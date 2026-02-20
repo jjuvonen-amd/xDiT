@@ -59,6 +59,7 @@ class AttentionBackendType(Enum):
     AITER = "AITER"
     AITER_FP8 = "AITER FP8"
     AITER_SAGE = "AITER Sage"
+    AITER_SAGE_MXFP4 = "AITER Sage MXFP4"
     NPU = "NPU"
 
 def register_attention_function(backend_type):
@@ -354,6 +355,14 @@ def _aiter_sage_attn_call(query, key, value, dropout_p, is_causal):
     # Pass layout="bhsd" to avoid permutation
     softmax_lse = None
     attn_fn = functools.partial(fav3_sage_wrapper_func, layout="bhsd")
+    output = attn_fn(query, key, value)
+    return output, softmax_lse
+
+@register_attention_function(AttentionBackendType.AITER_SAGE_MXFP4)
+def _aiter_sage_mxfp4_attn_call(query, key, value, dropout_p, is_causal):
+    # Pass layout="bhsd" to avoid permutation
+    softmax_lse = None
+    attn_fn = functools.partial(fav3_sage_wrapper_func, layout="bhsd", USE_MXFP4_SAGE=True)
     output = attn_fn(query, key, value)
     return output, softmax_lse
 
