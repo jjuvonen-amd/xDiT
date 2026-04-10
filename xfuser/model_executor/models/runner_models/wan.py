@@ -43,8 +43,14 @@ COMMON_FSDP_STRATEGY = {
 }
 
 
-def _setup_parallel_vae(vae) -> None:
-    """ Parallalizes the VAE decoder using distvae """
+def _setup_parallel_vae(vae, parallelize_encoder: bool = False) -> None:
+    """
+    Parallelizes the VAE decoder and optionally the encoder using distvae.
+
+    Args:
+        vae: The VAE model to parallelize
+        parallelize_encoder: If True, also parallelize the encoder (requires DistVAE encoder support)
+    """
     try:
         from distvae.modules.adapters.vae.decoder_adapters import WanDecoderAdapter
         patched_decoder = WanDecoderAdapter(
@@ -52,6 +58,27 @@ def _setup_parallel_vae(vae) -> None:
         ).to(vae.device)
         vae.decoder = patched_decoder
         log(f"Parallel VAE decoder enabled successfully.")
+
+        # Parallelize encoder if requested and supported
+        if parallelize_encoder:
+            try:
+                from distvae.modules.adapters.vae.encoder_adapters import WanEncoderAdapter
+                patched_encoder = WanEncoderAdapter(
+                    vae.encoder,
+                    vae_group=get_vae_parallel_group().device_group,
+                    vae_config=vae.config
+                ).to(vae.device)
+                vae.encoder = patched_encoder
+                log(f"Parallel VAE encoder enabled successfully.")
+            except ImportError:
+                log(
+                    "WARNING: WanEncoderAdapter not available in DistVAE. "
+                    "Encoder parallelization is skipped. "
+                    "To enable encoder parallelization, please update DistVAE to a version that supports it. "
+                    "See https://github.com/xdit-project/DistVAE for updates."
+                )
+            except Exception as e:
+                log(f"WARNING: Failed to patch VAE encoder: {e}. Encoder parallelization is skipped.")
     except ImportError:
         raise ValueError(
             "DistVAE library is missing or does not support WanDecoderAdapter. "
@@ -111,7 +138,7 @@ class xFuserWan21I2VModel(xFuserModel):
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
         super()._post_load_and_state_initialization(input_args)
         if self.config.use_parallel_vae:
-            _setup_parallel_vae(self.pipe.vae)
+            _setup_parallel_vae(self.pipe.vae, parallelize_encoder=True)
         self.pipe.scheduler.config.flow_shift = input_args["flow_shift"]
 
     def _load_model(self) -> DiffusionPipeline:
@@ -264,7 +291,7 @@ class xFuserWan21T2VModel(xFuserModel):
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
         super()._post_load_and_state_initialization(input_args)
         if self.config.use_parallel_vae:
-            _setup_parallel_vae(self.pipe.vae)
+            _setup_parallel_vae(self.pipe.vae, parallelize_encoder=True)
         self.pipe.scheduler.config.flow_shift = input_args["flow_shift"]
 
     def _load_model(self) -> DiffusionPipeline:
