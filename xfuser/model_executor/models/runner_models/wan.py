@@ -445,6 +445,14 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         output = self.pipe(**kwargs)
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
+    def _post_load_and_state_initialization(self, input_args: dict) -> None:
+        # Call base class init (skipping parent's VAE setup)
+        super(xFuserWan21T2VModel, self)._post_load_and_state_initialization(input_args)
+        # For 5B model, encoder parallelization is slower, so only parallelize decoder
+        if self.config.use_parallel_vae:
+            _setup_parallel_vae(self.pipe.vae, parallelize_encoder=False)
+        self.pipe.scheduler.config.flow_shift = input_args["flow_shift"]
+
     def _compile_model(self, input_args):
         torch._inductor.config.reorder_for_compute_comm_overlap = True
         self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default")
