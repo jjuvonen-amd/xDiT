@@ -135,10 +135,14 @@ class xFuserWan21I2VModel(xFuserModel):
         fsdp_strategy=COMMON_FSDP_STRATEGY,
     )
 
+    def _should_parallelize_vae_encoder(self) -> bool:
+        """Return whether to parallelize VAE encoder. Subclasses can override."""
+        return True
+    
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
         super()._post_load_and_state_initialization(input_args)
         if self.config.use_parallel_vae:
-            _setup_parallel_vae(self.pipe.vae, parallelize_encoder=True)
+            _setup_parallel_vae(self.pipe.vae, parallelize_encoder=self._should_parallelize_vae_encoder())
         self.pipe.scheduler.config.flow_shift = input_args["flow_shift"]
 
     def _load_model(self) -> DiffusionPipeline:
