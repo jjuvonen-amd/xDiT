@@ -18,6 +18,10 @@ from xfuser.model_executor.models.runner_models.base_model import (
     register_model,
     xFuserModel,
 )
+from xfuser.model_executor.models.runner_models.loading.contracts import (
+    LoadSupport,
+    LoadRoute,
+)
 
 DEFAULT_NEGATIVE_PROMPT = (
     ""
@@ -49,12 +53,26 @@ class xFuserLTX23VideoModel(xFuserModel):
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
     )
 
+    # Stage-2 LoRA is applied before a meta transformer could receive base weights.
+    load_support = LoadSupport(
+        meta_transformers=(),
+        meta_text_encoders=(),
+        replicated_meta=False,
+        routes=LoadRoute.NONE,
+    )
+
     settings = ModelSettings(
         model_name="dg845/LTX-2.3-Diffusers",
         output_name="ltx_2_3_video",
         model_output_type="video",
         fps=24,
         resolution_divisor=64,
+        fsdp_strategy={
+            "transformer": {
+                "wrap_attrs": ["transformer_blocks"],
+                "dtype": torch.bfloat16,
+            },
+        },
     )
 
     capabilities = ModelCapabilities(
@@ -62,6 +80,8 @@ class xFuserLTX23VideoModel(xFuserModel):
         ring_degree=True,
         enable_tiling=True,
         enable_slicing=True,
+        fully_shard_degree=True,
+        use_parallel_vae=True,
     )
 
     _STG_SCALE = 1.0
@@ -81,10 +101,8 @@ class xFuserLTX23VideoModel(xFuserModel):
             xFuserLTX2VideoTransformer3DWrapper,
         )
 
-        transformer = xFuserLTX2VideoTransformer3DWrapper.from_pretrained(
-            self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
+        transformer = self.loader.load_transformer(
+            xFuserLTX2VideoTransformer3DWrapper
         )
 
         pipe = LTX2Pipeline.from_pretrained(
@@ -116,6 +134,7 @@ class xFuserLTX23VideoModel(xFuserModel):
             vae=pipe.vae, latent_upsampler=latent_upsampler
         )
 
+        log("Enabling VAE tiling for LTX-2.3's full-resolution second-stage decode.")
         second_pipe.vae.enable_tiling()
 
         self.second_pipe = second_pipe
@@ -123,15 +142,10 @@ class xFuserLTX23VideoModel(xFuserModel):
 
         return pipe
 
-    def _enable_options(self) -> None:
-        super()._enable_options()
-        if self.config.enable_slicing:
-            self.second_pipe.vae.enable_slicing()
-
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
         from diffusers.pipelines.ltx2.utils import STAGE_2_DISTILLED_SIGMA_VALUES
 
-        generator = torch.Generator(device="cuda").manual_seed(input_args["seed"])
+        generator = self._make_generator(input_args["seed"])
 
         # self.pipe and self.second_pipe share the same transformer object, so the
         # stage 2 distilled LoRA loaded on second_pipe is also visible to pipe.
@@ -234,8 +248,6 @@ class xFuserLTX23VideoModel(xFuserModel):
         super()._post_load_and_state_initialization(input_args)
         self.upsample_pipe.to(self.pipe.device)
         self.second_pipe.to(self.pipe.device)
-
-
 @register_model("Lightricks/LTX-2")
 @register_model("LTX-2")
 class xFuserLTX2VideoModel(xFuserModel):
@@ -249,6 +261,13 @@ class xFuserLTX2VideoModel(xFuserModel):
         guidance_scale=4.0,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
     )
+    # Stage-2 LoRA is applied before a meta transformer could receive base weights.
+    load_support = LoadSupport(
+        meta_transformers=(),
+        meta_text_encoders=(),
+        replicated_meta=False,
+        routes=LoadRoute.NONE,
+    )
     settings = ModelSettings(
         model_name="Lightricks/LTX-2",
         output_name="ltx_2_video",
@@ -256,6 +275,12 @@ class xFuserLTX2VideoModel(xFuserModel):
         fp8_gemm_module_list=["transformer.transformer_blocks"],
         fps=24,
         resolution_divisor=64,
+        fsdp_strategy={
+            "transformer": {
+                "wrap_attrs": ["transformer_blocks"],
+                "dtype": torch.bfloat16,
+            },
+        },
     )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
@@ -263,6 +288,8 @@ class xFuserLTX2VideoModel(xFuserModel):
         enable_tiling=True,
         enable_slicing=True,
         use_fp8_gemms=True,
+        fully_shard_degree=True,
+        use_parallel_vae=True,
     )
 
     def _load_model(self) -> DiffusionPipeline:
@@ -273,10 +300,8 @@ class xFuserLTX2VideoModel(xFuserModel):
             xFuserLTX2VideoTransformer3DWrapper,
         )
 
-        transformer = xFuserLTX2VideoTransformer3DWrapper.from_pretrained(
-            self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
+        transformer = self.loader.load_transformer(
+            xFuserLTX2VideoTransformer3DWrapper
         )
         pipe = LTX2Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
@@ -312,13 +337,6 @@ class xFuserLTX2VideoModel(xFuserModel):
 
         return pipe
 
-    def _enable_options(self) -> None:
-        super()._enable_options()
-        if self.config.enable_tiling:
-            self.second_pipe.vae.enable_tiling()
-        if self.config.enable_slicing:
-            self.second_pipe.vae.enable_slicing()
-
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
         from diffusers.pipelines.ltx2.utils import STAGE_2_DISTILLED_SIGMA_VALUES
 
@@ -334,7 +352,7 @@ class xFuserLTX2VideoModel(xFuserModel):
             guidance_scale=input_args["guidance_scale"],
             output_type="latent",
             return_dict=False,
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
 
         video_latent = self.upsample_pipe(
@@ -351,7 +369,7 @@ class xFuserLTX2VideoModel(xFuserModel):
             noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
             sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
             output_type="np",
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         return DiffusionOutput(videos=output, pipe_args=input_args)
 
@@ -743,7 +761,13 @@ class xFuserLTX25DistilledVideoModel(_xFuserLTX25VideoModelBase):
         guidance_scale=1.0,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
     )
-
+    # The custom diffusion-decoder pipeline is not wired into shared/meta loading.
+    load_support = LoadSupport(
+        meta_transformers=(),
+        meta_text_encoders=(),
+        replicated_meta=False,
+        routes=LoadRoute.NONE,
+    )
     settings = ModelSettings(
         model_name="Lightricks/LTX-2.5-Diffusers",
         output_name="ltx_2_5_distilled_video",
@@ -767,6 +791,7 @@ class xFuserLTX25FullVideoModel(_xFuserLTX25VideoModelBase):
     _TRANSFORMER_SUBFOLDER = "transformer_full"
     _DISTILLED = False  # single-stage, no upsampler
 
+
     # Full-model guidance parameters - LTX-2.4/2.5 params:
     # video:  cfg_scale=3.0, stg_scale=1.0, rescale_scale=0.7, modality_scale=3.0, stg_blocks=[28]
     # audio:  cfg_scale=7.0, stg_scale=1.0, rescale_scale=0.7, modality_scale=3.0, stg_blocks=[28]
@@ -787,7 +812,13 @@ class xFuserLTX25FullVideoModel(_xFuserLTX25VideoModelBase):
         guidance_scale=3.0,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
     )
-
+    # The custom diffusion-decoder pipeline is not wired into shared/meta loading.
+    load_support = LoadSupport(
+        meta_transformers=(),
+        meta_text_encoders=(),
+        replicated_meta=False,
+        routes=LoadRoute.NONE,
+    )
     settings = ModelSettings(
         model_name="Lightricks/LTX-2.5-Diffusers",
         output_name="ltx_2_5_full_video",
