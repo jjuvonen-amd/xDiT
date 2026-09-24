@@ -20,7 +20,15 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from xfuser.core.distributed.attention_backend import VSA_H3_BACKENDS
+from xfuser.core.distributed.attention_backend import (
+    AITER_MHA_V4_SOL_BACKEND_SET,
+    SOL_EXACT_TOKENS_KEY,
+    SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
+    SOL_SEQUENCE_PERMUTATION_KEY,
+    VSA_H3_BACKENDS,
+    AttentionBackendType,
+)
+from xfuser.core.sparge_attention.sparge import get_gilbert_perm
 from xfuser.core.vsa_h3_attention import build_h3_vsa_metadata
 from xfuser.model_executor.layers.usp import (
     ULYSSES_EXTRA_INPUTS_KEY,
@@ -32,6 +40,85 @@ from xfuser.model_executor.layers.usp import (
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 
 
+def _effective_backend(backend):
+    """The backend a call will actually run on.
+
+    None does not mean "no backend" anywhere in this file: the attention entrypoints read it as
+    "ask the runtime state", which is how the runner selects one. So anything deciding behaviour
+    from the backend has to resolve it the same way, and has to do it per call rather than at
+    construction, since a hybrid schedule can hand different steps different backends.
+    """
+    if backend is not None:
+        return backend
+    return get_runtime_state().attention_backend
+
+
+def _configured_solattn_beta():
+    """The routing threshold offset the run was launched with.
+
+    Read from the runtime state for the same reason the backend is: this model's runners build the
+    wrapper straight from from_pretrained and pass neither an attention_kwargs dict nor a backend,
+    so --solattn_beta reaches the attention call only if the model fetches it.
+
+    Only a python float is read, so this stays traceable; a change to it would retrace, but it is
+    fixed for the life of a run.
+    """
+    return get_runtime_state().runtime_config.solattn_beta
+
+
+def _dense_backend_for(backend):
+    """The backend the token refiner should use, given the one chosen for the packed sequence.
+
+    The refiner attends the text embeddings alone, a few hundred tokens, which is nothing for a
+    routed backend to route over: a per-tile threshold drawn from a handful of KV blocks says
+    little, and what it declines to select is then replaced by block means covering much of the
+    sequence. The main blocks are a different question -- they attend the whole packed sequence --
+    so this substitutes only here rather than refusing the backend outright.
+
+    Returns the argument unchanged when it is not routed, which leaves None as None so the call
+    keeps deferring to the runtime state rather than pinning today's answer.
+    """
+    if _effective_backend(backend) in AITER_MHA_V4_SOL_BACKEND_SET:
+        return AttentionBackendType.AITER
+    return backend
+
+
+def _gilbert_sequence_permutations(
+    video_indices: torch.Tensor,
+    padded_length: int,
+    video_hw: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Embed a video-only Gilbert traversal in the full packed-row permutation.
+
+    Text and audio rows keep their positions, so the packed-row contract the rest of this model
+    depends on is unchanged; only the video rows are reordered among themselves, which is what
+    makes spatially adjacent video tokens share KV blocks.
+    """
+    height, width = (int(video_hw[0]), int(video_hw[1]))
+    rows_per_frame = height * width
+    if height <= 0 or width <= 0 or video_indices.numel() % rows_per_frame:
+        raise ValueError(
+            "MiniMax-H3 Gilbert reordering needs a positive video token grid whose "
+            f"area divides the number of video rows; got hw={video_hw} and "
+            f"{video_indices.numel()} video rows."
+        )
+
+    frames = video_indices.numel() // rows_per_frame
+    video_forward, video_inverse = get_gilbert_perm(
+        (frames, height, width), video_indices.device
+    )
+    identity = torch.arange(
+        padded_length, dtype=torch.long, device=video_indices.device
+    )
+    forward = identity.index_copy(
+        0, video_indices, video_indices.index_select(0, video_forward)
+    )
+    inverse = identity.index_copy(
+        0, video_indices, video_indices.index_select(0, video_inverse)
+    )
+    return forward, inverse
+
+
 class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
     def __init__(
         self,
@@ -39,11 +126,15 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
         attention_kwargs: dict[str, Any] | None = None,
         backend=None,
         use_fasth3_vsa: bool = False,
+        substitute_dense_for_sol: bool = False,
     ) -> None:
         super().__init__()
         self.use_ulysses_parallel_attention = use_ulysses_parallel_attention
         self.attention_kwargs = attention_kwargs
         self.backend = backend
+        # Set for the token refiner, whose sequence is too short to route over. Resolved per call
+        # rather than here because backend is usually None; see _effective_backend.
+        self.substitute_dense_for_sol = substitute_dense_for_sol
         self.use_vsa_h3 = use_fasth3_vsa and backend in VSA_H3_BACKENDS
 
     def __call__(
@@ -100,7 +191,11 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
             "is_causal": False,
             "attention_kwargs": self.attention_kwargs,
             "head_balance_layer": attn,
-            "backend": self.backend,
+            "backend": (
+                _dense_backend_for(self.backend)
+                if self.substitute_dense_for_sol
+                else self.backend
+            ),
         }
         if use_ulysses:
             attention_args["combine_qkv_a2a"] = True
@@ -177,6 +272,13 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             "vsa_h3_metadata": None,
             "vsa_h3_gate": None,
             ULYSSES_EXTRA_INPUTS_KEY: None,
+            # Sol-Attn. Present unconditionally, carrying None when no Sol row is selected: only
+            # Sol-Attn looks these up and every other backend ignores them, which is cheaper than
+            # adding and removing keys between forwards.
+            "solattn_beta": None,
+            SOL_EXACT_TOKENS_KEY: None,
+            SOL_SEQUENCE_PERMUTATION_KEY: None,
+            SOL_SEQUENCE_INVERSE_PERMUTATION_KEY: None,
         }
         self.enable_fasth3_vsa = enable_fasth3_vsa
         if attention_backend is None:
@@ -213,6 +315,7 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                 xFuserMiniMaxH3AttnProcessor(
                     use_ulysses_parallel_attention=False,
                     backend=self.attention_backend,
+                    substitute_dense_for_sol=True,
                 )
             )
 
@@ -491,6 +594,38 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             cu_seqlens_k = None
             max_seqlen_k = None
 
+        # Audio and text are a fraction of a percent and a few percent of this sequence; video is
+        # the rest. Sol-Attn thresholds each KV block against statistics taken over every block,
+        # so the two small modalities are judged against a distribution video writes, and their
+        # own queries lose the blocks they most needed -- audio worst, being the smaller. Name
+        # them and routing adds them to whatever it picked. Cost is one exact block per block they
+        # occupy, and it cannot make the answer worse: a forced block moves from the pooled
+        # approximation to the exact pass.
+        #
+        # Built unconditionally. Only Sol-Attn looks the key up and every other backend ignores
+        # it, which is cheaper than being clever: deciding here would mean resolving the backend
+        # once more, and the value is a single bool row.
+        exact_tokens = packed_hidden_states.new_zeros(padded_length, dtype=torch.bool)
+        exact_tokens[text_indices] = True
+        exact_tokens[audio_indices] = True
+
+        caller_attention_kwargs = attention_kwargs or {}
+        sequence_forward = None
+        sequence_inverse = None
+        if (
+            _effective_backend(self.attention_backend) in AITER_MHA_V4_SOL_BACKEND_SET
+            and caller_attention_kwargs.get("spargeattn_reorder_sequence", False)
+        ):
+            video_hw = caller_attention_kwargs.get("minimax_h3_video_hw")
+            if video_hw is None:
+                raise ValueError(
+                    "MiniMax-H3 Gilbert reordering with Sol-Attn requires "
+                    "`attention_kwargs['minimax_h3_video_hw']`."
+                )
+            sequence_forward, sequence_inverse = _gilbert_sequence_permutations(
+                video_indices, padded_length, video_hw
+            )
+
         self._usp_attention_kwargs.update(
             {
                 "indices_k": indices_k,
@@ -499,6 +634,15 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                 # _pad_rows appends its rows, so the valid keys are the leading
                 # sequence_length rows and nothing beyond them is real.
                 "valid_kv_len": max_seqlen_k,
+                # Seeded from the launch config, not from the caller: nothing upstream of this
+                # model passes a beta, so without this the backend's own default would apply and
+                # --solattn_beta would do nothing. An explicit caller value still wins.
+                "solattn_beta": caller_attention_kwargs.get(
+                    "solattn_beta", _configured_solattn_beta()
+                ),
+                SOL_EXACT_TOKENS_KEY: exact_tokens,
+                SOL_SEQUENCE_PERMUTATION_KEY: sequence_forward,
+                SOL_SEQUENCE_INVERSE_PERMUTATION_KEY: sequence_inverse,
             }
         )
 

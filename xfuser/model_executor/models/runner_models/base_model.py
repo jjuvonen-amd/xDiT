@@ -46,6 +46,7 @@ from xfuser.core.distributed import (
     init_distributed_environment,
 )
 from xfuser.core.distributed.attention_backend import (
+    AITER_MHA_V4_SOL_BACKEND_SET,
     AITER_MHA_V4_SPARGE_BACKEND_SET,
     AttentionBackendType,
 )
@@ -53,6 +54,7 @@ from xfuser.core.distributed.fp8_comms import setup_fp8_comms, validate_fp8_comm
 from xfuser.core.distributed.attention_schedule import (
     AttentionSchedule,
     GemmPrecisionSchedule,
+    SolAttnBetaSchedule,
     create_hybrid_attn_schedule,
     create_hybrid_gemm_schedule,
 )
@@ -92,7 +94,19 @@ _SPARGE_ATTENTION_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE_V2,
     AttentionBackendType.AITER_VSA,
     AttentionBackendType.FLEX_BLOCK_SPARGE,
-}) | AITER_MHA_V4_SPARGE_BACKEND_SET
+    # The Sol-Attn rows route their own mask rather than building a Sparge one, but they belong
+    # here for the half of this set that still governs them: they must not be left to serve
+    # cross-attention. Cross-attention falls back to the main backend when
+    # --cross_attention_backend is unset, and a text KV of a few hundred tokens is too few blocks
+    # for a per-tile threshold to select meaningfully and too few for a pooled correction to carry
+    # the mass it skips. It would not fail, it would quietly answer with a worse number.
+}) | AITER_MHA_V4_SPARGE_BACKEND_SET | AITER_MHA_V4_SOL_BACKEND_SET
+
+# Which of those rows a model opts into is a separate question per family, though. "Wired for
+# Sparge" and "wired for Sol-Attn" are different claims: Sparge builds a mask from the operands,
+# Sol-Attn routes its own and needs a long KV to route over. A model that has been checked for one
+# should not silently acquire the other, which is what a single shared capability would give it.
+_SOL_ATTENTION_BACKENDS = AITER_MHA_V4_SOL_BACKEND_SET
 
 
 def _parse_attention_backend(name: Optional[str], kind: str) -> Optional[AttentionBackendType]:
@@ -102,6 +116,21 @@ def _parse_attention_backend(name: Optional[str], kind: str) -> Optional[Attenti
         return AttentionBackendType[name.upper()]
     except KeyError:
         raise ValueError(f"Invalid {kind}: {name}")
+
+
+def _validate_ring_for_sol(config: xFuserArgs) -> None:
+    """Sol-Attn cannot be a ring rank, so say so here rather than at the first attention call.
+
+    Ring merges each rank's partial output by its LSE, which stops being valid once a rank has
+    folded in a pooled correction for the blocks it skipped: the correction is not in the LSE.
+    sol_attn_bhsd refuses this too, but that fires deep in the denoise loop after the model is
+    loaded, and several models that can serve Sol-Attn also advertise ring_degree.
+    """
+    if (config.ring_degree or 1) > 1:
+        raise ValueError(
+            f"Sol-Attn does not support ring parallelism, got --ring_degree "
+            f"{config.ring_degree}. Use --ulysses_degree for sequence parallelism instead."
+        )
 
 
 def _validate_cross_attention_for_sparge(config: xFuserArgs) -> None:
@@ -154,6 +183,7 @@ class ModelCapabilities:
     cross_attention_backend: bool = False
     supports_sparse_attention_backends: bool = False
     supports_sparge_attention_backends: bool = False
+    supports_sol_attention_backends: bool = False
     supports_distilled_weights: bool = False
     profile_capture_phase: bool = False
 
@@ -533,6 +563,7 @@ class xFuserModel(abc.ABC):
         backend = _parse_attention_backend(config.attention_backend, "attention backend")
         supports_sparse = self.capabilities.supports_sparse_attention_backends
         supports_sparge = self.capabilities.supports_sparge_attention_backends
+        supports_sol = self.capabilities.supports_sol_attention_backends
 
         if backend is None:
             if supports_sparse:
@@ -552,9 +583,18 @@ class xFuserModel(abc.ABC):
                     config.hybrid_attn_high_precision_backend,
                     "hybrid high-precision attention backend",
                 )
+                if (low in _SOL_ATTENTION_BACKENDS
+                        or high in _SOL_ATTENTION_BACKENDS):
+                    _validate_ring_for_sol(config)
                 if (low in _SPARGE_ATTENTION_BACKENDS
                         or high in _SPARGE_ATTENTION_BACKENDS):
-                    _validate_cross_attention_for_sparge(config)
+                    # Gated on the capability, as the explicit-backend branch below already is.
+                    # The check exists so a routed backend is not left to serve cross-attention by
+                    # falling back; a model that has no cross-attention has nothing to fall back
+                    # to, and demanding --cross_attention_backend there asks for a setting that
+                    # would go unread.
+                    if self.capabilities.cross_attention_backend:
+                        _validate_cross_attention_for_sparge(config)
         else:
             if backend in _SPARSE_ATTENTION_BACKENDS and not supports_sparse:
                 raise ValueError(
@@ -570,7 +610,13 @@ class xFuserModel(abc.ABC):
                     f"model equivalent."
                 )
             if backend in _SPARGE_ATTENTION_BACKENDS:
-                if not supports_sparge:
+                if backend in _SOL_ATTENTION_BACKENDS:
+                    if not supports_sol:
+                        raise ValueError(
+                            f"Model {config.model} does not support Sol-Attn attention backends."
+                        )
+                    _validate_ring_for_sol(config)
+                elif not supports_sparge:
                     raise ValueError(
                         f"Model {config.model} does not support Sparge attention backend."
                     )
@@ -978,6 +1024,11 @@ class xFuserModel(abc.ABC):
     def prepare_run(self, input_args: dict) -> None:
         """Prepare model state before a pipeline invocation."""
         self._vae_manager.prepare_run(self._decoding_vaes(), input_args)
+        # Each invocation starts the per-step schedules at their first step. Compile warmups and
+        # warmup calls spend forwards of their own, often with a shortened step count, and the
+        # counter only advances -- so without this a measured run picks up wherever the warmup
+        # stopped and every step reads a beta meant for a later one.
+        get_runtime_state().reset_step_counter()
 
     def _run_timed_pipe(self, input_args: dict) -> Tuple[DiffusionOutput, float]:
         """ Run the pipeline and time its latency from the synchronized across all ranks beginning
@@ -1057,6 +1108,9 @@ class xFuserModel(abc.ABC):
         if self.config.use_hybrid_gemm_schedule:
             self._setup_hybrid_gemm_schedule(input_args)
 
+        if getattr(self.config, "solattn_beta_schedule", None) is not None:
+            self._setup_solattn_beta_schedule(input_args)
+
         if self.config.use_vae_channels_last_format:
             self._convert_vae_to_channels_last()
 
@@ -1093,6 +1147,28 @@ class xFuserModel(abc.ABC):
         log("Enabling hybrid attention schedule")
         log(f"Hybrid attention schedule: {attention_schedule.backends}", debug=True)
         get_runtime_state().set_attention_schedule(attention_schedule, total_steps=total_steps)
+
+    def _setup_solattn_beta_schedule(self, input_args: dict) -> None:
+        """
+        Setup a per-step Sol-Attn routing threshold from --solattn_beta_schedule.
+
+        The spec is read per denoising step and held across that step's forwards, which is the
+        same multiplier the hybrid schedules use. The step counter advances per forward, so the
+        expansion is what makes a step's conditional and unconditional branch share a beta;
+        spreading the ramp over forwards instead would route one branch more exactly than the
+        other for the whole run, and guidance subtracts the two rather than averaging them.
+        """
+        forwards_per_step = self._calculate_hybrid_attention_step_multiplier(input_args)
+        denoising_steps = input_args["num_inference_steps"]
+        beta_schedule = SolAttnBetaSchedule.from_spec(
+            self.config.solattn_beta_schedule, denoising_steps,
+            forwards_per_step=forwards_per_step,
+        )
+
+        log("Enabling per-step Sol-Attn beta schedule")
+        log(f"Sol-Attn beta schedule: {beta_schedule.per_denoising_step}", debug=True)
+        get_runtime_state().set_solattn_beta_schedule(
+            beta_schedule, total_steps=denoising_steps * forwards_per_step)
 
     def _setup_hybrid_gemm_schedule(self, input_args: dict) -> None:
         """

@@ -11,6 +11,7 @@ import torch.distributed
 
 from xfuser.logger import init_logger
 from xfuser.core.distributed import init_distributed_environment
+from xfuser.core.distributed.attention_schedule import SolAttnBetaSchedule
 from xfuser.config.gemm import (
     GemmQuantizationSpec,
     load_gemm_config,
@@ -295,6 +296,9 @@ class xFuserArgs:
     spargeattn_simthreshold: float = 0.3
     spargeattn_cdfthreshold: float = 0.92
     use_spargeattn_head_balance: bool = False
+    # Sol-Attn
+    solattn_beta: float = 0.5
+    solattn_beta_schedule: Optional[str] = None
     # AITER CK-Tile VSA attention
     vsa_block_size: int = 128
     vsa_top_k: int = 1
@@ -1238,7 +1242,8 @@ class xFuserArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Reorder image tokens via the gilbert space-filling curve "
-                 "before Sparge attention. Use --no-spargeattn_reorder_sequence to disable."
+                 "before Sparge attention, and video tokens before Sol-Attn for "
+                 "MiniMax-H3. Use --no-spargeattn_reorder_sequence to disable."
         )
         parser.add_argument(
             "--use_spargeattn_static_block_mask",
@@ -1254,6 +1259,28 @@ class xFuserArgs:
             help="Balance per-rank attention work across Ulysses ranks by "
                  "permuting heads (block-sparse load balancing). Only has an "
                  "effect with ulysses_degree>1 and a Sparge attention backend.",
+        )
+        parser.add_argument(
+            "--solattn_beta",
+            type=float,
+            default=0.5,
+            help="Routing threshold for the AITER Sol backends. A KV block is "
+                 "computed exactly when its pooled proxy score exceeds "
+                 "mean + beta*std over the blocks of that query tile, so larger "
+                 "beta keeps fewer blocks.",
+        )
+        parser.add_argument(
+            "--solattn_beta_schedule",
+            type=nullable_str,
+            default=None,
+            help="Vary --solattn_beta across denoising steps, since steps are not equally "
+                 "approximable. Either 'first:last' for a linear ramp over the run, e.g. "
+                 "'1.0:-0.25' to start aggressive and end exact, or one beta per step as "
+                 "'0.5,0.5,0.25,...' -- per DENOISING STEP, so a 40-step run takes 40 whether or "
+                 "not guidance is on: a guided step's conditional and unconditional forward share "
+                 "the step's beta. Overrides --solattn_beta when set. A spec starting with a "
+                 "negative beta needs the --solattn_beta_schedule=-0.5:0.0 form, or argparse "
+                 "reads the leading minus as another option.",
         )
         parser.add_argument(
             "--vsa_block_size",
@@ -1470,6 +1497,16 @@ class xFuserArgs:
                     "hybrid_attn_high_precision_backend must be set."
                 )
 
+        if self.solattn_beta_schedule is not None:
+            # Parsing needs the step count, which is an input rather than an engine setting, so the
+            # spec is only turned into betas at model setup. Catch the shape of it here anyway:
+            # a typo in a 40-entry list should not surface after the weights have loaded.
+            SolAttnBetaSchedule.from_spec(
+                self.solattn_beta_schedule,
+                len(self.solattn_beta_schedule.split(","))
+                if ":" not in self.solattn_beta_schedule else 2,
+            )
+
         if self.group_offload_low_cpu_mem and not self.enable_group_cpu_offload:
             raise ValueError(
                 "--group_offload_low_cpu_mem only affects group CPU offload; pass "
@@ -1507,6 +1544,8 @@ class xFuserArgs:
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
             use_spargeattn_head_balance=self.use_spargeattn_head_balance,
+            solattn_beta=self.solattn_beta,
+            solattn_beta_schedule=self.solattn_beta_schedule,
             vsa_block_size=self.vsa_block_size,
             vsa_top_k=self.vsa_top_k,
             vsa_top_k_ratio=self.vsa_top_k_ratio,

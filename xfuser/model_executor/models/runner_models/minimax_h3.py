@@ -10,6 +10,7 @@ import torch
 
 from xfuser.core.distributed.attention_backend import (
     AITER_MHA_V4_ONLY_BACKEND_SET,
+    AITER_MHA_V4_SOL_BACKEND_SET,
     AttentionBackendType,
     VSA_H3_BACKENDS,
 )
@@ -52,7 +53,13 @@ _SUPPORTED_ATTN_BACKENDS = frozenset({
     AttentionBackendType.CUDNN,
     AttentionBackendType.SDPA,
     AttentionBackendType.NVTE_FP8,
-}) | (AITER_MHA_V4_ONLY_BACKEND_SET - _UNALIGNED_MHA_V4_BACKENDS)
+}) | (AITER_MHA_V4_ONLY_BACKEND_SET - _UNALIGNED_MHA_V4_BACKENDS) | (
+    # Sol-Attn rows. H3's attention is non-causal self-attention over one long packed sequence,
+    # which is the shape the pooled correction is for. The alignment pad is dropped from K/V
+    # through the varlen metadata rather than attended; see _sol_attn_key_seqlen. Which of these
+    # rows a device actually has is checked against the manifest in runtime_state, not here.
+    AITER_MHA_V4_SOL_BACKEND_SET
+)
 _FASTH3_ATTN_BACKENDS = VSA_H3_BACKENDS
 _SUPPORTED_ULYSSES_DEGREES = frozenset({1, 2, 4, 8})
 _SUPPORTED_TASKS = frozenset({"t2va", "i2va", "l2va", "fl2va", "ref2va"})
@@ -371,6 +378,11 @@ class xFuserMiniMaxH3Model(xFuserModel):
         use_fp8_gemms=True,
         use_fp4_gemms=True,
         use_hybrid_attn_schedule=True,
+        # Sol-Attn only; no Sparge backend is wired for this model. The cross-attention hazard the
+        # shared gate guards does not arise here either, since H3 index_copies text, video and
+        # audio into one packed sequence and attends them together rather than calling out to a
+        # short text KV.
+        supports_sol_attention_backends=True,
         enable_slicing=False,
         enable_tiling=False,
     )
@@ -574,6 +586,21 @@ class xFuserMiniMaxH3Model(xFuserModel):
             "width": input_args["width"],
             "num_frames": input_args["num_frames"],
             "num_inference_steps": input_args["num_inference_steps"],
+            "attention_kwargs": {
+                "spargeattn_reorder_sequence": (
+                    self.config.spargeattn_reorder_sequence
+                ),
+                # The generated video's token grid, which the packed sequence does not carry:
+                # Sol-Attn's Gilbert reordering needs it to walk the video rows spatially.
+                "minimax_h3_video_hw": (
+                    input_args["height"]
+                    // self.pipe.vae_spatial_compression_ratio
+                    // self.pipe.patch_size[1],
+                    input_args["width"]
+                    // self.pipe.vae_spatial_compression_ratio
+                    // self.pipe.patch_size[2],
+                ),
+            },
             "generator": torch.Generator(device="cuda").manual_seed(
                 input_args["seed"]
             ),
