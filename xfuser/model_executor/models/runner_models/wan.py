@@ -74,6 +74,10 @@ def _build_attention_kwargs(config: "xFuserArgs") -> dict:
         "spargeattn_cdfthreshold": config.spargeattn_cdfthreshold,
         "spargeattn_reorder_sequence": config.spargeattn_reorder_sequence,
         "use_spargeattn_static_block_mask": config.use_spargeattn_static_block_mask,
+        # Read by the Sol-Attn rows only. Wan hands this dict to the transformer wrapper's
+        # constructor and the processors pass it on every call, so --solattn_beta needs nothing
+        # else to reach the routing. A per-step schedule overrides it from the runtime state.
+        "solattn_beta": config.solattn_beta,
         "vsa_block_size": config.vsa_block_size,
         "vsa_top_k": config.vsa_top_k,
         "vsa_top_k_ratio": config.vsa_top_k_ratio,
@@ -189,6 +193,11 @@ class xFuserWan21I2VModel(xFuserWanModel):
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        # Wan's self-attention is one long single-modality video sequence -- 720p is ~75600
+        # tokens, ~591 KV blocks -- which is what Sol-Attn's per-tile threshold needs to route
+        # over. Its short KVs are safe by construction: the text and I2V image branches run on
+        # --cross_attention_backend, which the Sparge gate already forces to be set here.
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_step_caching=True,
@@ -415,6 +424,11 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        # Wan's self-attention is one long single-modality video sequence -- 720p is ~75600
+        # tokens, ~591 KV blocks -- which is what Sol-Attn's per-tile threshold needs to route
+        # over. Its short KVs are safe by construction: the text and I2V image branches run on
+        # --cross_attention_backend, which the Sparge gate already forces to be set here.
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_distilled_weights=True,
@@ -569,6 +583,11 @@ class xFuserWan21T2VModel(xFuserWanModel):
         use_parallel_vae=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        # Wan's self-attention is one long single-modality video sequence -- 720p is ~75600
+        # tokens, ~591 KV blocks -- which is what Sol-Attn's per-tile threshold needs to route
+        # over. Its short KVs are safe by construction: the text and I2V image branches run on
+        # --cross_attention_backend, which the Sparge gate already forces to be set here.
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
     )
@@ -594,6 +613,11 @@ class xFuserWan21T2VModel(xFuserWanModel):
         use_parallel_vae=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        # Wan's self-attention is one long single-modality video sequence -- 720p is ~75600
+        # tokens, ~591 KV blocks -- which is what Sol-Attn's per-tile threshold needs to route
+        # over. Its short KVs are safe by construction: the text and I2V image branches run on
+        # --cross_attention_backend, which the Sparge gate already forces to be set here.
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_step_caching=True,
@@ -772,6 +796,11 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        # Wan's self-attention is one long single-modality video sequence -- 720p is ~75600
+        # tokens, ~591 KV blocks -- which is what Sol-Attn's per-tile threshold needs to route
+        # over. Its short KVs are safe by construction: the text and I2V image branches run on
+        # --cross_attention_backend, which the Sparge gate already forces to be set here.
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_step_caching=True,
