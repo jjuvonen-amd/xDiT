@@ -274,9 +274,11 @@ def _check_block_tile_override(recipe=None):
     """Raise unless XFUSER_SOL_ATTN_BLOCK_TILE names a geometry this device has a kernel for.
 
     Checked against `recipe`'s operands when one is given, because a geometry need not exist in
-    every precision: gfx950's 64x64 rows are FP8 only, so the override is valid for the fp8 recipe
-    and for none of the others. Without a recipe it only asks whether any precision serves the
-    tile, which is all a caller reaching sol_attn_bhsd() directly has settled by then.
+    every precision: gfx950's 64x64 rows are FP8 and BF16 only, so the override is valid for those
+    two recipes and for none of the others. The membership is aiter's to state -- it is read from
+    the manifest per call, not pinned here -- so a build that adds rows widens this on its own.
+    Without a recipe it only asks whether any precision serves the tile, which is all a caller
+    reaching sol_attn_bhsd() directly has settled by then.
     """
     if _BLOCK_TILE_OVERRIDE is None:
         return
@@ -623,6 +625,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     # kernel's own remainder is padded back, which is at most one block of zero tokens.
     if key_seqlen is not None and key_seqlen < key.shape[1]:
         key, value = key[:, :key_seqlen], value[:, :key_seqlen]
+    real_kv_len = key.shape[1]
     key, value = _pad_kv_to_tile(key, value)
     _warn_if_kv_too_short(key.shape[1])
 
@@ -633,7 +636,6 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
         None if exact_tokens is None
         else _force_blocks_from_tokens(exact_tokens, key_seqlen, key.shape[1])
     )
-
     # The raw entrypoint routes internally from beta alone, so it cannot be told about forced
     # blocks any more than it can be asked for the head cost.
     if (routing is None and not return_head_cost and force_blocks is None
@@ -643,6 +645,27 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
                               softmax_scale=softmax_scale,
                               block_tile=sol_attn_block_tile())
         return restore_output(out), None
+
+    # Put back the guard the tile pad just took away. aiter forces a ragged final KV block to stay
+    # exact -- `partial_tail = seqlen_k % BLOCK_N != 0` in its routing -- because the approximate
+    # branch scales a block's pooled mean by the CONSTANT block size, which is only the right
+    # divisor for a short one. _pad_kv_to_tile makes seqlen_k a whole number of blocks, so aiter
+    # sees no ragged tail and drops the guard, while the block it is looking at is still short:
+    # on this model 89 real keys of 128, pooled over the real count and then re-weighted as if
+    # there were 128. Naming the block through the force path restores the invariant without
+    # teaching aiter about a pad it deliberately does not want to know about.
+    #
+    # Deliberately placed AFTER the raw-path return rather than beside the force_blocks it joins.
+    # A ragged seqlen_k is the common case, not the corner -- Wan at 720p is 590.6 blocks -- so
+    # forcing it above would take every such call off the raw entrypoint and onto host-side
+    # quantization, turning an accuracy fix into a silent dispatch change. The raw path does its
+    # own routing and owns this question itself.
+    if real_kv_len % sol_attn_block_tile()[1]:
+        tail = torch.zeros(
+            key.shape[1] // sol_attn_block_tile()[1], dtype=torch.bool, device=key.device
+        )
+        tail[(real_kv_len - 1) // sol_attn_block_tile()[1]] = True
+        force_blocks = tail if force_blocks is None else (force_blocks | tail)
 
     # Quantize exactly as the raw entrypoint would. On the fp8 row that means quantize_fp8_rotated
     # for Q/K: rotating both by the same orthonormal matrix leaves Q @ K.T alone while spreading the

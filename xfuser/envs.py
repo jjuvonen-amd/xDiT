@@ -60,9 +60,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # Sol-Attn routing/dispatch tile as "QxKV", e.g. "64x64". Unset takes the ASM row the aiter
     # manifest calls default: 256x128 on gfx950, 256x64 on gfx942.
     #
-    # The only alternative gfx950 ships is 64x64, and only for the FP8 recipe, so it takes
-    # --attention_backend aiter_fp8_sol; every other row exists at 256x128 alone and rejects the
-    # override at setup. It quadruples routing resolution -- a
+    # The only alternative gfx950 ships is 64x64, and only for the FP8 and BF16 recipes, so it
+    # takes --attention_backend aiter_fp8_sol or aiter_bf16_sol; the remaining rows exist at
+    # 256x128 alone and reject the override at setup, naming the recipe. Which rows serve it is
+    # read from aiter's manifest, so a build that adds more needs no change here. It quadruples
+    # routing resolution -- a
     # block is a quarter the KV width and a quarter the query rows, so a query tile's threshold is
     # computed over 4x more, 4x smaller blocks. That costs throughput per token (the same KV is
     # re-read by 4x as many query tiles), so it only wins where 128-token blocks are too coarse to

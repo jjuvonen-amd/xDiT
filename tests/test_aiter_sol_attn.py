@@ -113,6 +113,165 @@ def test_sol_attn_drops_a_caller_alignment_pad():
         )
 
 
+def _query_pad_case(real, n_pad):
+    """A packed sequence plus the trailing query pad MiniMax-H3 actually produces.
+
+    The pad rows are one vector repeated, at the same magnitude as a real row, because that is
+    what the model hands the backend: _pad_rows zeroes the hidden state, adaLN adds a shift
+    against a real modality row, norm_q renormalises the result, and RoPE at position 0 is the
+    identity -- so every pad row arrives full-sized and identical to its neighbours. Identical is
+    the part that bites: they sum coherently into a pooled query tile where real rows partly
+    cancel.
+    """
+    import torch
+
+    torch.manual_seed(0)
+
+    def bhsd(seq):
+        return torch.randn(1, 4, seq, 128, device="cuda", dtype=torch.bfloat16)
+
+    query, key, value = bhsd(real), bhsd(real), bhsd(real)
+    pad = bhsd(1).expand(1, 4, n_pad, 128)
+    padded = tuple(torch.cat((t, pad), dim=2) for t in (query, key, value))
+    return (query, key, value), padded
+
+
+def _sol_call(monkeypatch, operands, kwargs):
+    """Run one Sol-Attn call through the registered backend path, off the ring."""
+    from xfuser.core.distributed import attention_backend as backend_module
+    from xfuser.core.distributed.attention_backend import _aiter_sol_attn_call
+
+    monkeypatch.setattr(backend_module, "get_ring_parallel_world_size", lambda: 1)
+    output, _ = _aiter_sol_attn_call(
+        *operands, 0.0, False, {"solattn_beta": 0.0, **kwargs}, "bf16"
+    )
+    return output
+
+
+# 4000 is deliberately not a multiple of the 256-row query tile, so the pad rows land in a tile
+# that still holds real rows. Rounded up to a tile boundary the pad would get a tile of its own
+# and could not reach anything, which is the one case these tests must not accidentally measure.
+_PAD_REAL = 4000
+
+
+@pytest.mark.parametrize("n_pad", [1, 7, 63])
+def test_sol_attn_drops_a_caller_query_pad(n_pad, monkeypatch):
+    """valid_q_len must keep a trailing query pad out of the routing it would otherwise steer.
+
+    The mirror of the key-side trim, and the one that matters for a backend that POOLS queries.
+    Sol-Attn reduces each query tile to one representative row and routes a single block
+    selection per tile, so a pad row left in Q helps choose the blocks the real rows sharing its
+    tile are served by -- a hazard the dense paths genuinely do not have, since there each row is
+    computed independently and a pad row spoils only its own discarded output.
+
+    Equality is exact rather than approximate: the trim happens before quantization and routing,
+    so both calls see byte-identical operands and must produce byte-identical results.
+    """
+    _require_sol_attn()
+    _require_sol_recipe("bf16")
+    import torch
+
+    plain, padded = _query_pad_case(_PAD_REAL, n_pad)
+    reference = _sol_call(monkeypatch, plain, {})
+    trimmed = _sol_call(
+        monkeypatch,
+        padded,
+        {"cu_seqlens_k": torch.tensor([0, _PAD_REAL]),
+         "max_seqlen_k": _PAD_REAL,
+         "valid_q_len": _PAD_REAL},
+    )
+
+    assert trimmed.shape == padded[0].shape, (
+        "the trimmed call must hand back every row it was given, so the caller's own slicing "
+        "and the Ulysses all-to-all behind it still see the shape they passed in"
+    )
+    assert torch.equal(trimmed[:, :, :_PAD_REAL], reference), (
+        f"a {n_pad}-row query pad still reached routing and changed the real rows' answer"
+    )
+
+
+def test_a_query_pad_left_in_changes_the_answer(monkeypatch):
+    """The hazard the trim exists for, so the test above cannot pass vacuously.
+
+    Without valid_q_len the key side is still trimmed, so K, V and the pooled blocks are
+    identical between the two calls and routing is the only thing left that can differ. On the
+    BF16 row there is no quantization either, which removes the other candidate: if these two
+    disagree it is because the pad rows moved a query tile's threshold.
+    """
+    _require_sol_attn()
+    _require_sol_recipe("bf16")
+    import torch
+
+    plain, padded = _query_pad_case(_PAD_REAL, 63)
+    reference = _sol_call(monkeypatch, plain, {})
+    leaked = _sol_call(
+        monkeypatch,
+        padded,
+        {"cu_seqlens_k": torch.tensor([0, _PAD_REAL]), "max_seqlen_k": _PAD_REAL},
+    )
+
+    assert not torch.equal(leaked[:, :, :_PAD_REAL], reference), (
+        "a query pad left in routing changed nothing, so this build cannot demonstrate the bug "
+        "and the trim test above proves nothing"
+    )
+
+
+def test_the_query_pad_trim_composes_with_exact_tokens_and_reordering(monkeypatch):
+    """The trim has to carry the per-token mask and the sequence permutation with it.
+
+    Both are indexed by row, so trimming Q without them would silently misalign every one. The
+    permutation is safe to slice for the same reason the pad is safe to drop: MiniMax-H3 builds
+    it over the padded rows from an identity and index_copies only video positions, all of which
+    are below the real length, so the pad rows map to themselves.
+    """
+    _require_sol_attn()
+    _require_sol_recipe("bf16")
+    import torch
+
+    from xfuser.core.distributed.attention_backend import (
+        SOL_EXACT_TOKENS_KEY,
+        SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
+        SOL_SEQUENCE_PERMUTATION_KEY,
+    )
+
+    n_pad = 63
+    plain, padded = _query_pad_case(_PAD_REAL, n_pad)
+
+    exact = torch.zeros(_PAD_REAL + n_pad, dtype=torch.bool, device="cuda")
+    exact[:512] = True
+
+    # A permutation of the real rows, extended over the pad as an identity -- the shape
+    # _gilbert_sequence_permutations produces.
+    torch.manual_seed(1)
+    forward = torch.arange(_PAD_REAL + n_pad, device="cuda")
+    shuffled = torch.randperm(_PAD_REAL, device="cuda")
+    forward = forward.index_copy(0, torch.arange(_PAD_REAL, device="cuda"), shuffled)
+    inverse = torch.argsort(forward)
+
+    reference = _sol_call(
+        monkeypatch,
+        plain,
+        {SOL_EXACT_TOKENS_KEY: exact[:_PAD_REAL],
+         SOL_SEQUENCE_PERMUTATION_KEY: forward[:_PAD_REAL],
+         SOL_SEQUENCE_INVERSE_PERMUTATION_KEY: inverse[:_PAD_REAL]},
+    )
+    trimmed = _sol_call(
+        monkeypatch,
+        padded,
+        {"cu_seqlens_k": torch.tensor([0, _PAD_REAL]),
+         "max_seqlen_k": _PAD_REAL,
+         "valid_q_len": _PAD_REAL,
+         SOL_EXACT_TOKENS_KEY: exact,
+         SOL_SEQUENCE_PERMUTATION_KEY: forward,
+         SOL_SEQUENCE_INVERSE_PERMUTATION_KEY: inverse},
+    )
+
+    assert torch.equal(trimmed[:, :, :_PAD_REAL], reference), (
+        "trimming Q alongside exact_tokens and the permutation did not reproduce the untrimmed "
+        "sequence's answer"
+    )
+
+
 def test_forced_blocks_are_added_to_what_routing_picked():
     """A named token's block must be computed exactly however routing scored it.
 
@@ -971,12 +1130,17 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
         f"64x64 lost ground to {q_tile}x{kv_tile}: {cosine:.4f} vs {baseline:.4f}")
 
 
-def test_a_block_tile_only_one_recipe_serves_is_rejected_at_setup(monkeypatch):
-    """gfx950's 64x64 rows are FP8 only, and the three MX/INT8 recipes have to say so by name.
+def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
+    """A geometry need not exist in every precision, and a recipe without it must say so by name.
 
     At setup rather than at the first attention call, which is the point: this is the check that
     stands between a mistyped launch and a run that loads a model for minutes before dying. The
     dispatch would catch it too, but only after the load and without naming the variable.
+
+    Which recipes serve 64x64 is read from aiter's manifest rather than pinned here. gfx950 shipped
+    that geometry for FP8 first and BF16 later, and pinning the membership only meant this test
+    failed when a row was added. What has to hold is the behaviour on both sides of the split, so
+    the test asserts the split is non-trivial and then drives every recipe through it.
     """
     _require_sol_attn()
 
@@ -989,10 +1153,13 @@ def test_a_block_tile_only_one_recipe_serves_is_rejected_at_setup(monkeypatch):
     _override_tile(monkeypatch, (64, 64))
     recipes = _recipes_on_this_device()
     served = [recipe for recipe in recipes if _serves(recipe, (64, 64))]
-    assert served == ["fp8"], f"expected the FP8 row alone to serve 64x64, got {served}"
+    unserved = [recipe for recipe in recipes if recipe not in served]
+    assert served, "no recipe serves 64x64, so the accepting half of the check is untested"
+    assert unserved, "every recipe serves 64x64, so the rejecting half of the check is untested"
 
-    check_sol_attn_recipe("fp8")
-    for recipe in (r for r in recipes if r not in served):
+    for recipe in served:
+        check_sol_attn_recipe(recipe)
+    for recipe in unserved:
         with pytest.raises(SolAttnUnsupported, match=f"XFUSER_SOL_ATTN_BLOCK_TILE.*{recipe}"):
             check_sol_attn_recipe(recipe)
 

@@ -1241,6 +1241,15 @@ def _trim_mha_v4_trailing_pad(key, value, attention_kwargs):
     Q is deliberately left alone. It is never packed, its pad rows are discarded
     downstream, and trimming it by a key-side length would be wrong for cross
     attention, where the two sequences differ.
+
+    "Discarded downstream" is only a reason while every query row is computed
+    independently, which is true of this path and of every other dense one. It
+    stops being true for a backend that POOLS queries: Sol-Attn reduces each
+    query tile to one representative row and routes a single block selection
+    per tile, so a pad row left in Q helps choose the blocks its real
+    neighbours are served by. That path therefore trims Q itself, against a
+    ``valid_q_len`` the producer declares separately -- see
+    ``_sol_attn_query_seqlen`` and ``_aiter_sol_attn_call``.
     """
     kwargs = attention_kwargs or {}
     if kwargs.get("indices_k") is None:
@@ -1751,6 +1760,28 @@ def _sol_attn_key_seqlen(kwargs):
     return int(max_seqlen_k) if max_seqlen_k is not None else None
 
 
+def _sol_attn_query_seqlen(kwargs):
+    """Real query row count from a caller that padded Q, or None when it declared nothing.
+
+    The mirror of _sol_attn_key_seqlen for the side the dense backends deliberately leave alone.
+    Their reasoning -- a pad row's query only spoils its own output row, which the model slices
+    off -- holds for every backend that computes each row independently, and fails for this one:
+    Sol-Attn pools a whole query tile into one representative row and routes ONE block selection
+    per tile, so a pad row that reaches routing helps choose the blocks its real neighbours in
+    that tile are served by.
+
+    That would be harmless if a pad query were zero, since the tile mean would then be a positive
+    rescale of the real rows' mean and the threshold is invariant to those. It is not zero:
+    MiniMax-H3 zeroes the pad row's hidden state, but adaLN adds a shift and norm_q renormalises,
+    so the pad query arrives at full magnitude -- and identical across pad rows, which makes them
+    sum coherently where the real rows partly cancel.
+
+    Only a python int is read, never a tensor's values, so this stays traceable.
+    """
+    valid_q_len = kwargs.get("valid_q_len")
+    return int(valid_q_len) if valid_q_len is not None else None
+
+
 def _sol_attn_beta(kwargs):
     """This call's routing threshold: the step's scheduled beta if one is driving it, else the flag.
 
@@ -1788,6 +1819,32 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
 
     kwargs = attention_kwargs or {}
     cost_sink = kwargs.get(COST_SINK_KEY)
+    exact_tokens = kwargs.get(SOL_EXACT_TOKENS_KEY)
+    sequence_permutation = kwargs.get(SOL_SEQUENCE_PERMUTATION_KEY)
+    sequence_inverse_permutation = kwargs.get(SOL_SEQUENCE_INVERSE_PERMUTATION_KEY)
+
+    # Drop a caller's trailing query pad before anything pools it, the way _vsa_h3_attn_call
+    # already does for the other query-tiling backend. Both sides are sliced here rather than
+    # leaving K/V to key_seqlen below, so the trim is one operation with one length.
+    #
+    # Slicing the permutations is sound for the reason the pad is droppable at all: the model
+    # builds them over the padded rows from an identity, index_copying only the video positions,
+    # and every video position is below the real length. So the pad rows map to themselves, and
+    # the leading valid_q_len entries are a permutation of that range rather than a set with
+    # holes in it.
+    gathered_length = query.shape[2]
+    query_seqlen = _sol_attn_query_seqlen(kwargs)
+    if query_seqlen is not None and query_seqlen < gathered_length:
+        query = query[:, :, :query_seqlen]
+        key = key[:, :, :query_seqlen]
+        value = value[:, :, :query_seqlen]
+        if exact_tokens is not None:
+            exact_tokens = exact_tokens[:query_seqlen]
+        if sequence_permutation is not None:
+            sequence_permutation = sequence_permutation[:query_seqlen]
+        if sequence_inverse_permutation is not None:
+            sequence_inverse_permutation = sequence_inverse_permutation[:query_seqlen]
+
     output, head_cost = sol_attn_bhsd(
         query,
         key,
@@ -1798,17 +1855,26 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         dump_path=sol_attn_dump_path(),
         return_head_cost=cost_sink is not None,
         recipe=recipe,
+        # A no-op once the slice above has run, and still the whole trim for a caller that
+        # declares only the key side.
         key_seqlen=_sol_attn_key_seqlen(kwargs),
         # Set by a model that packs several modalities into one sequence, naming the tokens whose
         # blocks routing must not be allowed to drop. See sol_attn_bhsd.
-        exact_tokens=kwargs.get(SOL_EXACT_TOKENS_KEY),
-        sequence_permutation=kwargs.get(SOL_SEQUENCE_PERMUTATION_KEY),
-        sequence_inverse_permutation=kwargs.get(
-            SOL_SEQUENCE_INVERSE_PERMUTATION_KEY
-        ),
+        exact_tokens=exact_tokens,
+        sequence_permutation=sequence_permutation,
+        sequence_inverse_permutation=sequence_inverse_permutation,
     )
     if cost_sink is not None:
         cost_sink.copy_(head_cost)
+    if output.shape[2] < gathered_length:
+        # Give the rows back so the caller's own slicing, and the Ulysses all-to-all behind it,
+        # still see the shape they handed in. Zeros because these rows are discarded downstream;
+        # what matters is that they no longer took part in routing.
+        restored = output.new_zeros(
+            output.shape[0], output.shape[1], gathered_length, output.shape[3]
+        )
+        restored[:, :, : output.shape[2]] = output
+        output = restored
     return output, None
 
 

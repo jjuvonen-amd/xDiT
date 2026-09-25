@@ -634,6 +634,18 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                 # _pad_rows appends its rows, so the valid keys are the leading
                 # sequence_length rows and nothing beyond them is real.
                 "valid_kv_len": max_seqlen_k,
+                # The same count again, declared for the query side, which only a backend that
+                # POOLS queries needs. _pad_rows zeroes a pad row's hidden state, but the block
+                # modulates it as `norm(x) * (1 + scale) + shift` against a real adaLN row (the
+                # -1 tag is clamped to 0), and norm_q then renormalises the result to full
+                # real-token magnitude -- so a pad row carries an ordinary-sized query, not a
+                # small one, and every pad row carries the SAME one (RoPE at position 0 is the
+                # identity). A per-row backend does not care, because it discards those output
+                # rows. Sol-Attn routes one block selection per query tile, so leaving them in
+                # lets them write the threshold the real video rows at the end of the sequence
+                # are then served by. Named apart from valid_kv_len rather than reusing it
+                # because the key-side length is the wrong number for cross attention.
+                "valid_q_len": max_seqlen_k,
                 # Seeded from the launch config, not from the caller: nothing upstream of this
                 # model passes a beta, so without this the backend's own default would apply and
                 # --solattn_beta would do nothing. An explicit caller value still wins.
