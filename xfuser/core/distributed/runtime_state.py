@@ -389,6 +389,14 @@ class RuntimeState(metaclass=ABCMeta):
                     f"{attention_backend.value} attention is not available, "
                     "please update AITER"
                 ) from None
+            # Settle the per-device row question here, where it is cheap and eager. The attention
+            # call reads the answer from inside MiniMax-H3's compiled transformer, and asking it
+            # there traces aiter's manifest reader -- which opens a file, and so cannot be traced.
+            from xfuser.core.vsa_h3_aiter import vsa_h3_aiter_row_available
+
+            vsa_h3_aiter_row_available(
+                VSA_H3_AITER_RECIPE_BY_BACKEND[attention_backend]
+            )
         elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
             from xfuser.core.sparge_attention.sol import check_sol_attn_recipe
             # Fail here rather than on the first attention call: which recipes exist depends on the

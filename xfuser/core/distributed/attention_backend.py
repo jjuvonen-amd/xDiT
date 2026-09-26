@@ -2282,7 +2282,6 @@ def _triton_vsa_h3_attn_call(
 
 
 @register_attention_function(AttentionBackendType.AITER_BF16_VSA_H3)
-@torch.compiler.disable
 def _aiter_bf16_vsa_h3_attn_call(
     query,
     key,
@@ -2305,7 +2304,6 @@ def _aiter_bf16_vsa_h3_attn_call(
 
 
 @register_attention_function(AttentionBackendType.AITER_FP8_VSA_H3)
-@torch.compiler.disable
 def _aiter_fp8_vsa_h3_attn_call(
     query,
     key,

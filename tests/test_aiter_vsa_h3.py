@@ -486,20 +486,18 @@ def test_the_backend_rows_are_registered_and_carry_a_recipe_each():
 
 
 @pytest.mark.parametrize(
-    "backend, compiles",
-    [
-        ("AITER_BF16_VSA_H3", False),
-        ("AITER_FP8_VSA_H3", False),
-        ("TRITON_VSA_H3", True),
-    ],
+    "backend",
+    ["AITER_BF16_VSA_H3", "AITER_FP8_VSA_H3", "TRITON_VSA_H3"],
 )
-def test_torch_compile_is_refused_for_the_aiter_rows_alone(backend, compiles, monkeypatch):
-    """These rows disable Dynamo, and FastH3 compiles the transformer at fullgraph.
+def test_every_vsa_h3_row_accepts_torch_compile(backend, monkeypatch):
+    """All three VSA-H3 rows survive FastH3's fullgraph transformer compile.
 
-    A graph break inside a fullgraph region is an error, not a fallback, so the combination has to
-    be refused at config time with something a caller can act on rather than at the first forward
-    with a Dynamo traceback. The Triton row is here to hold the other side: it does compile, and a
-    refusal written against the whole VSA-H3 set would take it down with the AITER pair.
+    Upstream refused the AITER pair here, because they were torch.compiler.disable and a graph
+    break inside a fullgraph region is an error rather than a fallback. They are not disabled in
+    this tree: the two things that actually failed to trace were the per-device row query, which
+    reads aiter's manifest file, and the nested torch.compile wrappers around the gather and the
+    epilogue. Both are resolved where they arise, so the refusal has nothing left to protect and
+    a caller no longer has to choose between this kernel and compiling the transformer.
     """
     from types import SimpleNamespace
 
@@ -514,8 +512,4 @@ def test_torch_compile_is_refused_for_the_aiter_rows_alone(backend, compiles, mo
         xFuserFastH3Model.__mro__[1], "_validate_config", lambda self, config: None
     )
     runner = object.__new__(xFuserFastH3Model)
-    if compiles:
-        xFuserFastH3Model._validate_config(runner, config)
-        return
-    with pytest.raises(ValueError, match="use_torch_compile"):
-        xFuserFastH3Model._validate_config(runner, config)
+    xFuserFastH3Model._validate_config(runner, config)

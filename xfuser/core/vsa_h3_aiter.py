@@ -119,18 +119,35 @@ def _recipe_operands(recipe_id: str):
     return formats, scales, quantizers
 
 
-@functools.lru_cache(maxsize=None)
+# Memoised in a plain dict rather than with functools.lru_cache, which is not a style choice.
+# These rows run inside MiniMax-H3's whole-transformer compile, and Dynamo inlines an lru_cache
+# wrapper instead of calling it -- so the memoisation does not apply and it traces the query
+# itself, down into aiter's manifest reader, which calls builtin open(). That is untraceable, and
+# under fullgraph=True a hard error rather than a graph break. A module-global dict keyed by a
+# constant string is a constant Dynamo folds, so once the answer is present the expensive branch
+# below is never traced at all. runtime_state primes it at setup, outside any graph.
+_ROW_AVAILABLE: dict[str, bool] = {}
+
+
 def vsa_h3_aiter_row_available(recipe_id: str) -> bool:
     """Whether this device has a 64x64 sorted-sparse MHA v4 row for ``recipe_id``.
 
     Asked with the recipe's operands rather than for the geometry alone, because a geometry need
     not exist in every precision: 64x64 is BF16 and FP8 only, and the MX rows stop at 256x128.
     """
+    cached = _ROW_AVAILABLE.get(recipe_id)
+    if cached is not None:
+        return cached
     if _AITER is None or not torch.cuda.is_available():
-        return False
-    formats, scales, _ = _recipe_operands(recipe_id)
-    operands = _AITER.operands(*formats, *scales)
-    return VSA_H3_AITER_TILE in _AITER.block_tiles(operands, _AITER.sparse_mode)
+        available = False
+    else:
+        formats, scales, _ = _recipe_operands(recipe_id)
+        operands = _AITER.operands(*formats, *scales)
+        available = VSA_H3_AITER_TILE in _AITER.block_tiles(
+            operands, _AITER.sparse_mode
+        )
+    _ROW_AVAILABLE[recipe_id] = available
+    return available
 
 
 @functools.lru_cache(maxsize=None)
@@ -139,15 +156,40 @@ def _warn_once(message: str) -> None:
     logger.warning(message)
 
 
+def warn_if_padded_tiling(metadata: MiniMaxH3VSAMetadata) -> None:
+    """Say once that this tiling leaves key slots a per-tile block mask cannot mask out.
+
+    Call this from somewhere eager. Dynamo drops logging calls it cannot place rather than
+    breaking the graph, so the copy of this made from inside the attention row is lost on a
+    compiled run -- which is exactly the run whose accuracy cost most needs stating. The
+    transformer's out-of-graph metadata prep calls it for that case; ``_warn_once`` keeps the two
+    from doubling up.
+    """
+    if metadata.num_prefix_partial_tiles or (
+        metadata.num_full_video_tiles != metadata.num_video_tiles
+    ):
+        _warn_once(
+            "This VSA-H3 tiling leaves padded key slots, which a per-tile block mask cannot mask "
+            "out: a padded key scores 0 rather than -inf and takes softmax mass. Measured 2.8e-02 "
+            "relative L2 against FlexAttention on a default render, where the same row on a "
+            "tiling with no padding measures 2.7e-03."
+        )
+
+
 # The two ends of this path are pure data movement over the whole sequence, and the kernel in the
 # middle is the only part that is not. Both are compiled so Inductor emits one pass each instead of
 # the three or four an eager expression costs -- measured 1.52 -> 0.26 ms for the gather and
 # 0.75 -> 0.10 ms for the epilogue on a 125k-token render. They are compiled here, rather than by
-# the caller, because the attention row itself is torch.compiler.disable: nothing outside will
-# fuse them. dynamic=False because a run's geometry is fixed, so there is one shape to specialise
-# for and the first call's compile amortises over every layer of every step after it.
-@torch.compile(dynamic=False)
-def _tile_to_bshd(packed_bshd, tiled_to_packed_index, tiled_slot_valid):
+# the caller, for the eager path where nothing outside will fuse them. dynamic=False because a
+# run's geometry is fixed, so there is one shape to specialise for and the first call's compile
+# amortises over every layer of every step after it.
+#
+# Each is reached through a dispatcher below rather than called directly, because these rows also
+# run inside MiniMax-H3's whole-transformer compile. Same reason and same shape as
+# vsa_h3_attention._flex_attention_call: a compiled wrapper invoked from inside an outer compiled
+# region is what stops that transformer tracing at fullgraph=True. Under the outer compile the raw
+# body goes into the caller's graph, where Inductor fuses it anyway.
+def _tile_to_bshd_impl(packed_bshd, tiled_to_packed_index, tiled_slot_valid):
     """Gather packed rows into the kernel's padded BSHD tile buffer, in one pass.
 
     The caller's BHSD tensor transposed is already a BSHD view, so gathering along its sequence
@@ -162,8 +204,7 @@ def _tile_to_bshd(packed_bshd, tiled_to_packed_index, tiled_slot_valid):
     return torch.where(tiled_slot_valid.view(1, -1, 1, 1), tiled, torch.zeros_like(tiled))
 
 
-@torch.compile(dynamic=False)
-def _untile_and_mix(
+def _untile_and_mix_impl(
     sparse_bhsd, packed_to_tiled_index, compressed, packed_token_tile, gate
 ):
     """Undo the tiling and add the gated compression branch, in one pass.
@@ -174,6 +215,24 @@ def _untile_and_mix(
     """
     packed = sparse_bhsd.index_select(2, packed_to_tiled_index)
     return packed + compressed.index_select(2, packed_token_tile) * gate
+
+
+_compiled_tile_to_bshd = torch.compile(_tile_to_bshd_impl, dynamic=False)
+_compiled_untile_and_mix = torch.compile(_untile_and_mix_impl, dynamic=False)
+
+
+def _tile_to_bshd(*args):
+    """Dispatch the gather without nesting torch.compile inside a graph."""
+    if torch.compiler.is_compiling():
+        return _tile_to_bshd_impl(*args)
+    return _compiled_tile_to_bshd(*args)
+
+
+def _untile_and_mix(*args):
+    """Dispatch the epilogue without nesting torch.compile inside a graph."""
+    if torch.compiler.is_compiling():
+        return _untile_and_mix_impl(*args)
+    return _compiled_untile_and_mix(*args)
 
 
 def _pool_bshd(tiled_bshd: torch.Tensor, metadata: MiniMaxH3VSAMetadata):
@@ -239,15 +298,7 @@ def aiter_h3_vsa_attention(
         raise ValueError(
             f"VSA-H3 on AITER needs head dimension {VSA_H3_AITER_HEAD_DIM}, got {head_dim}"
         )
-    if metadata.num_prefix_partial_tiles or (
-        metadata.num_full_video_tiles != metadata.num_video_tiles
-    ):
-        _warn_once(
-            "This VSA-H3 tiling leaves padded key slots, which a per-tile block mask cannot mask "
-            "out: a padded key scores 0 rather than -inf and takes softmax mass. Measured 2.8e-02 "
-            "relative L2 against FlexAttention on a default render, where the same row on a "
-            "tiling with no padding measures 2.7e-03."
-        )
+    warn_if_padded_tiling(metadata)
 
     tiled = [
         _tile_to_bshd(

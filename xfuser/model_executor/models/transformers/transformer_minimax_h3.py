@@ -25,6 +25,7 @@ from xfuser.core.distributed.attention_backend import (
     SOL_EXACT_TOKENS_KEY,
     SOL_SEQUENCE_INVERSE_PERMUTATION_KEY,
     SOL_SEQUENCE_PERMUTATION_KEY,
+    VSA_H3_AITER_RECIPE_BY_BACKEND,
     VSA_H3_BACKENDS,
     AttentionBackendType,
 )
@@ -471,6 +472,13 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             (text_count, audio_count), video_shape, position_ids.device
         )
         self._vsa_h3_metadata_key = key
+        # Said here because here is eager. The AITER rows warn about a padded tiling from inside
+        # the attention call too, but under torch.compile Dynamo drops that logging call rather
+        # than breaking the graph -- so on a compiled run this is the only copy that survives.
+        if _effective_backend(self.attention_backend) in VSA_H3_AITER_RECIPE_BY_BACKEND:
+            from xfuser.core.vsa_h3_aiter import warn_if_padded_tiling
+
+            warn_if_padded_tiling(self._vsa_h3_metadata)
 
     @apply_lora_scale("attention_kwargs")
     def forward(
