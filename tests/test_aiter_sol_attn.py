@@ -70,6 +70,17 @@ def _recipes_on_this_device():
     return [r for r in sol.SOL_ATTN_RECIPES if allowed is None or r in allowed]
 
 
+def _any_precision_serves(tile):
+    """Whether this GPU has a Sol-Attn kernel at `tile` in ANY precision.
+
+    Asked through mha_v4_block_tiles_in_any_precision rather than the per-Q-tile query, which
+    refuses where the rows disagree on the KV tile -- as gfx950's now do at a 256-row query tile.
+    """
+    from xfuser.core.sparge_attention import sol
+
+    return tuple(tile) in sol._block_tiles_in_any_precision(sol._AITER.sol_attn_mode)
+
+
 def _serves(recipe, tile):
     """Whether this GPU has a Sol-Attn kernel at `tile` for `recipe`'s operands."""
     from xfuser.core.sparge_attention import sol
@@ -284,15 +295,15 @@ def test_forced_blocks_are_added_to_what_routing_picked():
 
     from xfuser.core.sparge_attention.sol import (
         _force_blocks_from_tokens,
-        _kv_tile,
         _quantize,
         _RECIPES,
+        sol_attn_block_tile,
         sol_attn_routing_for,
     )
 
-    tile = _kv_tile()
-    query, key, value = _operands(seqlen=8 * tile, heads=2)
     recipe = _RECIPES["fp8"]
+    tile = sol_attn_block_tile(recipe)[1]
+    query, key, value = _operands(seqlen=8 * tile, heads=2)
     q, k, v = _quantize(
         recipe,
         *(x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value)),
@@ -302,7 +313,7 @@ def test_forced_blocks_are_added_to_what_routing_picked():
     # A band the size of one block, as a minority modality would be.
     exact_tokens = torch.zeros(8 * tile, dtype=torch.bool, device="cuda")
     exact_tokens[3 * tile : 4 * tile] = True
-    forced = _force_blocks_from_tokens(exact_tokens, None, 8 * tile)
+    forced = _force_blocks_from_tokens(exact_tokens, None, 8 * tile, tile)
     assert forced.tolist() == [False, False, False, True, False, False, False, False]
 
     routed = sol_attn_routing_for(q, k, v, 0.5, recipe)["block_attn_mask"]
@@ -317,19 +328,23 @@ def test_forced_blocks_are_added_to_what_routing_picked():
 
 def test_forced_blocks_follow_the_same_trim_and_pad_as_kv():
     """The token mask has to stay in step with K/V or it names the wrong blocks."""
-    # _kv_tile() reads the manifest for the device, so this needs one even though the check below
-    # is pure tensor bookkeeping.
+    # The tile is read from the manifest for the device, so this needs one even though the check
+    # below is pure tensor bookkeeping.
     _require_sol_attn()
 
-    from xfuser.core.sparge_attention.sol import _force_blocks_from_tokens, _kv_tile
+    from xfuser.core.sparge_attention.sol import (
+        _force_blocks_from_tokens,
+        _RECIPES,
+        sol_attn_block_tile,
+    )
 
     import torch
 
-    tile = _kv_tile()
+    tile = sol_attn_block_tile(_RECIPES["fp8"])[1]
     # Two real blocks plus a partial third, trimmed from a caller pad, then padded back to tile.
     tokens = torch.zeros(3 * tile, dtype=torch.bool)
     tokens[2 * tile : 2 * tile + 5] = True
-    forced = _force_blocks_from_tokens(tokens, 2 * tile + 5, 3 * tile)
+    forced = _force_blocks_from_tokens(tokens, 2 * tile + 5, 3 * tile, tile)
     assert forced.tolist() == [False, False, True]
 
 
@@ -393,11 +408,15 @@ def test_sol_attn_refuses_multi_sequence_varlen():
         )
 
 
-def _kv_block(key):
-    """Number of pooled KV blocks in a BHSD key, at the tile this device's manifest row uses."""
-    from xfuser.core.sparge_attention.sol import _kv_tile
+def _kv_block(key, recipe="fp8"):
+    """Number of pooled KV blocks in a BHSD key, at the tile `recipe`'s manifest row uses.
 
-    tile = _kv_tile()
+    Takes a recipe because the rows need not share one: aiter routes BF16 on a 64-key tile and the
+    per-tensor rows on 128, so there is no arch-wide block count to ask for.
+    """
+    from xfuser.core.sparge_attention.sol import _RECIPES, sol_attn_block_tile
+
+    tile = sol_attn_block_tile(_RECIPES[recipe])[1]
     return -(-key.shape[2] // tile)
 
 
@@ -1051,11 +1070,59 @@ def test_an_unset_block_tile_takes_the_kernel_default(monkeypatch):
     """Unset is the shipped configuration, and it must not pin a geometry of its own."""
     _require_sol_attn()
 
-    from aiter.ops.mha_v4 import mha_v4_block_tile
+    from aiter.ops.mha_v4 import MHA_V4_SOL_ATTN_MODE, mha_v4_block_tile
     from xfuser.core.sparge_attention import sol
 
     _override_tile(monkeypatch, None)
-    assert sol.sol_attn_block_tile() == mha_v4_block_tile()
+    for recipe_id in _recipes_on_this_device():
+        recipe = sol._RECIPES[recipe_id]
+        expected = mha_v4_block_tile(
+            sol._recipe_operands(recipe), MHA_V4_SOL_ATTN_MODE
+        )
+        assert sol.sol_attn_block_tile(recipe) == expected
+
+
+def test_the_default_block_tile_is_read_per_recipe_not_per_arch():
+    """The whole reason sol_attn_block_tile takes a recipe: rows need not share a geometry.
+
+    aiter moved the BF16 rows to a 64-key KV tile while the per-tensor rows stayed at 128, and it
+    refuses an operand-blind query rather than pick one. A refactor that caches one tile for the
+    process would pass every other test here and cut masks for the wrong blocks on whichever
+    recipe it guessed wrong, so the disagreement itself is what this pins.
+    """
+    _require_sol_attn()
+
+    from xfuser.core.sparge_attention import sol
+
+    tiles = {
+        rid: sol.sol_attn_block_tile(sol._RECIPES[rid])
+        for rid in _recipes_on_this_device()
+    }
+    if len(set(tiles.values())) == 1:
+        pytest.skip(f"this device serves one Sol geometry for every recipe: {tiles}")
+    assert len(set(tiles.values())) > 1
+
+
+def test_an_aiter_that_cannot_answer_the_tile_query_does_not_break_the_import(monkeypatch):
+    """The capability probe must degrade to the arch default, never propagate.
+
+    It runs at module import of attention_backend, which is on xfuser's own import path, so
+    anything the geometry query raises fails `import xfuser` for every backend and every model --
+    not just for Sol-Attn. That is not hypothetical: aiter made the query refuse an operand-blind
+    call and the previous `except ImportError` let the ValueError straight through.
+    """
+    import aiter.ops.mha_v4 as mha_v4
+
+    from xfuser.core.distributed.attention_backend import (
+        _probe_aiter_mha_v4_capabilities,
+    )
+
+    def refuse(*args, **kwargs):
+        raise ValueError("rows disagree on ts_kv at ts_qo=256")
+
+    monkeypatch.setattr(mha_v4, "mha_v4_block_tile", refuse)
+    capabilities = _probe_aiter_mha_v4_capabilities(mha_v4.mha_v4)
+    assert capabilities.kv_tile == (64 if capabilities.is_gfx942 else 128)
 
 
 def test_a_block_tile_with_no_kernel_is_rejected_by_name(monkeypatch):
@@ -1093,8 +1160,8 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     from xfuser.core.sparge_attention import sol
     from xfuser.core.sparge_attention.head_balance import COST_SINK_KEY
 
-    if (64, 64) not in sol._AITER.block_tiles():
-        pytest.skip("this build has no 64x64 Sol-Attn row.")
+    if not _serves("fp8", (64, 64)):
+        pytest.skip("this build has no 64x64 FP8 Sol-Attn row.")
 
     monkeypatch.setattr(ab, "get_ulysses_parallel_world_size", lambda: 1)
     monkeypatch.setattr(ab, "get_ring_parallel_world_size", lambda: 1)
@@ -1104,9 +1171,14 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     query, key, value = _operands(seqlen=seqlen, heads=heads, cluster=64)
     call = ATTENTION_FUNCTION_REGISTRY[AttentionBackendType.AITER_FP8_SOL]
 
+    recipe = sol._RECIPES["fp8"]
+    fp8_default = sol._AITER.block_tile(
+        sol._recipe_operands(recipe), sol._AITER.sol_attn_mode
+    )
+
     def run(tile):
         _override_tile(monkeypatch, tile)
-        assert sol.sol_attn_block_tile() == (tile or sol._AITER.block_tile())
+        assert sol.sol_attn_block_tile(recipe) == (tile or fp8_default)
         sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
         with torch.no_grad():
             out, _ = call(query, key, value, dropout_p=0.0, is_causal=False,
@@ -1116,7 +1188,7 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
     default, _ = run(None)
     fine, fine_blocks = run((64, 64))
 
-    q_tile, kv_tile = sol._AITER.block_tile()
+    q_tile, kv_tile = fp8_default
     every_default_tile = heads * (seqlen // q_tile) * (seqlen // kv_tile)
     assert fine_blocks > every_default_tile, (
         f"64x64 reported {fine_blocks:.0f} selected blocks, which {q_tile}x{kv_tile} could have "
@@ -1147,7 +1219,7 @@ def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
     from xfuser.core.sparge_attention import sol
     from xfuser.core.sparge_attention.sol import SolAttnUnsupported, check_sol_attn_recipe
 
-    if (64, 64) not in sol._AITER.block_tiles():
+    if not _any_precision_serves((64, 64)):
         pytest.skip("this build has no 64x64 Sol-Attn row.")
 
     _override_tile(monkeypatch, (64, 64))
@@ -1165,18 +1237,21 @@ def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
 
 
 def test_every_recipe_serves_the_default_block_tile(monkeypatch):
-    """The unset default has to work everywhere, which is what makes it the safe default.
+    """Each recipe's unset default has to be a row that recipe actually has.
 
-    Without this the geometry filtering above could narrow to nothing for some recipe and only the
-    64x64 tests would notice, since an override is what they set.
+    Not one shared tile: aiter routes BF16 on a 64-key KV tile and the per-tensor rows on 128, so
+    there is no arch-wide default left to assert. What still has to hold -- and is what made this
+    the safe configuration -- is that whatever a recipe resolves to unset, it can run. Without
+    this the geometry filtering above could narrow to nothing for some recipe and only the 64x64
+    tests would notice, since an override is what they set.
     """
     _require_sol_attn()
 
     from xfuser.core.sparge_attention import sol
 
     _override_tile(monkeypatch, None)
-    tile = sol.sol_attn_block_tile()
     for recipe in _recipes_on_this_device():
+        tile = sol.sol_attn_block_tile(sol._RECIPES[recipe])
         assert _serves(recipe, tile), (
             f"the '{recipe}' recipe has no {tile[0]}x{tile[1]} Sol-Attn row, so the default "
-            "geometry is not the one every recipe serves")
+            "geometry it resolves to is one it cannot run")

@@ -54,9 +54,30 @@ def _probe_aiter_mha_v4_capabilities(mha_v4_fn) -> _AiterMhaV4Capabilities:
     kv_tile = 64 if is_gfx942 else 128
     if enabled:
         try:
-            from aiter.ops.mha_v4 import mha_v4_kv_tile as _aiter_mha_v4_kv_tile
-            kv_tile = int(_aiter_mha_v4_kv_tile())
-        except ImportError:
+            # Asked for the Sparge rows' own operands rather than for the arch. gfx950's
+            # block-sparse rows no longer agree on the KV tile at a 256-row query tile -- BF16 and
+            # BF16/FP8 route on 64 keys, the rest on 128 -- so aiter refuses an operand-blind query
+            # instead of picking one. The only consumer of this field is _mha_v4_sparge_tile, which
+            # serves AITER_MHA_V4_GFX942_SPARGE_BACKENDS: the fp8 and i8fp8 per-tensor rows. Those
+            # two share a KV tile on both arches, so one query answers for both.
+            from aiter.ops.mha_v4 import (
+                AttentionScaleMode,
+                MHA_V4_SPARSE_MODE,
+                mha_v4_block_tile,
+                mha_v4_operands,
+                native_fp8_format,
+            )
+
+            fp8 = native_fp8_format()
+            per_tensor = AttentionScaleMode.F32_PER_TENSOR
+            operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
+            kv_tile = int(mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE)[1])
+        except (ImportError, AttributeError, TypeError, ValueError):
+            # Deliberately broader than ImportError, and not defensive padding: this probe runs at
+            # module import of attention_backend, which is on xfuser's own import path, so anything
+            # this geometry query raises fails `import xfuser` for every backend and every model.
+            # An aiter that has renamed, re-signed or cannot answer the query is a reason to keep
+            # the arch default above, not a reason for the package to be unimportable.
             pass
     return _AiterMhaV4Capabilities(
         enabled=enabled,

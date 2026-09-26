@@ -58,13 +58,16 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # layer and the step axis. Call index is step * num_layers + layer.
     "SOL_ATTN_DUMP_CALLS": lambda: os.environ.get("XFUSER_SOL_ATTN_DUMP_CALLS", "0"),
     # Sol-Attn routing/dispatch tile as "QxKV", e.g. "64x64". Unset takes the ASM row the aiter
-    # manifest calls default: 256x128 on gfx950, 256x64 on gfx942.
+    # manifest calls default FOR THE RECIPE, which is not one number per arch: on gfx950 the BF16
+    # and BF16/FP8 rows route 256x64 and the per-tensor and MX rows 256x128; gfx942 is 256x64.
     #
-    # The only alternative gfx950 ships is 64x64, and only for the FP8 and BF16 recipes, so it
-    # takes --attention_backend aiter_fp8_sol or aiter_bf16_sol; the remaining rows exist at
-    # 256x128 alone and reject the override at setup, naming the recipe. Which rows serve it is
-    # read from aiter's manifest, so a build that adds more needs no change here. It quadruples
-    # routing resolution -- a
+    # So an override has to be legal for the recipe the run selected, not just for the GPU. gfx950
+    # serves 64x64 to FP8 and BF16 (--attention_backend aiter_fp8_sol or aiter_bf16_sol) and to
+    # nothing else, and 256x128 to everything EXCEPT BF16 and BF16/FP8 -- pinning 256x128 on
+    # aiter_bf16_sol is now rejected at setup, naming the recipe. Which rows serve what is read
+    # from aiter's manifest per call, so a build that adds or moves rows needs no change here.
+    #
+    # Going to 64x64 quadruples routing resolution -- a
     # block is a quarter the KV width and a quarter the query rows, so a query tile's threshold is
     # computed over 4x more, 4x smaller blocks. That costs throughput per token (the same KV is
     # re-read by 4x as many query tiles), so it only wins where 128-token blocks are too coarse to
