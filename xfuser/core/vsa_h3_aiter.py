@@ -8,9 +8,9 @@ that mass twice, once per formulation.
 
 The selection is shared with the other two VSA-H3 kernels, not reimplemented: build_h3_vsa_kv_list
 already returns the ascending per-query-tile key-tile list that the sorted-sparse row's ragged LUT
-wants, so the conversion below is index arithmetic on shapes and no device work at all. As on the
-Triton path, that list's rows for the prefix query tiles go unused: those rows are dense, and this
-module recomputes them rather than teaching the AITER row to walk a second, wider tile list.
+wants, so the conversion below is index arithmetic on shapes and no device work at all. The prefix
+query tiles are dense, as FastH3 was trained, and the row's ragged LUT expresses that directly:
+those rows point at one appended run of every tile id instead of at their P + K selection.
 """
 from __future__ import annotations
 
@@ -207,20 +207,15 @@ def _tile_to_bshd_impl(packed_bshd, tiled_to_packed_index, tiled_slot_valid):
 
 
 def _untile_and_mix_impl(
-    sparse_bhsd, packed_to_tiled_index, compressed, packed_token_tile, gate, dense_prefix
+    sparse_bhsd, packed_to_tiled_index, compressed, packed_token_tile, gate
 ):
     """Undo the tiling and add the gated compression branch, in one pass.
 
     Fused rather than merely faster: eager rounds the compressed-times-gate product to bf16 before
     the add, and this keeps it in fp32 until the one store, which lands within a bf16 ulp of the
     fp32 result where the eager form does not.
-
-    ``dense_prefix`` replaces the sparse rows the kernel produced for the prefix query tiles. It is
-    spliced in before the gate add, not after, because the compression branch belongs on every row
-    including the dense ones -- that is the order ``h3_vsa_attention`` uses.
     """
     packed = sparse_bhsd.index_select(2, packed_to_tiled_index)
-    packed[:, :, : dense_prefix.shape[2]] = dense_prefix
     return packed + compressed.index_select(2, packed_token_tile) * gate
 
 
@@ -255,24 +250,41 @@ def _pool_bshd(tiled_bshd: torch.Tensor, metadata: MiniMaxH3VSAMetadata):
     return pooled.permute(0, 2, 1, 3) / metadata.variable_block_sizes.view(1, 1, -1, 1)
 
 
-def _ragged_lut(kv_indices: torch.Tensor, width: int):
+def _ragged_lut(kv_indices: torch.Tensor, width: int, num_prefix_tiles: int):
     """Reshape a VSA-H3 key-tile list into the sorted-sparse row's ragged LUT triple.
 
     ``kv_indices`` is ``[B, H, query tiles, slots]`` with the first ``width`` slots holding this
     query tile's selection and the rest a sentinel; the kernel indexes one flat list by a start and
     a count per (batch, head, query tile), in exactly that row-major order. So the list is the
-    buffer viewed flat, the starts are its row stride, and the counts are constant -- the ragged
-    form's generality is unused here because every query tile keeps the same number of tiles.
+    buffer viewed flat and the starts are its row stride.
 
     The sentinel slots are never addressed, since the count stops short of them. They are why the
     starts are a stride rather than a cumulative sum of the counts.
+
+    This is where the prefix query tiles are made dense, as FastH3 was trained. Rather than widen
+    the rectangular buffer to hold every tile id for the sake of a handful of rows, one ascending
+    run of all tile ids is appended once and those rows' starts point into it with a count of every
+    tile. That is the ragged form's generality finally being used, and it keeps the dense rows
+    inside the same kernel launch -- computing them separately costs a pass over all of K/V at 425
+    query rows, which no flash kernel has the query parallelism to make cheap.
     """
     batch, heads, query_tiles, slots = kv_indices.shape
     rows = batch * heads * query_tiles
     device = kv_indices.device
     lut_start = torch.arange(rows, dtype=torch.int32, device=device) * slots
     lut_count = torch.full((rows,), width, dtype=torch.int32, device=device)
-    return kv_indices.reshape(-1), lut_start, lut_count
+
+    num_tiles = query_tiles
+    dense = torch.arange(num_tiles, dtype=torch.int32, device=device)
+    flat = torch.cat((kv_indices.reshape(-1), dense))
+    prefix_rows = (
+        torch.arange(rows, device=device)
+        .view(batch * heads, query_tiles)[:, :num_prefix_tiles]
+        .reshape(-1)
+    )
+    lut_start[prefix_rows] = rows * slots
+    lut_count[prefix_rows] = num_tiles
+    return flat, lut_start, lut_count
 
 
 def aiter_h3_vsa_attention(
@@ -325,7 +337,7 @@ def aiter_h3_vsa_attention(
     width = metadata.num_prefix_tiles + compute_h3_vsa_topk(
         sparsity, metadata.num_video_tiles
     )
-    kv_block_indices, lut_start, lut_count = _ragged_lut(kv_indices, width)
+    kv_block_indices, lut_start, lut_count = _ragged_lut(kv_indices, width, metadata.num_prefix_tiles)
 
     formats, scales, quantizers = _recipe_operands(recipe)
     # The tile buffers are already in the kernel's BSHD layout, so a rotated operand is rotated
@@ -353,22 +365,10 @@ def aiter_h3_vsa_attention(
         pooled_key.to(query.dtype),
         pooled_value.to(query.dtype),
     )
-    # The prefix (text/audio) query rows attend to every key, as FastH3 was trained; only video
-    # query rows are sparse. The kernel gave these rows the same P + K tiles as a video tile, so
-    # they are recomputed here and spliced over its output. Packed rows carry no padding, so this
-    # is one plain attention call -- the same thing h3_vsa_attention does on the Flex path.
-    #
-    # Taken from the unquantized operands even on the FP8 row. The row quantizes to make the sparse
-    # walk cheap, and 1% of the rows run dense either way, so spending FP8 on them would buy nothing
-    # and cost accuracy on exactly the rows the reference keeps exact.
-    dense_prefix = F.scaled_dot_product_attention(
-        query[:, :, : metadata.num_prefix_tokens], key, value
-    )
     return _untile_and_mix(
         sparse_output.transpose(1, 2),
         metadata.packed_to_tiled_index,
         compressed.to(query.dtype),
         metadata.packed_token_tile,
         gate,
-        dense_prefix,
     )

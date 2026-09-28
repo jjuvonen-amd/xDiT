@@ -246,17 +246,12 @@ def test_the_fused_epilogue_is_no_further_from_exact_than_the_plain_one():
         ) * gate.to(dtype)
 
     exact = plain(torch.float32)
-    # The dense-prefix splice is handed back exactly the rows the untiling already produced, so it
-    # is a no-op here. This test is about the gate mix staying in fp32 until the store, and a splice
-    # that changed the values would measure something else.
-    untiled = untile_h3_vsa_bhsd(sparse_bshd.transpose(1, 2), metadata)
     fused = _untile_and_mix(
         sparse_bshd.transpose(1, 2),
         metadata.packed_to_tiled_index,
         compressed,
         metadata.packed_token_tile,
         gate,
-        untiled[:, :, : metadata.num_prefix_tokens],
     )
 
     assert fused.dtype == torch.bfloat16
@@ -294,21 +289,30 @@ def test_the_ragged_lut_addresses_the_same_tiles_the_selection_chose():
     kv_indices = build_h3_vsa_kv_list(pooled_query, pooled_key, metadata)
     width = _selection_width(metadata)
 
-    kv_block_indices, lut_start, lut_count = _ragged_lut(kv_indices, width)
+    prefix = metadata.num_prefix_tiles
+    kv_block_indices, lut_start, lut_count = _ragged_lut(kv_indices, width, prefix)
 
     batch, heads, query_tiles, _ = kv_indices.shape
     assert lut_start.numel() == batch * heads * query_tiles
     assert lut_count.numel() == lut_start.numel()
-    assert torch.equal(lut_count, torch.full_like(lut_count, width))
+    every_tile = torch.arange(
+        metadata.num_tiles, dtype=kv_indices.dtype, device=kv_indices.device
+    )
     for row, (b, h, q) in enumerate(
         (b, h, q)
         for b in range(batch)
         for h in range(heads)
         for q in range(query_tiles)
     ):
-        start = int(lut_start[row])
-        addressed = kv_block_indices[start : start + width]
-        assert torch.equal(addressed, kv_indices[b, h, q, :width])
+        start, count = int(lut_start[row]), int(lut_count[row])
+        addressed = kv_block_indices[start : start + count]
+        if q < prefix:
+            # A prefix query tile is dense: it addresses every tile, in order, exactly once.
+            assert count == metadata.num_tiles
+            assert torch.equal(addressed, every_tile)
+        else:
+            assert count == width
+            assert torch.equal(addressed, kv_indices[b, h, q, :width])
         # Every addressed tile is a real tile, never the sentinel the list is padded with.
         assert int(addressed.max()) < metadata.num_tiles
 
