@@ -246,12 +246,17 @@ def test_the_fused_epilogue_is_no_further_from_exact_than_the_plain_one():
         ) * gate.to(dtype)
 
     exact = plain(torch.float32)
+    # The dense-prefix splice is handed back exactly the rows the untiling already produced, so it
+    # is a no-op here. This test is about the gate mix staying in fp32 until the store, and a splice
+    # that changed the values would measure something else.
+    untiled = untile_h3_vsa_bhsd(sparse_bshd.transpose(1, 2), metadata)
     fused = _untile_and_mix(
         sparse_bshd.transpose(1, 2),
         metadata.packed_to_tiled_index,
         compressed,
         metadata.packed_token_tile,
         gate,
+        untiled[:, :, : metadata.num_prefix_tokens],
     )
 
     assert fused.dtype == torch.bfloat16

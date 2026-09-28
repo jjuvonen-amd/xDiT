@@ -8,7 +8,9 @@ that mass twice, once per formulation.
 
 The selection is shared with the other two VSA-H3 kernels, not reimplemented: build_h3_vsa_kv_list
 already returns the ascending per-query-tile key-tile list that the sorted-sparse row's ragged LUT
-wants, so the conversion below is index arithmetic on shapes and no device work at all.
+wants, so the conversion below is index arithmetic on shapes and no device work at all. As on the
+Triton path, that list's rows for the prefix query tiles go unused: those rows are dense, and this
+module recomputes them rather than teaching the AITER row to walk a second, wider tile list.
 """
 from __future__ import annotations
 
@@ -205,15 +207,20 @@ def _tile_to_bshd_impl(packed_bshd, tiled_to_packed_index, tiled_slot_valid):
 
 
 def _untile_and_mix_impl(
-    sparse_bhsd, packed_to_tiled_index, compressed, packed_token_tile, gate
+    sparse_bhsd, packed_to_tiled_index, compressed, packed_token_tile, gate, dense_prefix
 ):
     """Undo the tiling and add the gated compression branch, in one pass.
 
     Fused rather than merely faster: eager rounds the compressed-times-gate product to bf16 before
     the add, and this keeps it in fp32 until the one store, which lands within a bf16 ulp of the
     fp32 result where the eager form does not.
+
+    ``dense_prefix`` replaces the sparse rows the kernel produced for the prefix query tiles. It is
+    spliced in before the gate add, not after, because the compression branch belongs on every row
+    including the dense ones -- that is the order ``h3_vsa_attention`` uses.
     """
     packed = sparse_bhsd.index_select(2, packed_to_tiled_index)
+    packed[:, :, : dense_prefix.shape[2]] = dense_prefix
     return packed + compressed.index_select(2, packed_token_tile) * gate
 
 
@@ -281,7 +288,7 @@ def aiter_h3_vsa_attention(
     """VSA-H3 attention through an AITER 64x64 sorted-sparse row, gate applied.
 
     Same contract as ``h3_vsa_attention``: packed ``[B, H, S, D]`` in, packed out, with the
-    compression branch and the learned gate already mixed in.
+    compression branch and the learned gate already mixed in, and the prefix query rows dense.
 
     Unlike the Triton kernel this one cannot read packed rows through the tile map, so the padded
     tile buffers are built here. It also masks whole tiles only, which is what the padding warning
@@ -346,10 +353,22 @@ def aiter_h3_vsa_attention(
         pooled_key.to(query.dtype),
         pooled_value.to(query.dtype),
     )
+    # The prefix (text/audio) query rows attend to every key, as FastH3 was trained; only video
+    # query rows are sparse. The kernel gave these rows the same P + K tiles as a video tile, so
+    # they are recomputed here and spliced over its output. Packed rows carry no padding, so this
+    # is one plain attention call -- the same thing h3_vsa_attention does on the Flex path.
+    #
+    # Taken from the unquantized operands even on the FP8 row. The row quantizes to make the sparse
+    # walk cheap, and 1% of the rows run dense either way, so spending FP8 on them would buy nothing
+    # and cost accuracy on exactly the rows the reference keeps exact.
+    dense_prefix = F.scaled_dot_product_attention(
+        query[:, :, : metadata.num_prefix_tokens], key, value
+    )
     return _untile_and_mix(
         sparse_output.transpose(1, 2),
         metadata.packed_to_tiled_index,
         compressed.to(query.dtype),
         metadata.packed_token_tile,
         gate,
+        dense_prefix,
     )
