@@ -255,7 +255,12 @@ class xFuserHunyuanvideo15Model(xFuserModel):
             "num_frames": input_args["num_frames"],
             "generator": self._make_generator(input_args["seed"]),
             "prompt": input_args["prompt"],
+            "negative_prompt": input_args.get("negative_prompt"),
         }
+        # HunyuanVideo-1.5 reads its CFG scale from the pipeline's guider, not a call argument.
+        guidance_scale = input_args.get("guidance_scale")
+        if guidance_scale is not None:
+            self.pipe.guider = self.pipe.guider.new(guidance_scale=guidance_scale)
         if self.config.task == "i2v":
             kwargs["image"] = input_args["image"]
         else:  # t2v task
