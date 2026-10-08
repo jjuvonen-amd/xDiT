@@ -99,6 +99,49 @@ def _set_effective_heads_for_ulysses(transformer, ulysses_degree: int) -> None:
 
     transformer.config.num_attention_heads = effective_heads
 
+def _compile_vae_decoder(pipe, mode, dynamic) -> None:
+    """Compile the VAE decoder, after taking AITER's GroupNorm back out of it.
+
+    Two separate things, but neither pays off without the other.
+
+    ``torch.compile(vae)`` would be a no-op: the pipeline calls ``vae.decode``,
+    not ``vae.forward``, so the compiled wrapper is never entered.  The decoder
+    submodule is the thing whose ``forward`` actually runs.
+
+    And compiling it alone only gets about half the win, because xDiT swaps
+    ``torch.nn.GroupNorm`` for AITER's globally at import.  AITER's is much the
+    faster of the two run eagerly -- 30.4 ms vs 74.2 ms for this decoder -- but
+    it is an opaque custom op, so it is also a fusion barrier: the SiLU, the
+    convolution bias and the residual add on either side of it each stay their
+    own pass over a full-resolution activation.  Handing those back to Inductor
+    beats the faster-but-unfusable kernel, but only once there is a compiler to
+    hand them to.  Measured on the decode half of a 1024x1024 run: 30.4 ms
+    eager, 28.5 ms compiled with AITER GroupNorm, 26.0 ms compiled without.
+
+    So the restore is strictly coupled to the compile and must not outlive it.
+    """
+    vae = getattr(pipe, "vae", None)
+    decoder = getattr(vae, "decoder", None)
+    if decoder is None:
+        return
+    from xfuser.envs import _TORCH_GROUPNORM
+
+    for parent in decoder.modules():
+        for child_name, child in list(parent.named_children()):
+            if type(child).__module__ != "aiter.ops.groupnorm":
+                continue
+            if not getattr(child, "affine", False) or child.weight is None:
+                continue  # non-affine AITER GroupNorm already defers to torch
+            replacement = _TORCH_GROUPNORM(
+                child.num_groups, child.weight.shape[0], eps=child.eps, affine=True
+            ).to(device=child.weight.device, dtype=child.weight.dtype)
+            replacement.weight = child.weight
+            replacement.bias = child.bias
+            setattr(parent, child_name, replacement)
+
+    vae.decoder = torch.compile(decoder, mode=mode, dynamic=dynamic)
+
+
 @register_model("Tongyi-MAI/Z-Image")
 @register_model("Z-Image")
 class xFuserZImageModel(xFuserModel):
@@ -156,6 +199,31 @@ class xFuserZImageModel(xFuserModel):
             ),
         },
     )
+
+    def _compile_model(self, input_args: dict) -> None:
+        # Parallel VAE shards the decoder across ranks and owns its execution;
+        # leave that path alone.
+        if not self.config.use_parallel_vae:
+            _compile_vae_decoder(
+                self.pipe, self._get_compile_mode(), self._get_compile_dynamic()
+            )
+        super()._compile_model(input_args)
+
+    def _get_compiled_pipe_components(self) -> list[str]:
+        """Compile the text encoder alongside the transformer.
+
+        Run eager it is ~4800 kernel launches per call and ~44 ms of the ~880 ms
+        this model spends on the GPU -- almost none of it arithmetic.  Its
+        RMSNorms alone come out as a mean/pow/rsqrt/mul/mul quintet per norm,
+        each a few microseconds of launch for a couple of MB of data.  Letting
+        Inductor fuse it takes that to ~1700 launches and ~28 ms.
+
+        Safe to compile because the shape is pinned: ``ZImagePipeline`` tokenizes
+        with ``padding="max_length"``, so the encoder sees the same sequence
+        length whatever the prompt is, and nothing here re-triggers compilation
+        between requests.
+        """
+        return ["transformer", "text_encoder"]
 
     def _customize_settings(self, config) -> None:
         """Exclude context_refiner from INT8 quant when sequence parallelism is active.
@@ -247,6 +315,31 @@ class xFuserZImageTurboModel(xFuserModel):
         fp8_text_encoder_module_list=["text_encoder.layers"],
         int8_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
     )
+
+    def _compile_model(self, input_args: dict) -> None:
+        # Parallel VAE shards the decoder across ranks and owns its execution;
+        # leave that path alone.
+        if not self.config.use_parallel_vae:
+            _compile_vae_decoder(
+                self.pipe, self._get_compile_mode(), self._get_compile_dynamic()
+            )
+        super()._compile_model(input_args)
+
+    def _get_compiled_pipe_components(self) -> list[str]:
+        """Compile the text encoder alongside the transformer.
+
+        Run eager it is ~4800 kernel launches per call and ~44 ms of the ~880 ms
+        this model spends on the GPU -- almost none of it arithmetic.  Its
+        RMSNorms alone come out as a mean/pow/rsqrt/mul/mul quintet per norm,
+        each a few microseconds of launch for a couple of MB of data.  Letting
+        Inductor fuse it takes that to ~1700 launches and ~28 ms.
+
+        Safe to compile because the shape is pinned: ``ZImagePipeline`` tokenizes
+        with ``padding="max_length"``, so the encoder sees the same sequence
+        length whatever the prompt is, and nothing here re-triggers compilation
+        between requests.
+        """
+        return ["transformer", "text_encoder"]
 
     def _customize_settings(self, config) -> None:
         """Exclude context_refiner from INT8 quant when sequence parallelism is active.
