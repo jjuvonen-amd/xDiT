@@ -184,6 +184,17 @@ class xFuserZImageModel(xFuserModel):
             },
         },
         fp8_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
+        # Per-tensor FP8 on feed_forward.w2 destroys base Z-Image's output (random colour noise): its input, the
+        # SwiGLU product, carries outlier tokens ~3500x the RMS, so one scale for the whole activation flushes the
+        # remaining tokens. adaLN_modulation (M=1, no speedup) adds error for nothing. Keep both in bf16.
+        fp8_gemm_include_suffixes=(
+            "attention.to_q",
+            "attention.to_k",
+            "attention.to_v",
+            "attention.to_out.0",
+            "feed_forward.w1",
+            "feed_forward.w3",
+        ),
         fp8_text_encoder_module_list=["text_encoder.layers"],
         int8_gemm_module_list=[
             "transformer.layers",
