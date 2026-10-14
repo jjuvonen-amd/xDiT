@@ -509,6 +509,14 @@ class xFuserFlux2Klein9BModel(xFuserModel):
         if not self.config.use_parallel_vae:
             # Parallel VAE shards the decoder across ranks and owns its
             # execution; leave that path alone.
+            #
+            # The mid-block attention (one head, dim 512, S = H*W/64 tokens) runs as GEMMs + softmax instead
+            # of SDPA flash. Installed only here, with the compile: the path needs Inductor to fuse its softmax.
+            # ROCm only for now: the speedup has been measured there and not yet on other GPUs.
+            if torch.version.hip is not None:
+                from xfuser.model_executor.layers.flux2.vae_attention import Flux2VAEAttnProcessor
+
+                self.pipe.vae.set_attn_processor(Flux2VAEAttnProcessor())
             self._compile_vae_decoder()
         text_encoder = getattr(self.pipe, "text_encoder", None)
         if text_encoder is not None:
