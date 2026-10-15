@@ -13,6 +13,7 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DefaultInputValues,
     DiffusionOutput,
     ModelSettings,
+    images_to_pil,
 )
 from xfuser.envs import PACKAGES_CHECKER
 from xfuser.core.utils.runner_utils import (
@@ -562,8 +563,9 @@ class xFuserFlux2Klein9BModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             generator=self._make_generator(input_args["seed"]),
+            output_type="pt",
         )
-        images = output.images if output else []  # non-last pp ranks return None
+        images = images_to_pil(output.images) if output else []  # non-last pp ranks return None
         return DiffusionOutput(images=images, pipe_args=input_args)
 
     def _preprocess_args_images(self, input_args: dict) -> dict:

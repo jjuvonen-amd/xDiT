@@ -14,6 +14,7 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DiffusionOutput,
     ModelCapabilities,
     ModelSettings,
+    images_to_pil,
 )
 from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadSupport,
@@ -280,8 +281,9 @@ class xFuserZImageModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             generator=self._make_generator(input_args["seed"]),
+            output_type="pt",
         )
-        return DiffusionOutput(images=output.images, pipe_args=input_args)
+        return DiffusionOutput(images=images_to_pil(output.images), pipe_args=input_args)
 
 
 @register_model("Tongyi-MAI/Z-Image-Turbo")
@@ -397,5 +399,6 @@ class xFuserZImageTurboModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             generator=self._make_generator(input_args["seed"]),
+            output_type="pt",
         )
-        return DiffusionOutput(images=output.images, pipe_args=input_args)
+        return DiffusionOutput(images=images_to_pil(output.images), pipe_args=input_args)

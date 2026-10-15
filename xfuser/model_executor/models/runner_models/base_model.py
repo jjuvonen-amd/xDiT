@@ -3,6 +3,7 @@ import torch
 import copy
 import json
 import os
+import PIL.Image
 from PIL.Image import Image
 from typing import Callable, List, Optional, Tuple, Generator
 from dataclasses import dataclass, field
@@ -79,6 +80,22 @@ def register_model(name: str) -> Callable:
         return cls
 
     return decorator
+
+
+def images_to_pil(images) -> List[Image]:
+    """PIL images from a pipeline called with output_type="pt" ([B, C, H, W] in [0, 1]).
+
+    output_type="pil" copies the image to the host and scales, rounds and casts it
+    there in NumPy while the GPU idles, inside the timed pipe (8 ms per 1024x1024
+    image, 51 ms per 2048x2048). Doing that on the device leaves only a uint8 copy
+    in [H, W, C] layout (1 ms / 2 ms), with identical pixels.
+    Anything other than a tensor (e.g. images already in PIL form) is returned unchanged.
+    """
+    if not isinstance(images, torch.Tensor):
+        return images
+    images = images.float().mul(255).round_().clamp_(0, 255).to(torch.uint8)
+    images = images.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+    return [PIL.Image.fromarray(image) for image in images]
 
 
 # Derived from the backend specs rather than listed here: each backend declares
