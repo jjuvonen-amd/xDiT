@@ -29,6 +29,7 @@ from xfuser.core.attention.constraints import (
     HEAD_DIM,
     MASKED_VARLEN,
     MHA_ONLY,
+    MIN_KEYS,
     NON_CAUSAL,
     NO_VARLEN,
 )
@@ -209,6 +210,22 @@ def test_head_dim_constraint():
 
     q, k, v = _qkv(head_dim=128)
     assert HEAD_DIM(128).unmet(q, k, v, AttnCall()) is None
+
+
+def test_min_keys_constraint_counts_keys_not_queries():
+    q, k, v = _qkv(q_len=4128, kv_len=32)
+    reason = MIN_KEYS(65).unmet(q, k, v, AttnCall())
+    assert "at least 65 keys" in reason and "32" in reason
+
+    q, k, v = _qkv(q_len=32, kv_len=65)
+    assert MIN_KEYS(65).unmet(q, k, v, AttnCall()) is None
+
+
+def test_min_keys_constraint_checks_the_declared_valid_length():
+    """A trailing pad is sliced off before a dense kernel runs, so the valid count is what it attends over."""
+    q, k, v = _qkv(q_len=128, kv_len=128)
+    assert MIN_KEYS(65).unmet(q, k, v, AttnCall(attention_kwargs={"valid_kv_len": 32})) is not None
+    assert MIN_KEYS(65).unmet(q, k, v, AttnCall(attention_kwargs={"valid_kv_len": 100})) is None
 
 
 def test_head_dim_is_readable_for_shape_selection():
@@ -1023,7 +1040,8 @@ def test_only_varlen_capable_backends_accept_packed_keys():
     from xfuser.core.attention import registry
     from xfuser.core.attention.spec import VarlenPacking
 
-    q = torch.zeros(1, 4, 8, 128)
+    # 128 keys: long enough for every kernel's minimum (MHA v4 needs 65), so only varlen support decides.
+    q = torch.zeros(1, 4, 128, 128)
     packed = AttnCall(
         varlen=VarlenPacking(
             indices_k=torch.tensor([0]),
@@ -1240,8 +1258,9 @@ def test_dense_mha_v4_serves_packed_keys_but_sparge_does_not():
     alignment both a trailing-pad slice and a gather remove."""
     from xfuser.core.attention import registry
 
-    t = torch.empty((1, 2, 8, 128))
-    call = _packed(4, valid_kv_len=4)
+    # 100 valid keys of 128: above MHA v4's 65-key minimum, so only the packing decides.
+    t = torch.empty((1, 2, 128, 128))
+    call = _packed(100, valid_kv_len=100)
 
     dense = registry.get(AttentionBackendType.AITER_BF16)
     assert dense.rejects(t, t, t, call) is None

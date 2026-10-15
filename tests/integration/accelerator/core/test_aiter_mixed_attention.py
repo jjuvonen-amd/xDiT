@@ -145,6 +145,28 @@ def _xfail_broken_mxfp4_v(backend_name, sequence_length):
         )
 
 
+@pytest.mark.parametrize("key_length", [32, 64])
+def test_aiter_bf16_serves_short_key_sequences_through_the_fallback(key_length):
+    """MHA v4 returns zeros for 64 keys or fewer. Z-Image's context refiner attends over its caption alone (32 keys
+    for a short prompt), which zeroed the caption and made the model ignore the prompt. AITER_BF16 must hand such
+    calls to its fallback and still match SDPA."""
+    _require_mha_v4_aiter("AITER_BF16")
+    _require_mha_v4_recipe("AITER_BF16")
+
+    torch.manual_seed(1234)
+    query = torch.randn((1, 30, 4128, 128), device="cuda", dtype=torch.bfloat16)
+    key = torch.randn((1, 30, key_length, 128), device="cuda", dtype=torch.bfloat16)
+    value = torch.randn((1, 30, key_length, 128), device="cuda", dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        reference = F.scaled_dot_product_attention(query, key, value)
+        output, _ = _run("AITER_BF16", query, key, value, dropout_p=0.0, is_causal=False)
+
+    cosine_similarity = F.cosine_similarity(output.float().flatten(), reference.float().flatten(), dim=0).item()
+    assert output.abs().max() > 0
+    assert cosine_similarity > 0.99
+
+
 @pytest.mark.parametrize(
     "backend_name",
     [

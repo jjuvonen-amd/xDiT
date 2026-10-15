@@ -17,6 +17,7 @@ from xfuser.core.attention.requirements import ALWAYS, ARCH, NEVER, PARAM, Requi
 from xfuser.core.attention.constraints import (
     HEAD_DIM,
     MHA_ONLY,
+    MIN_KEYS,
     NON_CAUSAL,
     NO_DROPOUT,
     NO_VARLEN,
@@ -131,7 +132,13 @@ FORMATS = [
 # Dense serves packed keys by shortening K/V -- slicing a declared trailing pad
 # or gathering the valid rows. Sparge cannot do either: its sorted-sparse launch
 # needs the key length padded to its KV tile, which is the alignment both remove.
-DENSE_CALLS = NO_DROPOUT & NON_CAUSAL & PACKED_KEYS & HEAD_DIM(128)
+#
+# With 64 keys or fewer the dense kernel returns an all-zero output, silently and
+# whatever the query length (gfx950, AITER main; 65 keys and up match SDPA).
+# Z-Image's context refiner attends over the caption alone -- 32 keys for a short
+# prompt -- so serving it here zeroed the caption features and the model ignored
+# the prompt. Those calls go to the fallback instead.
+DENSE_CALLS = NO_DROPOUT & NON_CAUSAL & PACKED_KEYS & HEAD_DIM(128) & MIN_KEYS(65)
 SPARGE_CALLS = NO_DROPOUT & NON_CAUSAL & NO_VARLEN & HEAD_DIM(128) & MHA_ONLY & SELF_ATTENTION
 
 
@@ -156,9 +163,10 @@ def _dense_spec(fmt: MhaV4Format) -> Spec:
         # Every row here is head dim 128, which makes the family unselectable
         # for a model that mixes widths: LTX-2 runs 128-wide video blocks
         # beside 64-wide audio ones under one backend choice. The odd widths
-        # go to AITER v3, which covers all of them. Not SDPA, which returns no
-        # LSE -- on a ring run that would hand the merge a partial from the
-        # 128-wide blocks and nothing from the rest.
+        # go to AITER v3, which covers all of them, and so do calls with too
+        # few keys (see DENSE_CALLS). Not SDPA, which returns no LSE -- on a
+        # ring run that would hand the merge a partial from the 128-wide
+        # blocks and nothing from the rest.
         fallback=AttentionBackendType.AITER,
         requires=SYMBOL(_MHA_V4) & GFX950_OR_GFX942 & _scale_modes(fmt),
     )

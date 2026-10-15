@@ -77,6 +77,24 @@ class HEAD_DIM(CallConstraint):
 
 
 @dataclass(frozen=True)
+class MIN_KEYS(CallConstraint):
+    """At least ``minimum`` keys per sequence: the kernel is wrong below that.
+
+    Keys are dim 2 of the [B, H, S, D] call. A declared trailing pad
+    (``valid_kv_len``) is what a dense kernel actually attends over once the
+    pad is sliced off, so that count is the one checked when present.
+    """
+
+    minimum: int
+
+    def unmet(self, query, key, value, call) -> Optional[str]:
+        found = call.attention_kwargs.get("valid_kv_len") or key.shape[2]
+        if found >= self.minimum:
+            return None
+        return f"needs at least {self.minimum} keys, got {found}"
+
+
+@dataclass(frozen=True)
 class _NonCausal(CallConstraint):
     def unmet(self, query, key, value, call) -> Optional[str]:
         return "does not support causal masking" if call.is_causal else None
