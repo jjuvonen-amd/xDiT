@@ -143,6 +143,20 @@ def _compile_vae_decoder(pipe, mode, dynamic) -> None:
     vae.decoder = torch.compile(decoder, mode=mode, dynamic=dynamic)
 
 
+# Linears that base Z-Image quantizes (FP8 or FP4); the rest of each block stays in bf16. Per-tensor FP8 on
+# feed_forward.w2 destroys the output (random colour noise): its input, the SwiGLU product, carries outlier tokens
+# ~3500x the RMS, so one scale for the whole activation flushes the remaining tokens. adaLN_modulation (M=1, no
+# speedup) adds error for nothing.
+_Z_IMAGE_QUANTIZED_SUFFIXES = (
+    "attention.to_q",
+    "attention.to_k",
+    "attention.to_v",
+    "attention.to_out.0",
+    "feed_forward.w1",
+    "feed_forward.w3",
+)
+
+
 @register_model("Tongyi-MAI/Z-Image")
 @register_model("Z-Image")
 class xFuserZImageModel(xFuserModel):
@@ -169,6 +183,7 @@ class xFuserZImageModel(xFuserModel):
         use_fp8_text_encoder=True,
         use_fp8_comms=True,
         use_int8_gemms=True,
+        use_fp4_gemms=True,
         supports_step_caching=True,
         use_parallel_vae=True,
     )
@@ -185,17 +200,9 @@ class xFuserZImageModel(xFuserModel):
             },
         },
         fp8_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
-        # Per-tensor FP8 on feed_forward.w2 destroys base Z-Image's output (random colour noise): its input, the
-        # SwiGLU product, carries outlier tokens ~3500x the RMS, so one scale for the whole activation flushes the
-        # remaining tokens. adaLN_modulation (M=1, no speedup) adds error for nothing. Keep both in bf16.
-        fp8_gemm_include_suffixes=(
-            "attention.to_q",
-            "attention.to_k",
-            "attention.to_v",
-            "attention.to_out.0",
-            "feed_forward.w1",
-            "feed_forward.w3",
-        ),
+        fp8_gemm_include_suffixes=_Z_IMAGE_QUANTIZED_SUFFIXES,
+        fp4_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
+        fp4_gemm_include_suffixes=_Z_IMAGE_QUANTIZED_SUFFIXES,
         fp8_text_encoder_module_list=["text_encoder.layers"],
         int8_gemm_module_list=[
             "transformer.layers",
@@ -304,6 +311,7 @@ class xFuserZImageTurboModel(xFuserModel):
         use_fp8_text_encoder=True,
         use_fp8_comms=True,
         use_int8_gemms=True,
+        use_fp4_gemms=True,
         fully_shard_degree=True,
         use_parallel_vae=True,
     )
@@ -326,6 +334,7 @@ class xFuserZImageTurboModel(xFuserModel):
             },
         },
         fp8_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
+        fp4_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
         fp8_text_encoder_module_list=["text_encoder.layers"],
         int8_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
     )

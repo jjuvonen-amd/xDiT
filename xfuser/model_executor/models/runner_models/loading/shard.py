@@ -277,7 +277,7 @@ def build_block_quantize_fn(
                 fp8_suffix_layers=fp8_suffix_overrides,
                 hybrid=config.use_hybrid_gemm_schedule,
                 device=device,
-                filter_fn=_target_filter(local_fp4_targets),
+                filter_fn=_target_filter(local_fp4_targets, (), getattr(settings, "fp4_gemm_include_suffixes", None)),
             )
         if use_fp6_block:
             adapter = loader.backends.format if pure_fp6 else loader.backends.fp6

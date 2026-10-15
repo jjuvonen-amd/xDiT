@@ -101,7 +101,11 @@ def _prepare_native_load(model, adapter, component_name, targets, stream_quant, 
         adapter,
         component_name=component_name,
         targets=targets,
-        stream_quant=stream_quant,
+        # Same reason as FP8 above: a suffix-restricted FP4 policy converts after the load.
+        stream_quant=(
+            stream_quant
+            and not (is_fp4 and getattr(model.settings, "fp4_gemm_include_suffixes", None))
+        ),
         precision_prefixes=((model.settings.fp8_precision_overrides or ()) if is_fp4 else ()),
         precision_suffixes=((model.settings.fp8_precision_override_suffixes or ()) if is_fp4 else ()),
         hybrid=(model.config.use_hybrid_gemm_schedule if is_fp4 else False),

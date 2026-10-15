@@ -163,6 +163,7 @@ def _setup_format_gemms(loader, local_rank, *, stream_quant) -> None:
         convert, filter_fn = conversion_filter(
             module_name,
             loader.quantization_ledger.streaming_targets,
+            include_suffixes=(None if pure_fp6 else getattr(model.settings, "fp4_gemm_include_suffixes", None)),
         )
         if not convert:
             continue

@@ -1,3 +1,5 @@
+import dataclasses
+
 import torch
 from typing import Optional
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -443,6 +445,7 @@ class xFuserFlux2Klein9BModel(xFuserModel):
         use_parallel_vae_encoder=True,
         fully_shard_degree=True,
         use_fp8_comms=True,
+        use_fp4_gemms=True,
         pipefusion_parallel_degree=True,
         supports_step_caching=True,
         profile_capture_phase=True,
@@ -460,6 +463,10 @@ class xFuserFlux2Klein9BModel(xFuserModel):
         model_output_type="image",
         mod_value=16,
         fp8_gemm_module_list=[
+            "transformer.transformer_blocks",
+            "transformer.single_transformer_blocks",
+        ],
+        fp4_gemm_module_list=[
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
         ],
@@ -591,6 +598,8 @@ class xFuserFlux2Klein9BModel(xFuserModel):
 @register_model("black-forest-labs/FLUX.2-klein-4B")
 @register_model("FLUX.2-klein-4B")
 class xFuserFlux2Klein4BModel(xFuserFlux2Klein9BModel):
+    # MXFP4 GEMMs are enabled and validated for the 9B only.
+    capabilities = dataclasses.replace(xFuserFlux2Klein9BModel.capabilities, use_fp4_gemms=False)
     load_support = LoadSupport(
         meta_transformers=("transformer",),
         meta_text_encoders=("text_encoder",),
