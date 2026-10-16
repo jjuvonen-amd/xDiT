@@ -184,6 +184,7 @@ class xFuserZImageModel(xFuserModel):
         use_fp8_comms=True,
         use_int8_gemms=True,
         use_fp4_gemms=True,
+        use_hybrid_gemm_schedule=True,
         supports_step_caching=True,
         use_parallel_vae=True,
     )
@@ -203,6 +204,17 @@ class xFuserZImageModel(xFuserModel):
         fp8_gemm_include_suffixes=_Z_IMAGE_QUANTIZED_SUFFIXES,
         fp4_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
         fp4_gemm_include_suffixes=_Z_IMAGE_QUANTIZED_SUFFIXES,
+        # With a low=fp4,high=fp8 profile the attention projections stay FP8 and only feed_forward w1/w3 run in
+        # MXFP4. MXFP4 attention costs base Z-Image its prompt adherence: ZI-1 (32 prompts vs bf16) CLIP -9.6%,
+        # LPIPS 0.25 with every layer in MXFP4; CLIP +0.0%, LPIPS 0.13 with this tier. FP8 on q/k only or v/out
+        # only recovers half of that. Adding --use_hybrid_gemm_schedule
+        # --num_hybrid_gemm_high_precision_steps 1 brings LPIPS to 0.10.
+        fp8_precision_override_suffixes=(
+            "attention.to_q",
+            "attention.to_k",
+            "attention.to_v",
+            "attention.to_out.0",
+        ),
         fp8_text_encoder_module_list=["text_encoder.layers"],
         int8_gemm_module_list=[
             "transformer.layers",

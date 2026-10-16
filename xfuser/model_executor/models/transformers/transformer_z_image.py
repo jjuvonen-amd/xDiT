@@ -27,6 +27,7 @@ from xfuser.core.distributed import (
     get_classifier_free_guidance_world_size,
     get_classifier_free_guidance_rank,
     get_cfg_group,
+    get_runtime_state,
 )
 
 ADALN_EMBED_DIM = 256
@@ -322,6 +323,9 @@ class xFuserZImageTransformer2DWrapper(ZImageTransformer2DModel):
             # elsewhere in the process keeps upstream's forward.
             layer.forward = _fused_block_forward.__get__(layer, type(layer))
         register_fp8_comms_eligible_modules(self, z_image_attn_modules(self))
+        # One transformer call per denoising step (CFG batches both branches), so this drives the hybrid
+        # GEMM schedule; it does nothing unless a schedule is set.
+        self.register_forward_pre_hook(lambda module, args: get_runtime_state().increment_step_counter())
 
     def _chunk_and_pad_sequence(
         self, x: torch.Tensor, sp_world_rank: int, sp_world_size: int, pad_amount: int, dim: int
