@@ -58,6 +58,18 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     #       quantise and broadcast work, at the cost of a second shard resident.
     # These are reclaimable file-backed pages that the fill drops as it finishes each shard.
     "XDIT_WARM_SHARDS": lambda: os.environ.get("XDIT_WARM_SHARDS", "2"),
+    # How Wan's cross-attention runs under tensor parallelism.
+    #   sharded    - like self-attention: rows gathered into column-parallel Q, row-parallel output
+    #                reduce-scattered (3 all-gathers + 3 reduce-scatters per block).
+    #   replicated - full weights on every rank, applied to the local rows without communication
+    #                (2 + 2 per block), at the memory of one unsharded cross-attention per block.
+    "XDIT_WAN_TP_CROSS_ATTENTION": lambda: os.environ.get("XDIT_WAN_TP_CROSS_ATTENTION", "sharded"),
+    # How tensor parallelism's all-gathers and reduce-scatters meet their GEMMs.
+    #   none    - each collective, then its GEMM (or the reverse), on one stream.
+    #   chunked - pipelined in XDIT_TP_OVERLAP_CHUNKS chunks, RCCL on a side stream
+    #             (benchmarks/tp_comm_gemm_overlap.py measures the gain per site).
+    "XDIT_TP_COMM_OVERLAP": lambda: os.environ.get("XDIT_TP_COMM_OVERLAP", "none"),
+    "XDIT_TP_OVERLAP_CHUNKS": lambda: os.environ.get("XDIT_TP_OVERLAP_CHUNKS", "4"),
 }
 
 

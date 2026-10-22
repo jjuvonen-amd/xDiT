@@ -368,6 +368,35 @@ def init_vae_group(
     _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
 
 
+def _set_seq_parallel_pg_from_ranks(sp_group_ranks: List[List[int]], ulysses_degree: int, rank: int) -> None:
+    """Build yunchang's Ulysses and ring groups inside the given SP groups.
+
+    yunchang's `set_seq_parallel_pg` assumes each SP group is a contiguous run of
+    ranks. With tensor parallelism innermost, an SP group is strided by the TP
+    degree ([0, 2, 4, 6] for TP 2), and the contiguous groups would mix TP peers
+    into the Ulysses exchange. This keeps yunchang's ulysses-low layout (Ulysses
+    over adjacent members, ring across them) but over the actual members.
+    Every rank creates every group, in the same order, as `new_group` requires.
+    """
+    from yunchang.globals import PROCESS_GROUP
+
+    ulysses_pg = ring_pg = None
+    for ranks in sp_group_ranks:
+        ring_degree = len(ranks) // ulysses_degree
+        for i in range(ring_degree):
+            ulysses_ranks = ranks[i * ulysses_degree : (i + 1) * ulysses_degree]
+            group = torch.distributed.new_group(ulysses_ranks)
+            if rank in ulysses_ranks:
+                ulysses_pg = group
+        for i in range(ulysses_degree):
+            ring_ranks = ranks[i::ulysses_degree]
+            group = torch.distributed.new_group(ring_ranks)
+            if rank in ring_ranks:
+                ring_pg = group
+    PROCESS_GROUP.ULYSSES_PG = ulysses_pg
+    PROCESS_GROUP.RING_PG = ring_pg
+
+
 def initialize_model_parallel(
     data_parallel_degree: int = 1,
     classifier_free_guidance_degree: int = 1,
@@ -515,12 +544,17 @@ def initialize_model_parallel(
         from yunchang import set_seq_parallel_pg
         from yunchang.globals import PROCESS_GROUP
 
-        set_seq_parallel_pg(
-            sp_ulysses_degree=ulysses_degree,
-            sp_ring_degree=ring_degree,
-            rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
-        )
+        if tensor_parallel_degree > 1:
+            _set_seq_parallel_pg_from_ranks(
+                rank_generator.get_ranks("sp"), ulysses_degree, get_world_group().rank_in_group
+            )
+        else:
+            set_seq_parallel_pg(
+                sp_ulysses_degree=ulysses_degree,
+                sp_ring_degree=ring_degree,
+                rank=get_world_group().rank_in_group,
+                world_size=dit_parallel_size,
+            )
 
         _SP = init_model_parallel_group(
             group_ranks=rank_generator.get_ranks("sp"),

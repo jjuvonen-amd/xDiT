@@ -250,6 +250,29 @@ class GroupCoordinator:
             output_tensor = output_tensor.reshape(input_size)
             return output_tensor
 
+    def reduce_scatter(
+        self, input_: torch.Tensor, dim: int = 0, op=torch._C._distributed_c10d.ReduceOp.SUM
+    ) -> torch.Tensor:
+        """Sum `input_` across the group and keep this rank's chunk of `dim`; the inverse of `all_gather`."""
+        world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input_
+        assert -input_.dim() <= dim < input_.dim(), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+        assert input_.size(dim) % world_size == 0, (
+            f"dim {dim} of size {input_.size(dim)} does not split across {world_size} ranks"
+        )
+        # The collective scatters dim 0; a no-op move and copy when dim is already 0 and contiguous.
+        input_ = input_.movedim(dim, 0).contiguous()
+        output_size = list(input_.size())
+        output_size[0] //= world_size
+        output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
+        torch.distributed.reduce_scatter_single(output_tensor, input_, op=op, group=self.device_group)
+        return output_tensor.movedim(0, dim)
+
     def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor:
         """
         NOTE: We assume that the input tensor is on the same device across

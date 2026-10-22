@@ -35,3 +35,17 @@ def test_wan_ulysses_degree_must_divide_heads_before_loading(name, task, heads, 
     _build(name, ulysses_degree=accepted, **task_args)
     with pytest.raises(ValueError, match=rf"has {heads} attention heads.*got {refused}\..*--ring_degree"):
         _build(name, ulysses_degree=refused, **task_args)
+
+
+def test_wan22_t2v_tensor_parallel_times_ulysses_must_divide_heads():
+    """TP takes 1/tp of the heads and Ulysses splits each rank's share; 8 divides 40 but not the 20 of TP 2."""
+    _build("Wan2.2-T2V", tensor_parallel_degree=2, ulysses_degree=4)
+    with pytest.raises(ValueError, match=r"must divide 40; got 2 x 8\."):
+        _build("Wan2.2-T2V", tensor_parallel_degree=2, ulysses_degree=8)
+
+
+def test_wan_tensor_parallel_refuses_what_its_sharding_does_not_split():
+    with pytest.raises(ValueError, match=r"does not support --use_fp8_gemms, --cache_method\."):
+        _build("Wan2.2-T2V", tensor_parallel_degree=2, use_fp8_gemms=True, cache_method="fbcache")
+    with pytest.raises(ValueError, match=r"does not support tensor_parallel_degree"):
+        _build("Wan2.1-T2V", tensor_parallel_degree=2)

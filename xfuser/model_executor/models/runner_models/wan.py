@@ -8,6 +8,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import load_image
 from safetensors.torch import load_file
 
+import xfuser.envs as envs
 from xfuser import xFuserArgs
 from xfuser.model_executor.pipelines.pipeline_wan_i2v import (
     xFuserWanImageToVideoPipeline,
@@ -782,7 +783,69 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
     )
 
     # See xFuserWan22I2VModel: "fbcache" == DBCache first-block (Fn_compute_blocks=1).
-    capabilities = replace(xFuserWan21T2VModel.capabilities, use_fp8_comms=True)
+    capabilities = replace(xFuserWan21T2VModel.capabilities, use_fp8_comms=True, tensor_parallel_degree=True)
+
+    def _validate_config(self, config: xFuserArgs) -> None:
+        super()._validate_config(config)
+        tp_degree = config.tensor_parallel_degree or 1
+        if tp_degree == 1:
+            return
+        heads_per_rank, remainder = divmod(self.attention_heads, tp_degree)
+        ulysses_degree = config.ulysses_degree or 1
+        if remainder or heads_per_rank % ulysses_degree:
+            raise ValueError(
+                f"Wan tensor parallelism splits the {self.attention_heads} attention heads over "
+                f"--tensor_parallel_degree and Ulysses splits each rank's share again, so their product must "
+                f"divide {self.attention_heads}; got {tp_degree} x {ulysses_degree}."
+            )
+        # The TP sharding slices bf16 nn.Linear weights after placement; these replace or
+        # wrap those linears, or depend on per-layer state TP does not split.
+        unsupported = {
+            "--use_fp8_gemms": config.use_fp8_gemms,
+            "--use_fp4_gemms": config.use_fp4_gemms,
+            "--use_fp6_gemms": config.use_fp6_gemms,
+            "--use_a6w4_gemms": config.use_a6w4_gemms,
+            "--use_hybrid_gemm_schedule": config.use_hybrid_gemm_schedule,
+            "--use_fp8_comms": config.use_fp8_comms,
+            "--cache_method": config.cache_method,
+            "--fully_shard_degree": config.fully_shard_degree > 1,
+            "--pipefusion_parallel_degree": config.pipefusion_parallel_degree > 1,
+            "CPU offloading": config.enable_model_cpu_offload
+            or config.enable_sequential_cpu_offload
+            or config.enable_group_cpu_offload,
+        }
+        named = [flag for flag, requested in unsupported.items() if requested]
+        if named:
+            raise ValueError(f"Wan tensor parallelism does not support {', '.join(named)}.")
+
+    def _post_load_and_state_initialization(self, input_args: dict) -> None:
+        super()._post_load_and_state_initialization(input_args)
+        if (self.config.tensor_parallel_degree or 1) > 1:
+            cross_attention = envs.environment_variables["XDIT_WAN_TP_CROSS_ATTENTION"]().strip().lower()
+            if cross_attention not in ("sharded", "replicated"):
+                raise ValueError(
+                    f"XDIT_WAN_TP_CROSS_ATTENTION must be 'sharded' or 'replicated'; got {cross_attention!r}."
+                )
+            overlap = envs.environment_variables["XDIT_TP_COMM_OVERLAP"]().strip().lower()
+            if overlap not in ("none", "chunked"):
+                raise ValueError(f"XDIT_TP_COMM_OVERLAP must be 'none' or 'chunked'; got {overlap!r}.")
+            chunks = 1
+            if overlap == "chunked":
+                raw_chunks = envs.environment_variables["XDIT_TP_OVERLAP_CHUNKS"]()
+                if not raw_chunks.strip().isdigit() or int(raw_chunks) < 2:
+                    raise ValueError(f"XDIT_TP_OVERLAP_CHUNKS must be an integer >= 2; got {raw_chunks!r}.")
+                chunks = int(raw_chunks)
+            log(
+                f"Wan tensor parallelism: cross-attention {cross_attention}, comm overlap {overlap}"
+                + (f" in {chunks} chunks." if chunks > 1 else ".")
+            )
+            # After placement, so each rank slices its share on its own device; before
+            # torch.compile, which runs later in initialize().
+            for name in self.settings.transformer_attr_names:
+                getattr(self.pipe, name).shard_for_tensor_parallel(
+                    shard_cross_attention=cross_attention == "sharded", overlap_chunks=chunks
+                )
+            torch.cuda.empty_cache()
 
     def _customize_settings(self, config: xFuserArgs) -> None:
         super()._customize_settings(config)

@@ -9,8 +9,10 @@ across query rows). A forward hook zeroes them on the ranks that hold any.
 import pytest
 import torch
 
+from xfuser.model_executor.layers.tensor_parallel import tp_split_rows
 from xfuser.model_executor.models.transformers.transformer_wan import (
     _local_sp_pad_rows,
+    _local_tp_pad_rows,
     _zero_sp_pad_rows_hook,
     xFuserWanTransformer3DWrapper,
 )
@@ -44,6 +46,24 @@ def test_pad_rows_are_counted_on_the_ranks_whose_chunk_holds_them(seq_len, sp_si
     for rank in range(sp_size):
         expected = sum(row >= seq_len for row in range(rank * local_len, (rank + 1) * local_len))
         assert _local_sp_pad_rows(seq_len, local_len, rank) == expected
+
+
+@pytest.mark.parametrize("seq_len", [64, 61, 50, 33])
+@pytest.mark.parametrize("sp_size, tp_size, chunks", [(1, 2, 1), (1, 4, 2), (2, 2, 4), (2, 4, 2)])
+def test_tp_pad_rows_are_the_trailing_rows_each_rank_holds(seq_len, sp_size, tp_size, chunks):
+    """Under TP the rows split block-cyclically; each rank's pad must be counted and trail its rows."""
+    multiple = sp_size * tp_size * chunks
+    padded = -(-seq_len // multiple) * multiple
+    sp_len = padded // sp_size
+    rows = torch.arange(padded).view(1, padded)
+    for sp_rank in range(sp_size):
+        sp_rows = rows[:, sp_rank * sp_len : (sp_rank + 1) * sp_len]
+        for tp_rank in range(tp_size):
+            local = tp_split_rows(sp_rows, tp_rank, tp_size, chunks)[0]
+            is_pad = local >= seq_len
+            count = _local_tp_pad_rows(seq_len, sp_rank, sp_len, tp_rank, tp_size, chunks)
+            assert count == int(is_pad.sum())
+            assert is_pad[local.numel() - count :].all(), "pad rows must trail, which the zeroing hook assumes"
 
 
 def test_the_hook_zeroes_the_pad_rows_and_nothing_else():
