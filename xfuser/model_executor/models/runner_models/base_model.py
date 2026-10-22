@@ -1110,10 +1110,14 @@ class xFuserModel(abc.ABC):
         self._validate_args(input_args)
         input_args = self._split_prompts_for_dp(input_args)
 
+        # One cycle, which is all the loop below runs. With the default endless repeat, the
+        # last step() opens a new cycle that drops the active iterations' device events
+        # before the trace is exported (traces held no GPU kernels on torch 2.13 / ROCm).
         schedule = torch.profiler.schedule(
             wait=self.config.profile_wait,
             warmup=self.config.profile_warmup,
             active=self.config.profile_active,
+            repeat=1,
         )
         num_repetitions = self.config.profile_wait + self.config.profile_warmup + self.config.profile_active
         with_stack = self.config.profile_with_stack
