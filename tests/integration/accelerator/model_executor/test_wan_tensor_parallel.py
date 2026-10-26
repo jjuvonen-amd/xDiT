@@ -3,8 +3,8 @@
 TP shards the heads and the FFN, splits the residual rows across the TP group
 and normalizes Q/K over heads held by different ranks. Cross-attention is
 either sharded the same way or kept whole on every rank's own rows. The
-collectives run either next to their GEMMs or pipelined against them in
-chunks, which holds the rows block-cyclically. The model pads the sequence to
+collectives run next to their GEMMs, pipelined against them in chunks (which
+holds the rows block-cyclically), or inside torch's fused symm_mem ops. The model pads the sequence to
 a multiple of SP x TP x chunks, so a short sequence also checks the pad.
 Tiny random weights in fp32 on SDPA_EFFICIENT, so only reduction order
 differs from one GPU; nothing is downloaded.
@@ -57,7 +57,16 @@ def _inputs(name, latent_shape, batch):
 
 
 def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape, options, output_path):
-    cross_attention, chunks, batch = options["cross_attention"], options["chunks"], options["batch"]
+    cross_attention, chunks, batch, fused = (
+        options["cross_attention"],
+        options["chunks"],
+        options["batch"],
+        options["fused"],
+    )
+    import contextlib
+
+    import torch.distributed._symmetric_memory as symm_mem
+
     from xfuser.config.args import xFuserArgs
     from xfuser.core.distributed import (
         get_runtime_state,
@@ -92,7 +101,9 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         # Seeded on the CPU, so every process builds the same weights.
         torch.manual_seed(0)
         model = xFuserWanTransformer3DWrapper(**_TINY_CONFIG).eval().to(device=device, dtype=torch.float32)
-        model.shard_for_tensor_parallel(shard_cross_attention=cross_attention == "sharded", overlap_chunks=chunks)
+        model.shard_for_tensor_parallel(
+            shard_cross_attention=cross_attention == "sharded", overlap_chunks=chunks, fused_comm=fused
+        )
         if tp > 1:
             heads = _TINY_CONFIG["num_attention_heads"]
             assert all(isinstance(block, xFuserWanTPTransformerBlock) for block in model.blocks)
@@ -103,7 +114,10 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
             key: tensor.to(device=device, dtype=tensor.dtype if key == "timestep" else torch.float32)
             for key, tensor in _inputs(name, latent_shape, batch).items()
         }
-        with torch.no_grad():
+        # torch's symm_mem kernels segfault on ROCm; its test mode runs their collective + GEMM
+        # fallback through the same op calls, so the wiring is still checked there.
+        fused_kernels = symm_mem._test_mode() if fused and torch.version.hip else contextlib.nullcontext()
+        with torch.no_grad(), fused_kernels:
             output = model(**inputs, return_dict=False)[0]
         if rank == 0:
             torch.save(output.cpu(), output_path)
@@ -112,10 +126,10 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         destroy_distributed_environment()
 
 
-def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1):
+def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=False):
     tp, ulysses, ring = MODES[mode] if mode else (1, 1, 1)
     output_path = directory / "output.pt"
-    options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch)
+    options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch, fused=fused)
     spawn_accelerator_ranks(
         _worker,
         directory,
@@ -198,6 +212,25 @@ def test_tensor_parallel_batch_of_two_matches_one_gpu(tmp_path, one_gpu_output, 
     expected = one_gpu_output("wan", PADDED, batch=2)
 
     actual = _run(tmp_path, "tp2", "wan", PADDED, chunks=chunks, batch=2)
+
+    error = _relative_error(actual, expected)
+    assert error <= TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+@pytest.mark.parametrize("cross_attention", ["sharded", "replicated"])
+@pytest.mark.parametrize("mode", ["tp2", "tp4", "tp2-ulysses2"])
+def test_tensor_parallel_with_fused_comm_matches_one_gpu(tmp_path, one_gpu_output, mode, cross_attention, latent_shape):
+    """torch's symm_mem fused ops for every pair, as XDIT_TP_COMM_OVERLAP=symm_mem runs them.
+
+    On CUDA this runs the real kernels. On ROCm, where they segfault, it runs
+    torch's fallback for them, which checks the call wiring but not the kernels.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires an accelerator")
+    expected = one_gpu_output("wan", latent_shape)
+
+    actual = _run(tmp_path, mode, "wan", latent_shape, cross_attention=cross_attention, fused=True)
 
     error = _relative_error(actual, expected)
     assert error <= TOLERANCE, f"relative error {error:.3e}"

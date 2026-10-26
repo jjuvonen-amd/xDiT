@@ -5,11 +5,12 @@
 #
 # CONFIG names:
 #   sp8                       Ulysses over 8 GPUs, no TP (the reference)
-#   tp<N>_x<cross>[_ov]       Megatron TP+SP over N GPUs
-#   tp<N>_u<M>_x<cross>[_ov]  TP N x Ulysses M
+#   tp<N>_x<cross>[_ov|_fused]       Megatron TP+SP over N GPUs
+#   tp<N>_u<M>_x<cross>[_ov|_fused]  TP N x Ulysses M
 # where <cross> is "sharded" (cross-attention split too: 3 all-gathers + 3 reduce-scatters
-# per block) or "repl" (cross-attention whole on each rank's rows: 2 + 2), and "_ov"
-# pipelines each collective against its GEMM (XDIT_TP_COMM_OVERLAP=chunked).
+# per block) or "repl" (cross-attention whole on each rank's rows: 2 + 2). "_ov" pipelines
+# each collective against its GEMM in chunks (XDIT_TP_COMM_OVERLAP=chunked); "_fused" uses
+# torch's symm_mem fused AG+GEMM / GEMM+RS ops (XDIT_TP_COMM_OVERLAP=symm_mem; NVLink only).
 #
 # Environment:
 #   OUTPUT_DIR  where <config>/{log.txt,profile_trace_rank_<r>.json.gz} go (default ./output/profiles)
@@ -30,7 +31,7 @@ CHUNKS=${CHUNKS:-4}
 PROFILE=${PROFILE:-1}
 
 if [ $# -eq 0 ]; then
-  sed -n '2,23p' "$0"
+  sed -n '2,24p' "$0"
   exit 1
 fi
 
@@ -52,11 +53,12 @@ for name in "$@"; do
   overlap=none
   if [ "$name" = sp8 ]; then
     parallel=(--ulysses_degree 8)
-  elif [[ $name =~ ^tp([0-9]+)(_u([0-9]+))?_x(sharded|repl)(_ov)?$ ]]; then
+  elif [[ $name =~ ^tp([0-9]+)(_u([0-9]+))?_x(sharded|repl)(_ov|_fused)?$ ]]; then
     parallel=(--tensor_parallel_degree "${BASH_REMATCH[1]}")
     [ -n "${BASH_REMATCH[3]}" ] && parallel+=(--ulysses_degree "${BASH_REMATCH[3]}")
     [ "${BASH_REMATCH[4]}" = repl ] && cross=replicated
-    [ -n "${BASH_REMATCH[5]}" ] && overlap=chunked
+    [ "${BASH_REMATCH[5]}" = _ov ] && overlap=chunked
+    [ "${BASH_REMATCH[5]}" = _fused ] && overlap=symm_mem
   else
     echo "unknown config: $name" >&2
     status=1

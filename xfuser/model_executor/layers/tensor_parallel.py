@@ -17,12 +17,19 @@ into tp*chunks blocks, TP rank r holds blocks r, tp+r, 2tp+r, ... Each chunk's
 all-gather output and reduce-scatter input are then contiguous rows of the
 natural order. `tp_split_rows` / `tp_gather_rows` convert between the layouts;
 with one chunk the layout is plain contiguous chunks.
+
+With `fused`, torch's symmetric-memory ops run each pair instead
+(`symm_mem.fused_all_gather_matmul` / `fused_matmul_reduce_scatter`). They
+pipeline peer-to-peer copies against per-shard GEMMs themselves, on the
+contiguous layout. They work over NVLink; on torch 2.13 / ROCm 7.16 they
+segfault beyond ~10 MB.
 """
 
 from typing import List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory  # noqa: F401  registers torch.ops.symm_mem
 import torch.nn.functional as F
 from torch import nn
 from torch.profiler import record_function
@@ -115,8 +122,14 @@ def tp_gather_rows(x: torch.Tensor, chunks: int) -> torch.Tensor:
     return blocks.transpose(1, 2).reshape(batch, rows, *rest)
 
 
-def tp_column_parallel(x: torch.Tensor, linear: nn.Linear, site: str, chunks: int) -> torch.Tensor:
+def tp_column_parallel(x: torch.Tensor, linear: nn.Linear, site: str, chunks: int, fused: bool = False) -> torch.Tensor:
     """`linear` over the TP group's rows of `x` (dim 1): all-gather, then the column-parallel GEMM."""
+    if fused:
+        with record_function(f"tp_ag:{site}"):
+            _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(
+                x, [linear.weight.t()], 1, get_tp_group().device_group.group_name, return_A=False
+            )
+        return out if linear.bias is None else out + linear.bias
     if chunks == 1:
         return linear(tp_all_gather_seq(x, site))
     group = get_tp_group()
@@ -127,10 +140,15 @@ def tp_column_parallel(x: torch.Tensor, linear: nn.Linear, site: str, chunks: in
 
 
 def tp_row_parallel(
-    x: torch.Tensor, linear: nn.Linear, bias: Optional[torch.Tensor], site: str, chunks: int
+    x: torch.Tensor, linear: nn.Linear, bias: Optional[torch.Tensor], site: str, chunks: int, fused: bool = False
 ) -> torch.Tensor:
     """Row-parallel `linear` over all rows of `x`, reduce-scattered to this rank's rows, plus `bias` once."""
-    if chunks == 1:
+    if fused:
+        with record_function(f"tp_rs:{site}"):
+            out = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                x, linear.weight.t(), "sum", 1, get_tp_group().device_group.group_name
+            )
+    elif chunks == 1:
         out = tp_reduce_scatter_seq(linear(x), site)
     else:
         group = get_tp_group()

@@ -68,6 +68,8 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     #   none    - each collective, then its GEMM (or the reverse), on one stream.
     #   chunked - pipelined in XDIT_TP_OVERLAP_CHUNKS chunks, RCCL on a side stream
     #             (benchmarks/tp_comm_gemm_overlap.py measures the gain per site).
+    #   symm_mem - torch's symm_mem fused AG+GEMM / GEMM+RS ops (NVLink; they
+    #             segfault on torch 2.13 / ROCm 7.16).
     "XDIT_TP_COMM_OVERLAP": lambda: os.environ.get("XDIT_TP_COMM_OVERLAP", "none"),
     "XDIT_TP_OVERLAP_CHUNKS": lambda: os.environ.get("XDIT_TP_OVERLAP_CHUNKS", "4"),
 }

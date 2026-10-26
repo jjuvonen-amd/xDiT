@@ -62,9 +62,11 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         # Set by xFuserWanTransformer3DWrapper.shard_for_tensor_parallel: the layer
         # holds 1/tp of the heads, and its Q/K norms span all of them. It is then
         # given this rank's rows and gathers them into its Q/K/V projections in
-        # `tp_chunks` pipelined chunks (see layers/tensor_parallel.py).
+        # `tp_chunks` pipelined chunks, or through torch's fused symm_mem ops
+        # with `tp_fused` (see layers/tensor_parallel.py).
         self.tensor_parallel = False
         self.tp_chunks = 1
+        self.tp_fused = False
 
     def _get_qkv_projections(
         self, attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor
@@ -93,10 +95,11 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         """Q/K/V of this rank's heads over all rows: the rows are gathered from the TP group into Q (and K/V
         for self-attention). Cross-attention's text K/V are whole on every rank. Projections are fused."""
         if self.is_cross_attention:
-            query = tp_column_parallel(hidden_states, attn.to_q, "attn2_q", self.tp_chunks)
+            query = tp_column_parallel(hidden_states, attn.to_q, "attn2_q", self.tp_chunks, self.tp_fused)
             key, value = attn.to_kv(encoder_hidden_states).chunk(2, dim=-1)
             return query, key, value
-        return tp_column_parallel(hidden_states, attn.to_qkv, "attn1_qkv", self.tp_chunks).chunk(3, dim=-1)
+        qkv = tp_column_parallel(hidden_states, attn.to_qkv, "attn1_qkv", self.tp_chunks, self.tp_fused)
+        return qkv.chunk(3, dim=-1)
 
     def _get_added_kv_projections(self, attn: "WanAttention", encoder_hidden_states_img: torch.Tensor):
         if attn.fused_projections:
@@ -193,7 +196,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         if self.tensor_parallel:
             # Row-parallel: partial sums over this rank's heads, reduced back to its rows.
             site = "attn2_out" if self.is_cross_attention else "attn1_out"
-            hidden_states = tp_row_parallel(hidden_states, attn.to_out[0], attn.tp_out_bias, site, self.tp_chunks)
+            hidden_states = tp_row_parallel(
+                hidden_states, attn.to_out[0], attn.tp_out_bias, site, self.tp_chunks, self.tp_fused
+            )
         else:
             hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
@@ -303,8 +308,8 @@ class xFuserWanTPTransformerBlock(WanTransformerBlock):
     class. The residual rows are split across the TP group. Each attention and
     the FFN all-gather the group's rows into their column-parallel projections
     and reduce-scatter their row-parallel output projections (the attention
-    processors do so inside attn1/attn2), in `tp_chunks` pipelined chunks.
-    Row-parallel biases are added once, after the reduction. Cross-attention
+    processors do so inside attn1/attn2), in `tp_chunks` pipelined chunks or
+    through torch's fused symm_mem ops with `tp_fused`. Row-parallel biases are added once, after the reduction. Cross-attention
     instead runs unsharded on the local rows when `shard_cross_attention` is
     False. The modulation, norms and gated residuals are diffusers', applied to
     the local rows.
@@ -349,9 +354,9 @@ class xFuserWanTPTransformerBlock(WanTransformerBlock):
             hidden_states
         )
         act = self.ffn.net[0]
-        ff_hidden = act.gelu(tp_column_parallel(norm_hidden_states, act.proj, "ffn_up", self.tp_chunks))
+        ff_hidden = act.gelu(tp_column_parallel(norm_hidden_states, act.proj, "ffn_up", self.tp_chunks, self.tp_fused))
         ff_output = tp_row_parallel(
-            self.ffn.net[1](ff_hidden), self.ffn.net[2], self.ffn_out_bias, "ffn_down", self.tp_chunks
+            self.ffn.net[1](ff_hidden), self.ffn.net[2], self.ffn_out_bias, "ffn_down", self.tp_chunks, self.tp_fused
         )
         hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 
@@ -431,7 +436,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         self._tp_rank = 0
         self._tp_chunks = 1
 
-    def shard_for_tensor_parallel(self, shard_cross_attention: bool = True, overlap_chunks: int = 1) -> None:
+    def shard_for_tensor_parallel(
+        self, shard_cross_attention: bool = True, overlap_chunks: int = 1, fused_comm: bool = False
+    ) -> None:
         """Split the blocks' weights across the TP group, Megatron style.
 
         Q/K/V and the FFN's first projection are column-parallel and their
@@ -447,7 +454,11 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         weights and runs on each rank's own rows, without communication.
         `overlap_chunks` > 1 pipelines each collective against its GEMM in that
         many chunks, with the residual rows block-cyclic (see layers/tensor_parallel.py).
+        `fused_comm` runs each pair through torch's symm_mem fused ops instead,
+        on contiguous rows.
         """
+        if fused_comm and overlap_chunks != 1:
+            raise ValueError("fused_comm pipelines on its own; it takes no overlap_chunks")
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size == 1 or self._tp_size > 1:
             return
@@ -459,6 +470,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         for block in self.blocks:
             block.shard_cross_attention = shard_cross_attention
             block.tp_chunks = overlap_chunks
+            block.tp_fused = fused_comm
             for name in ("attn1", "attn2") if shard_cross_attention else ("attn1",):
                 attn = getattr(block, name)
                 if getattr(attn, "fused_projections", False) or attn.add_k_proj is not None:
@@ -480,6 +492,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 attn.kv_inner_dim //= tp_size
                 attn.processor.tensor_parallel = True
                 attn.processor.tp_chunks = overlap_chunks
+                attn.processor.tp_fused = fused_comm
             # The Ulysses head balancer permutes this rank's heads only.
             block.attn1.head_perm = torch.arange(block.attn1.heads, device=block.attn1.head_perm.device)
             shard_linear_(block.ffn.net[0].proj, 0, tp_rank, tp_size)

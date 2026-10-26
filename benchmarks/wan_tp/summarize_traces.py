@@ -8,6 +8,13 @@ how much collective time overlaps compute kernels on another stream. Exposed
 collective time is what a comm/GEMM overlap can still win back. Collectives
 are identified by the "Collective name" the profiler attaches to their kernels,
 on CUDA and ROCm alike.
+
+torch's symm_mem fused ops (XDIT_TP_COMM_OVERLAP=symm_mem) carry no such name:
+they move data with device-to-device memory copies from peer buffers and
+synchronize with their own small kernels. Those are reported as "symm_mem
+copies"/"symm_mem kernels" and counted as communication too. Local device
+copies are memcpys as well, so copies count as communication only in traces
+that hold symm_mem kernels.
 """
 
 import argparse
@@ -23,6 +30,8 @@ CATEGORIES = [
     ("attention", re.compile(r"fmha|flash|sdpa|attn_fwd", re.I)),
     ("gemm", re.compile(r"Cijk_|nvjet|cutlass|xmma|gemm|matmul", re.I)),
 ]
+# symm_mem's synchronization and multicast kernels (barriers, signal pads, NVLS multimem).
+SYMM_MEM_KERNEL = re.compile(r"symm|multimem|barrier|signal", re.I)
 
 
 def _union(intervals):
@@ -51,9 +60,12 @@ def _intersection(a, b):
 
 
 def summarize(path):
-    kernels = [e for e in json.load(gzip.open(path))["traceEvents"] if e.get("cat") == "kernel"]
+    events = json.load(gzip.open(path))["traceEvents"]
+    kernels = [e for e in events if e.get("cat") == "kernel"]
+    copies = [e for e in events if e.get("cat") == "gpu_memcpy" and "DtoD" in e.get("name", "")]
     by_category = collections.Counter()
     collectives = collections.defaultdict(list)
+    symm_kernels = []
     comm_spans, compute_spans = [], []
     for kernel in kernels:
         span = (kernel["ts"], kernel["ts"] + kernel["dur"])
@@ -62,8 +74,15 @@ def summarize(path):
             collectives[collective].append(kernel)
             comm_spans.append(span)
             continue
+        if SYMM_MEM_KERNEL.search(kernel["name"]):
+            symm_kernels.append(kernel)
+            comm_spans.append(span)
+            continue
         compute_spans.append(span)
         by_category[next((c for c, rx in CATEGORIES if rx.search(kernel["name"])), "other")] += kernel["dur"]
+    if symm_kernels:
+        # Only symm_mem runs move data in peer copies; elsewhere they are local and left out.
+        comm_spans += [(c["ts"], c["ts"] + c["dur"]) for c in copies]
     comm, compute = _union(comm_spans), _union(compute_spans)
     busy = _length(_union(comm_spans + compute_spans))
 
@@ -84,10 +103,16 @@ def summarize(path):
             f"  coll {name:34s} x{len(ks):5d}  total {total / 1e6:6.2f} s  mean {total / len(ks) / 1e3:7.2f} ms"
             f"  msg {size / 1e6:8.1f} MB  busbw {busbw:6.1f} GB/s"
         )
+    for label, items in (("symm_mem copies", copies), ("symm_mem kernels", symm_kernels)):
+        if items and symm_kernels:
+            total = sum(i["dur"] for i in items)
+            moved = sum(i["args"].get("bytes", 0) for i in items)
+            rate = f"  {moved / (total * 1e-6) / 1e9:6.1f} GB/s" if moved else ""
+            print(f"  {label:39s} x{len(items):5d}  total {total / 1e6:6.2f} s{rate}")
     comm_total = _length(comm)
     hidden = _intersection(comm, compute)
     print(
-        f"  collectives wall {comm_total / 1e6:.2f} s, overlapping compute {hidden / 1e6:.2f} s"
+        f"  communication wall {comm_total / 1e6:.2f} s, overlapping compute {hidden / 1e6:.2f} s"
         f" ({100 * hidden / max(comm_total, 1):.0f}%), exposed {(comm_total - hidden) / 1e6:.2f} s"
         f" = {100 * (comm_total - hidden) / max(busy, 1):.0f}% of GPU busy time"
     )
