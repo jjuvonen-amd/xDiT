@@ -78,6 +78,8 @@ def _build_attention_kwargs(config: "xFuserArgs") -> dict:
         # constructor and the processors pass it on every call, so --solattn_beta needs nothing
         # else to reach the routing. A per-step schedule overrides it from the runtime state.
         "solattn_beta": config.solattn_beta,
+        # Read by the transformer, which turns it into a per-token query mask once it knows thw.
+        "solattn_exact_edge_frames": config.solattn_exact_edge_frames,
         "vsa_block_size": config.vsa_block_size,
         "vsa_top_k": config.vsa_top_k,
         "vsa_top_k_ratio": config.vsa_top_k_ratio,
@@ -88,6 +90,25 @@ def _build_attention_kwargs(config: "xFuserArgs") -> dict:
         "use_vsa_first_frame_mask": config.use_vsa_first_frame_mask,
         "vsa_collect_density": config.vsa_collect_density,
     }
+
+
+def _load_wan22_loras(pipe, config) -> None:
+    """Attach --lora_path / --lora_path_2 to the two Wan2.2 A14B experts, unfused, through PEFT.
+
+    Called after the loader has materialized and quantized the transformers, so PEFT wraps the
+    FP8 linears (TorchaoLoraLinear) and the adapters themselves stay BF16. Before torch.compile,
+    so the traced graph includes them. diffusers converts the LightX2V / kohya key layout.
+    """
+    for path, component, into_2 in ((config.lora_path, "transformer", False),
+                                    (config.lora_path_2, "transformer_2", True)):
+        if not path:
+            continue
+        adapter = f"lora_{component}"
+        log(f"Loading LoRA {path} into {component} (unfused, adapter '{adapter}')")
+        pipe.load_lora_weights(path, adapter_name=adapter, load_into_transformer_2=into_2)
+        wrapped = sum(1 for name, _ in getattr(pipe, component).named_modules()
+                      if name.endswith(f"lora_A.{adapter}"))
+        log(f"LoRA '{adapter}' wraps {wrapped} linear layers in {component}")
 
 
 class xFuserWanModel(xFuserModel):
@@ -379,6 +400,10 @@ class xFuserWan22I2VModel(xFuserWan21I2VModel):
                 **te_kwargs,
         )
         return pipe
+
+    def _post_load_and_state_initialization(self, input_args: dict) -> None:
+        super()._post_load_and_state_initialization(input_args)
+        _load_wan22_loras(self.pipe, self.config)
 
     def _get_compiled_pipe_components(self):
         return ["transformer", "transformer_2"]
@@ -763,6 +788,10 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
             **te_kwargs,
         )
         return pipe
+
+    def _post_load_and_state_initialization(self, input_args: dict) -> None:
+        super()._post_load_and_state_initialization(input_args)
+        _load_wan22_loras(self.pipe, self.config)
 
     def _get_compiled_pipe_components(self):
         return ["transformer", "transformer_2"]

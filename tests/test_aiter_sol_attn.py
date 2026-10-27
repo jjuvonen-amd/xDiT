@@ -4,22 +4,25 @@ Sol-Attn (arXiv 2607.24027) runs an AITER MHA v4 mode-2 row over the KV blocks i
 and recovers the rest from pooled per-block K/V under the same online softmax, so a dropped block
 costs its higher-order terms rather than all of its mass.
 
-Four rows are built -- fp8, i8fp8, mxfp8 and mxfp4 -- differing only in how Q/K/V are quantized.
-Where a test is about the mechanism rather than one row's precision it is parametrized over all
-four, because the MX rows reach the kernel by a different route: they have no raw entry point and
-their block-granular scales do not survive pooling, so they pool in dequantized space and hand the
-kernel a pooled scale of its own.
+The rows -- bf16, bf16fp8, fp8, i8fp8, mxfp8, mxfp4, mxfp6, f8f6, f6f8 and f6f4 -- differ only in
+how Q/K/V are quantized. Where a test is about the mechanism rather than one row's precision it is
+parametrized over all of them, because the MX rows reach the kernel by a different route: a packed
+operand pools from its BF16 source, and a block-granular scale does not survive pooling, so it
+pools in dequantized space and hands the kernel a pooled scale of its own.
 
 It differs from the Sparge backends in ways these tests pin down: it routes for itself instead of
-through a Sparge block mask, it is gfx950-only, and it rejects ring parallelism outright because
-merging partial outputs by LSE stops being valid once each rank has added its own correction.
+through a Sparge block mask, and it rejects ring parallelism outright because its routing threshold
+is taken over the blocks one call is shown.
 """
-
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
+
+
+# Every Sol-Attn recipe xDiT wires, as test ids. Listed rather than read from sol.py so collection
+# does not need aiter; a recipe the device lacks is skipped by _require_sol_recipe.
+ALL_RECIPES = ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "mxfp4", "mxfp6", "f8f6", "f6f8", "f6f4"]
 
 
 def _require_sol_attn():
@@ -32,19 +35,14 @@ def _require_sol_attn():
     if arch is None:
         pytest.skip(f"Sol-Attn ships gfx942 and gfx950 kernels, got {arch_name}.")
 
-    try:
-        import aiter
-        from aiter.ops.mha_v4 import mha_v4_sol_attn  # noqa: F401
-        from aiter.ops.triton.attention.utils import sol_attn_prepare  # noqa: F401
-    except ImportError:
-        pytest.skip("AITER does not expose the Sol-Attn API.")
+    from xfuser.core.sparge_attention import sol
 
-    # gfx942 keeps its code objects one level down, in an MI300 subdirectory.
-    fwd_dir = Path(aiter.__file__).resolve().parent.parent / "hsa" / arch / "fmha_v4_fwd"
-    if arch == "gfx942":
-        fwd_dir = fwd_dir / "MI300"
-    if not (fwd_dir / "fwd_hd128_fp8_sol_attn.co").exists():
-        pytest.skip(f"AITER does not include the {arch} Sol-Attn FMHA kernel.")
+    if not sol.SOL_ATTN_AVAILABLE:
+        pytest.skip("AITER does not expose the mha_v4_sol / sol_prepare API.")
+    # Asked of the manifest rather than of a code object's file name, which changed when aiter
+    # renamed the rows; a build with no mode-2 row on this arch has nothing to test.
+    if not _recipes_on_this_device():
+        pytest.skip(f"AITER has no Sol-Attn manifest row on {arch}.")
 
 
 def _require_sol_recipe(recipe):
@@ -63,11 +61,13 @@ def _require_sol_recipe(recipe):
 
 
 def _recipes_on_this_device():
-    """The Sol-Attn recipe ids this arch builds rows for, in declaration order."""
+    """The Sol-Attn recipe ids this device has a mode-2 manifest row for, in declaration order."""
     from xfuser.core.sparge_attention import sol
 
-    allowed = sol._ARCH_RECIPES.get(sol._device_arch())
-    return [r for r in sol.SOL_ATTN_RECIPES if allowed is None or r in allowed]
+    return [
+        r for r in sol.SOL_ATTN_RECIPES
+        if sol._AITER.block_tiles(sol._recipe_operands(sol._RECIPES[r]), sol._AITER.sol_mode)
+    ]
 
 
 def _any_precision_serves(tile):
@@ -78,7 +78,7 @@ def _any_precision_serves(tile):
     """
     from xfuser.core.sparge_attention import sol
 
-    return tuple(tile) in sol._block_tiles_in_any_precision(sol._AITER.sol_attn_mode)
+    return tuple(tile) in sol._block_tiles_in_any_precision(sol._AITER.sol_mode)
 
 
 def _serves(recipe, tile):
@@ -86,7 +86,7 @@ def _serves(recipe, tile):
     from xfuser.core.sparge_attention import sol
 
     operands = sol._recipe_operands(sol._RECIPES[recipe])
-    return sol._kv_tile_for_q_tile(tile[0], operands, sol._AITER.sol_attn_mode) == tile[1]
+    return sol._kv_tile_for_q_tile(tile[0], operands, sol._AITER.sol_mode) == tile[1]
 
 
 def test_sol_attn_drops_a_caller_alignment_pad():
@@ -304,7 +304,7 @@ def test_forced_blocks_are_added_to_what_routing_picked():
     recipe = _RECIPES["fp8"]
     tile = sol_attn_block_tile(recipe)[1]
     query, key, value = _operands(seqlen=8 * tile, heads=2)
-    q, k, v = _quantize(
+    quantized = _quantize(
         recipe,
         *(x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value)),
         query.shape[-1] ** -0.5,
@@ -316,8 +316,8 @@ def test_forced_blocks_are_added_to_what_routing_picked():
     forced = _force_blocks_from_tokens(exact_tokens, None, 8 * tile, tile)
     assert forced.tolist() == [False, False, False, True, False, False, False, False]
 
-    routed = sol_attn_routing_for(q, k, v, 0.5, recipe)["block_attn_mask"]
-    pinned = sol_attn_routing_for(q, k, v, 0.5, recipe, force_blocks=forced)[
+    routed = sol_attn_routing_for(quantized, 0.5, recipe)["block_attn_mask"]
+    pinned = sol_attn_routing_for(quantized, 0.5, recipe, force_blocks=forced)[
         "block_attn_mask"
     ]
 
@@ -386,6 +386,150 @@ def test_the_backend_hands_named_tokens_to_the_routing(monkeypatch):
     )
     # The beta the caller asked for has to arrive too, rather than the default.
     assert seen.get("beta") == 0.25
+
+
+def test_the_backend_hands_named_query_tokens_to_the_routing(monkeypatch):
+    """Same last link for the query-side mask, including the trim a caller's query pad gets."""
+    import torch
+
+    from xfuser.core.distributed import attention_backend as backend_module
+    from xfuser.core.distributed.attention_backend import (
+        SOL_EXACT_QUERY_TOKENS_KEY,
+        _aiter_sol_attn_call,
+    )
+    from xfuser.core.sparge_attention import sol as sol_module
+
+    seen = {}
+
+    def _record(query, key, value, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros_like(query), None
+
+    monkeypatch.setattr(sol_module, "sol_attn_bhsd", _record)
+    monkeypatch.setattr(backend_module, "get_ring_parallel_world_size", lambda: 1)
+
+    exact_query_tokens = torch.zeros(256, dtype=torch.bool)
+    exact_query_tokens[:8] = True
+    q = torch.zeros(1, 2, 256, 8)
+    _aiter_sol_attn_call(
+        q, q, q, 0.0, False,
+        {SOL_EXACT_QUERY_TOKENS_KEY: exact_query_tokens, "valid_q_len": 200},
+        "fp8",
+    )
+
+    assert seen.get("exact_query_tokens") is not None, "the named query tokens were dropped"
+    assert seen["exact_query_tokens"].equal(exact_query_tokens[:200]), (
+        "the query mask has to be trimmed with the query it describes"
+    )
+
+
+def test_forced_rows_cover_every_tile_holding_a_named_query():
+    """A query tile is the unit routing selects for, so one flagged token makes its whole tile exact."""
+    import torch
+
+    from xfuser.core.sparge_attention.sol import _force_rows_from_tokens
+
+    tokens = torch.zeros(10, dtype=torch.bool)
+    tokens[5] = True
+    rows = _force_rows_from_tokens(tokens, 10, 4)
+    # 10 queries in tiles of 4 is three tiles, the last one short; token 5 sits in the second.
+    assert rows.shape == (3, 1)
+    assert rows.flatten().tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize("recipe", ["bf16", "fp8"])
+def test_a_ragged_call_is_not_padded_and_keeps_its_short_tail_exact(recipe, monkeypatch):
+    """Every gfx950 Sol-Attn row is ragged, so a key length off the tile goes to it as it is.
+
+    Padding was the old route, and it hid the short last block from aiter's partial-tail guard, so
+    that block could be pooled as if every slot were real. Handed the true length, aiter's routing
+    sees the short block and keeps it exact itself, on the raw path as much as the packed one.
+    """
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+
+    from xfuser.core.sparge_attention import sol
+
+    tile = sol.sol_attn_block_tile(sol._RECIPES[recipe])
+    kv_tile = tile[1]
+    assert sol._ragged_kv(recipe, tile), f"the {recipe} Sol-Attn row should declare ragged_kv"
+
+    seen = {"pad": False, "raw": False}
+    real_pad, real_raw = sol._pad_kv_to_tile, sol._AITER.sol
+
+    def pad(*args, **kwargs):
+        seen["pad"] = True
+        return real_pad(*args, **kwargs)
+
+    def raw(*args, **kwargs):
+        seen["raw"] = True
+        return real_raw(*args, **kwargs)
+
+    monkeypatch.setattr(sol, "_pad_kv_to_tile", pad)
+    monkeypatch.setattr(sol._AITER, "sol", raw)
+
+    seqlen = 8 * kv_tile + kv_tile // 4
+    query, key, value = _operands(seqlen=seqlen)
+    with torch.no_grad():
+        out, _ = sol.sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe)
+    assert out.shape == query.shape and torch.isfinite(out).all()
+    assert not seen["pad"], "a ragged row must be handed the true key length"
+    assert seen["raw"], "a plain ragged call keeps the raw entrypoint"
+
+    quantized = sol._quantize(
+        sol._RECIPES[recipe],
+        *(x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value)),
+        query.shape[-1] ** -0.5,
+    )
+    mask = sol.sol_attn_routing_for(quantized, 0.5, sol._RECIPES[recipe])["block_attn_mask"]
+    assert mask.shape[-1] == 9, "the short last block still counts as a block"
+    assert mask[..., -1].all(), "routing must keep the short last block exact for every tile"
+
+
+def test_exact_query_tokens_make_their_rows_dense():
+    """Flagged query tiles have to come out as they would with every block exact, and only those.
+
+    Checked against the same kernel with beta low enough that routing selects everything, on the
+    BF16 row, where no quantization stands between the two.
+    """
+    _require_sol_attn()
+    _require_sol_recipe("bf16")
+
+    from xfuser.core.sparge_attention.sol import _RECIPES, sol_attn_block_tile, sol_attn_bhsd
+
+    q_tile = sol_attn_block_tile(_RECIPES["bf16"])[0]
+    seqlen = 4 * q_tile
+    query, key, value = _operands(seqlen=seqlen, heads=2)
+    exact_query_tokens = torch.zeros(seqlen, dtype=torch.bool, device="cuda")
+    exact_query_tokens[:q_tile] = True
+    exact_query_tokens[-1] = True
+
+    with torch.no_grad():
+        exact_all, _ = sol_attn_bhsd(query, key, value, beta=-100.0, recipe="bf16")
+        sparse, _ = sol_attn_bhsd(query, key, value, beta=1.0, recipe="bf16")
+        pinned, _ = sol_attn_bhsd(query, key, value, beta=1.0, recipe="bf16",
+                                  exact_query_tokens=exact_query_tokens)
+
+    flagged = torch.zeros(seqlen, dtype=torch.bool, device="cuda")
+    flagged[:q_tile] = True
+    flagged[-q_tile:] = True
+    torch.testing.assert_close(pinned[:, :, flagged], exact_all[:, :, flagged],
+                               atol=1e-3, rtol=1e-3)
+    assert torch.equal(pinned[:, :, ~flagged], sparse[:, :, ~flagged]), (
+        "rows outside the flagged tiles must keep their routed selection"
+    )
+    # Not checked on the outputs: on the unquantized BF16 row the pooled correction is near exact
+    # on these operands, so a sparse and an exact row can agree. The selection is what has to differ.
+    from xfuser.core.sparge_attention.sol import _quantize, sol_attn_routing_for
+
+    recipe = _RECIPES["bf16"]
+    quantized = _quantize(
+        recipe,
+        *(x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value)),
+        query.shape[-1] ** -0.5,
+    )
+    routed = sol_attn_routing_for(quantized, 1.0, recipe)["block_attn_mask"]
+    assert not routed[:, :, 0].all(), "beta 1.0 must leave the first tile sparse, or the pin is moot"
 
 
 def test_sol_attn_refuses_multi_sequence_varlen():
@@ -682,15 +826,21 @@ def test_sol_attn_takes_a_seqlen_that_is_not_a_whole_number_of_kv_blocks(seqlen)
 # BF16's is four orders tighter than the rest because nothing rounds on that row: with no
 # quantization the pooled correction reproduces the dense result outright, so anything it loses is
 # float accumulation order and not the algorithm. The quantized rows are bounded by how far their
-# pooled means round away from the blocks they stand in for, which is why MXFP4 -- eight magnitude
-# levels, and the only row that also quantizes V into them -- gets an order more room.
+# pooled means round away from the blocks they stand in for, which is why the MXFP6-V and MXFP4-V
+# rows other than all-MXFP4 get an order more room.
 _DENSE_SIBLING_TOLERANCE = {
     "bf16": 1e-6,
     "bf16fp8": 2e-3,
     "fp8": 2e-3,
     "i8fp8": 2e-3,
     "mxfp8": 2e-3,
-    "mxfp4": 2e-2,
+    # Against F4F4 (MXFP4 V as well) it measures 1.2e-7 on the mha_v4-sol-attn build; the old
+    # 2e-2 was room for comparing against the retired FP8-V MXFP4 row.
+    "mxfp4": 2e-3,
+    # Measured on that build at 1.4e-3, 1.0e-3 and 1.0e-3 worst case over the three separations.
+    "mxfp6": 1e-2,
+    "f8f6": 1e-2,
+    "f6f4": 1e-2,
 }
 
 
@@ -698,7 +848,8 @@ _DENSE_SIBLING_TOLERANCE = {
     ("recipe", "dense_backend"),
     [("bf16", "AITER_BF16"), ("bf16fp8", "AITER_BF16FP8"),
      ("fp8", "AITER_FP8"), ("i8fp8", "AITER_I8FP8"),
-     ("mxfp8", "AITER_MXFP8"), ("mxfp4", "AITER_MXFP4")],
+     ("mxfp8", "AITER_MXFP8"), ("mxfp4", "AITER_F4F4"),
+     ("mxfp6", "AITER_MXFP6"), ("f8f6", "AITER_F8F6"), ("f6f4", "AITER_F6F4")],
 )
 def test_every_sol_row_holds_its_dense_sibling_across_cluster_separations(
     recipe, dense_backend, monkeypatch
@@ -763,6 +914,161 @@ def test_every_sol_row_holds_its_dense_sibling_across_cluster_separations(
         )
 
 
+@pytest.mark.parametrize("recipe", [r for r in ALL_RECIPES if r != "mxfp8"])
+def test_the_packed_path_reproduces_mha_v4_sol_with_k_smoothing_on(recipe):
+    """xDiT's own quantization has to hand the kernel exactly what mha_v4_sol would.
+
+    The packed path is taken for head cost, forced blocks and the error router; if its operands
+    differed from the raw entrypoint's, switching any of those on would change the output for a
+    reason that has nothing to do with them. K carries a large shared component here so aiter's
+    smoothing gate actually fires -- below it the shift is a zero vector and a missed subtraction,
+    or a k_shift not handed to a packed K's pooling, would go unseen.
+    """
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _operands(seqlen=1024, heads=2)
+    common = torch.randn(1, key.shape[1], 1, key.shape[3], device="cuda")
+    key = (key.float() + 3.0 * common * key.float().std()).bfloat16()
+
+    with torch.no_grad():
+        raw, _ = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe)
+        packed, cost = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe,
+                                     return_head_cost=True)
+
+    assert cost is not None
+    assert torch.equal(raw, packed), (
+        f"{recipe}: the packed path must reproduce mha_v4_sol exactly, K smoothing included"
+    )
+
+
+@pytest.mark.parametrize("recipe", ALL_RECIPES)
+@pytest.mark.parametrize("router,jensen", [("mean", True), ("error", False), ("error", True)])
+def test_the_router_and_jensen_options_run_on_every_recipe_that_takes_them(recipe, router, jensen):
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+
+    from xfuser.core.sparge_attention.sol import _RECIPES, SolAttnUnsupported, sol_attn_bhsd
+
+    query, key, value = _operands(seqlen=2048, heads=2)
+    if router == "error" and not _RECIPES[recipe].supports_error_router:
+        with pytest.raises(SolAttnUnsupported, match="packed"):
+            sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe, router=router,
+                          jensen=jensen)
+        return
+    with torch.no_grad():
+        out, _ = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe, router=router,
+                               jensen=jensen)
+        plain, _ = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe)
+    assert out.shape == query.shape and torch.isfinite(out).all()
+    # Against the same recipe without the options rather than an absolute bar: MXFP4 sits near
+    # 0.83 of fp32 here whatever Sol-Attn does, because dense MXFP4 does too.
+    reference = _fp32_attention(query, key, value)
+    assert _cosine(out, reference) > _cosine(plain, reference) - 0.01
+
+
+@pytest.mark.parametrize("recipe", ["bf16", "fp8"])
+def test_the_jensen_term_does_not_pull_a_sparse_selection_away_from_exact(recipe):
+    """With few blocks exact the pooled branch carries most of the mass, which is where the
+    second-order term is meant to help; it must at least not make the answer worse."""
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _operands(seqlen=2048, heads=2, sharpness=1.0)
+    reference = _fp32_attention(query, key, value)
+    with torch.no_grad():
+        plain, _ = sol_attn_bhsd(query, key, value, beta=1.5, recipe=recipe)
+        jensen, _ = sol_attn_bhsd(query, key, value, beta=1.5, recipe=recipe, jensen=True)
+
+    def rel(x):
+        return ((x.float() - reference).norm() / reference.norm()).item()
+
+    assert rel(jensen) <= rel(plain) * 1.02, (
+        f"{recipe}: Jensen rel err {rel(jensen):.4g} vs plain {rel(plain):.4g}"
+    )
+
+
+def test_the_error_router_is_refused_at_setup_for_a_packed_k():
+    _require_sol_attn()
+
+    from xfuser.core.sparge_attention.sol import SolAttnUnsupported, check_sol_attn_recipe
+
+    for recipe in ("mxfp4", "mxfp6", "f6f8", "f6f4"):
+        _require_sol_recipe(recipe)
+        with pytest.raises(SolAttnUnsupported, match="packed"):
+            check_sol_attn_recipe(recipe, router="error")
+    check_sol_attn_recipe("fp8", router="error")
+
+
+@pytest.mark.parametrize("router,jensen", [("error", False), ("mean", True)])
+def test_the_new_options_take_the_packed_path(router, jensen, monkeypatch):
+    """mha_v4_sol routes with the mean router and no variance, so it must not be asked to do more."""
+    _require_sol_attn()
+    _require_sol_recipe("fp8")
+
+    from xfuser.core.sparge_attention import sol
+
+    called = []
+
+    def raw(*args, **kwargs):
+        called.append(True)
+        raise AssertionError("the raw entrypoint cannot honour router/jensen")
+
+    monkeypatch.setattr(sol._AITER, "sol", raw)
+    query, key, value = _operands(seqlen=1024, heads=2)
+    with torch.no_grad():
+        sol.sol_attn_bhsd(query, key, value, beta=0.5, recipe="fp8", router=router, jensen=jensen)
+    assert not called
+
+
+@pytest.mark.parametrize("recipe", ["bf16", "fp8"])
+def test_the_new_options_hold_one_graph(recipe):
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _operands(seqlen=1008)
+
+    def run(q, k, v):
+        out, _ = sol_attn_bhsd(q, k, v, beta=0.5, recipe=recipe, router="error", jensen=True)
+        return out
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        compiled = torch.compile(run, fullgraph=True)(query, key, value)
+        eager = run(query, key, value)
+    assert torch.equal(compiled, eager), "compiling must not change the result"
+
+
+def test_the_backend_hands_the_configured_options_to_sol(monkeypatch):
+    """--solattn_router / --solattn_jensen arrive through the runtime config, not attention_kwargs."""
+    import torch
+
+    from xfuser.core.distributed import attention_backend as backend_module
+    from xfuser.core.distributed import runtime_state
+    from xfuser.core.distributed.attention_backend import _aiter_sol_attn_call
+    from xfuser.core.sparge_attention import sol as sol_module
+
+    seen = {}
+
+    def _record(query, key, value, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros_like(query), None
+
+    monkeypatch.setattr(sol_module, "sol_attn_bhsd", _record)
+    monkeypatch.setattr(backend_module, "get_ring_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(runtime_state, "get_configured_sol_options", lambda: ("error", True))
+
+    q = torch.zeros(1, 2, 256, 8)
+    _aiter_sol_attn_call(q, q, q, 0.0, False, {}, "fp8")
+    assert seen.get("router") == "error" and seen.get("jensen") is True
+
+
 def test_sol_attn_publishes_a_head_cost_without_changing_the_output(monkeypatch):
     """Requesting the head cost moves the call onto aiter's packed API.
 
@@ -810,7 +1116,8 @@ def test_sol_attn_publishes_a_head_cost_without_changing_the_output(monkeypatch)
     ("recipe", "dense_backend"),
     [("bf16", "AITER_BF16"), ("bf16fp8", "AITER_BF16FP8"),
      ("fp8", "AITER_FP8"), ("i8fp8", "AITER_I8FP8"),
-     ("mxfp8", "AITER_MXFP8"), ("mxfp4", "AITER_MXFP4")],
+     ("mxfp8", "AITER_MXFP8"), ("mxfp4", "AITER_F4F4"),
+     ("mxfp6", "AITER_MXFP6"), ("f8f6", "AITER_F8F6"), ("f6f4", "AITER_F6F4")],
 )
 def test_every_sol_recipe_tracks_its_own_dense_sibling(recipe, dense_backend):
     """Each row against the dense row of the SAME recipe, which is the only fair target.
@@ -855,7 +1162,7 @@ def test_every_sol_recipe_tracks_its_own_dense_sibling(recipe, dense_backend):
     assert _cosine(sol, reference) > _cosine(dense, reference) - 0.01
 
 
-@pytest.mark.parametrize("recipe", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("recipe", ALL_RECIPES)
 def test_every_sol_recipe_publishes_a_head_cost(recipe):
     """The balancer consumes this for every row, not just the one with a raw entry point."""
     _require_sol_attn()
@@ -876,7 +1183,7 @@ def test_every_sol_recipe_publishes_a_head_cost(recipe):
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.parametrize("recipe", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("recipe", ALL_RECIPES)
 @pytest.mark.parametrize("seqlen", [1024, 1008])
 @pytest.mark.parametrize("head_cost", [False, True])
 def test_sol_attn_holds_one_graph(recipe, seqlen, head_cost):
@@ -1070,14 +1377,14 @@ def test_an_unset_block_tile_takes_the_kernel_default(monkeypatch):
     """Unset is the shipped configuration, and it must not pin a geometry of its own."""
     _require_sol_attn()
 
-    from aiter.ops.mha_v4 import MHA_V4_SOL_ATTN_MODE, mha_v4_block_tile
+    from aiter.ops.mha_v4 import MHA_V4_SOL_MODE, mha_v4_block_tile
     from xfuser.core.sparge_attention import sol
 
     _override_tile(monkeypatch, None)
     for recipe_id in _recipes_on_this_device():
         recipe = sol._RECIPES[recipe_id]
         expected = mha_v4_block_tile(
-            sol._recipe_operands(recipe), MHA_V4_SOL_ATTN_MODE
+            sol._recipe_operands(recipe), MHA_V4_SOL_MODE
         )
         assert sol.sol_attn_block_tile(recipe) == expected
 
@@ -1173,7 +1480,7 @@ def test_the_64x64_override_routes_and_dispatches_at_64(monkeypatch):
 
     recipe = sol._RECIPES["fp8"]
     fp8_default = sol._AITER.block_tile(
-        sol._recipe_operands(recipe), sol._AITER.sol_attn_mode
+        sol._recipe_operands(recipe), sol._AITER.sol_mode
     )
 
     def run(tile):
@@ -1209,25 +1516,32 @@ def test_a_block_tile_not_every_recipe_serves_is_rejected_at_setup(monkeypatch):
     stands between a mistyped launch and a run that loads a model for minutes before dying. The
     dispatch would catch it too, but only after the load and without naming the variable.
 
-    Which recipes serve 64x64 is read from aiter's manifest rather than pinned here. gfx950 shipped
-    that geometry for FP8 first and BF16 later, and pinning the membership only meant this test
-    failed when a row was added. What has to hold is the behaviour on both sides of the split, so
-    the test asserts the split is non-trivial and then drives every recipe through it.
+    Which geometry splits the recipes is read from aiter's manifest rather than pinned here. It used
+    to be 64x64, until the mha_v4-sol-attn branch gave every recipe a 64x64 row; on that build it is
+    256x64, which only the BF16 Q/K rows route on. Pinning either only meant this test failed when a
+    row was added. What has to hold is the behaviour on both sides of the split, so the test finds a
+    geometry with recipes on both sides and drives every recipe through it.
     """
     _require_sol_attn()
 
     from xfuser.core.sparge_attention import sol
     from xfuser.core.sparge_attention.sol import SolAttnUnsupported, check_sol_attn_recipe
 
-    if not _any_precision_serves((64, 64)):
-        pytest.skip("this build has no 64x64 Sol-Attn row.")
-
-    _override_tile(monkeypatch, (64, 64))
     recipes = _recipes_on_this_device()
-    served = [recipe for recipe in recipes if _serves(recipe, (64, 64))]
+    tiles = sorted({tile for recipe in recipes
+                    for tile in sol._AITER.block_tiles(
+                        sol._recipe_operands(sol._RECIPES[recipe]), sol._AITER.sol_mode)})
+    split = next(
+        (tile for tile in tiles
+         if 0 < sum(_serves(recipe, tile) for recipe in recipes) < len(recipes)),
+        None,
+    )
+    if split is None:
+        pytest.skip("every Sol-Attn geometry on this build is served by every recipe.")
+
+    _override_tile(monkeypatch, split)
+    served = [recipe for recipe in recipes if _serves(recipe, split)]
     unserved = [recipe for recipe in recipes if recipe not in served]
-    assert served, "no recipe serves 64x64, so the accepting half of the check is untested"
-    assert unserved, "every recipe serves 64x64, so the rejecting half of the check is untested"
 
     for recipe in served:
         check_sol_attn_recipe(recipe)

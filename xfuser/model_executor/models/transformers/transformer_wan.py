@@ -11,6 +11,7 @@ from xfuser.model_executor.layers.usp import (
     USP,
     attention,
 )
+from xfuser.core.distributed.attention_backend import SOL_EXACT_QUERY_TOKENS_KEY
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
@@ -30,6 +31,20 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+
+
+def _edge_frame_tokens(num_frames, frame_tokens, pad_amount, device):
+    """Bool mask over the gathered self-attention sequence flagging the first and last latent frames.
+
+    Tokens are frame-major (patchify flattens T, H, W in that order), so latent frame t owns
+    [t * frame_tokens, (t + 1) * frame_tokens). The sequence-parallel pad sits after the last
+    frame and stays unflagged. Built fresh with tensor ops each forward so it traces as part of
+    the compiled transformer rather than as a cached attribute Dynamo would have to guard.
+    """
+    mask = torch.zeros(num_frames * frame_tokens + pad_amount, dtype=torch.bool, device=device)
+    mask[:frame_tokens] = True
+    mask[(num_frames - 1) * frame_tokens : num_frames * frame_tokens] = True
+    return mask
 
 @xFuserAttentionProcessorRegister.register(WanAttnProcessor)
 class xFuserWanAttnProcessor(WanAttnProcessor):
@@ -366,6 +381,14 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         # Part of sequence parallel: given the resolution, we may need to pad the sequence length to match this prior to chunking
         pad_amount = (sp_world_size - (hidden_states.shape[1] % sp_world_size)) % sp_world_size
         hidden_states = self._chunk_and_pad_sequence(hidden_states, sp_world_rank, sp_world_size, pad_amount, dim=1)
+
+        if self.attention_kwargs is not None and self.attention_kwargs.get("solattn_exact_edge_frames"):
+            self.attention_kwargs[SOL_EXACT_QUERY_TOKENS_KEY] = _edge_frame_tokens(
+                post_patch_num_frames,
+                post_patch_height * post_patch_width,
+                pad_amount,
+                hidden_states.device,
+            )
 
         if ts_seq_len is not None: # (wan2.2 ti2v)
             temb = self._chunk_and_pad_sequence(temb, sp_world_rank, sp_world_size, pad_amount, dim=1)

@@ -711,6 +711,10 @@ class AttentionBackendType(Enum):
     AITER_FP8_SOL = "AITER FP8 Sol"
     AITER_MXFP8_SOL = "AITER MXFP8 Sol"
     AITER_MXFP4_SOL = "AITER MXFP4 Sol"
+    AITER_MXFP6_SOL = "AITER MXFP6 Sol"
+    AITER_F8F6_SOL = "AITER F8F6 Sol"
+    AITER_F6F8_SOL = "AITER F6F8 Sol"
+    AITER_F6F4_SOL = "AITER F6F4 Sol"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
     AITER_SAGE_V2 = "AITER Sage V2"
@@ -775,8 +779,8 @@ AITER_MHA_V4_ONLY_BACKENDS = tuple(
 )
 AITER_MHA_V4_ONLY_BACKEND_SET = frozenset(AITER_MHA_V4_ONLY_BACKENDS)
 AITER_MHA_V4_SPARGE_BACKEND_SET = frozenset(AITER_MHA_V4_SPARGE_BACKENDS)
-# The mode-2 (Sol-Attn) rows. A subset of the recipes above: Sol-Attn needs a manifest row of its
-# own per recipe, and only these six are built.
+# The mode-2 (Sol-Attn) rows. Sol-Attn needs a manifest row of its own per recipe; these are the
+# ones aiter's mha_v4-sol-attn branch builds on gfx950. f6f8 has no dense or Sparge sibling here.
 AITER_MHA_V4_SOL_BACKENDS = (
     AttentionBackendType.AITER_BF16_SOL,
     AttentionBackendType.AITER_BF16FP8_SOL,
@@ -784,18 +788,25 @@ AITER_MHA_V4_SOL_BACKENDS = (
     AttentionBackendType.AITER_FP8_SOL,
     AttentionBackendType.AITER_MXFP8_SOL,
     AttentionBackendType.AITER_MXFP4_SOL,
+    AttentionBackendType.AITER_MXFP6_SOL,
+    AttentionBackendType.AITER_F8F6_SOL,
+    AttentionBackendType.AITER_F6F8_SOL,
+    AttentionBackendType.AITER_F6F4_SOL,
 )
 AITER_MHA_V4_SOL_BACKEND_SET = frozenset(AITER_MHA_V4_SOL_BACKENDS)
 # attention_kwargs key a model uses to name the KV tokens routing must not drop. See
 # sol_attn_bhsd's exact_tokens argument for what it is for. It lives here rather than beside that
 # argument so a model can set it without importing sol.py, whose import is deliberately lazy.
 SOL_EXACT_TOKENS_KEY = "_sol_exact_tokens"
+# The query-side counterpart: query tokens whose tiles compute every KV block exactly. See
+# sol_attn_bhsd's exact_query_tokens argument.
+SOL_EXACT_QUERY_TOKENS_KEY = "_sol_exact_query_tokens"
 # Optional full-sequence permutations applied immediately before Sol-Attn routing and reversed on
 # its output. Models publish both so every layer reuses cached tensors without sorting on-device.
 SOL_SEQUENCE_PERMUTATION_KEY = "_sol_sequence_permutation"
 SOL_SEQUENCE_INVERSE_PERMUTATION_KEY = "_sol_sequence_inverse_permutation"
-# Which recipe each backend asks for, so setup can check the device has that row. The BF16 and MX
-# rows are gfx950-only; gfx942 builds the per-tensor pair.
+# Which recipe each backend asks for, so setup can check the device has that row. Which rows a
+# device has is read from aiter's manifest at setup; gfx942 currently has none.
 AITER_MHA_V4_SOL_RECIPE = {
     AttentionBackendType.AITER_BF16_SOL: "bf16",
     AttentionBackendType.AITER_BF16FP8_SOL: "bf16fp8",
@@ -803,6 +814,10 @@ AITER_MHA_V4_SOL_RECIPE = {
     AttentionBackendType.AITER_FP8_SOL: "fp8",
     AttentionBackendType.AITER_MXFP8_SOL: "mxfp8",
     AttentionBackendType.AITER_MXFP4_SOL: "mxfp4",
+    AttentionBackendType.AITER_MXFP6_SOL: "mxfp6",
+    AttentionBackendType.AITER_F8F6_SOL: "f8f6",
+    AttentionBackendType.AITER_F6F8_SOL: "f6f8",
+    AttentionBackendType.AITER_F6F4_SOL: "f6f4",
 }
 AITER_MHA_V4_GFX942_SPARGE_BACKENDS = (
     AttentionBackendType.AITER_I8FP8_SPARGE,
@@ -1834,6 +1849,17 @@ def _sol_attn_beta(kwargs):
     return float(kwargs.get("solattn_beta", 0.5))
 
 
+def _sol_attn_options():
+    """This run's (router, jensen), from --solattn_router / --solattn_jensen.
+
+    Read from the runtime config rather than attention_kwargs so every Sol model gets them without
+    threading them through its own kwargs, the way MiniMax-H3 has to for beta.
+    """
+    from xfuser.core.distributed.runtime_state import get_configured_sol_options
+
+    return get_configured_sol_options()
+
+
 def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs, recipe):
     """Run Sol-Attn on one of the AITER MHA v4 mode-2 rows.
 
@@ -1851,6 +1877,7 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     kwargs = attention_kwargs or {}
     cost_sink = kwargs.get(COST_SINK_KEY)
     exact_tokens = kwargs.get(SOL_EXACT_TOKENS_KEY)
+    exact_query_tokens = kwargs.get(SOL_EXACT_QUERY_TOKENS_KEY)
     sequence_permutation = kwargs.get(SOL_SEQUENCE_PERMUTATION_KEY)
     sequence_inverse_permutation = kwargs.get(SOL_SEQUENCE_INVERSE_PERMUTATION_KEY)
 
@@ -1871,11 +1898,14 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         value = value[:, :, :query_seqlen]
         if exact_tokens is not None:
             exact_tokens = exact_tokens[:query_seqlen]
+        if exact_query_tokens is not None:
+            exact_query_tokens = exact_query_tokens[:query_seqlen]
         if sequence_permutation is not None:
             sequence_permutation = sequence_permutation[:query_seqlen]
         if sequence_inverse_permutation is not None:
             sequence_inverse_permutation = sequence_inverse_permutation[:query_seqlen]
 
+    router, jensen = _sol_attn_options()
     output, head_cost = sol_attn_bhsd(
         query,
         key,
@@ -1892,8 +1922,11 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         # Set by a model that packs several modalities into one sequence, naming the tokens whose
         # blocks routing must not be allowed to drop. See sol_attn_bhsd.
         exact_tokens=exact_tokens,
+        exact_query_tokens=exact_query_tokens,
         sequence_permutation=sequence_permutation,
         sequence_inverse_permutation=sequence_inverse_permutation,
+        router=router,
+        jensen=jensen,
     )
     if cost_sink is not None:
         cost_sink.copy_(head_cost)
@@ -1961,9 +1994,41 @@ def _aiter_mxfp8_sol_attn_call(query, key, value, dropout_p, is_causal, attentio
 
 @register_attention_function(AttentionBackendType.AITER_MXFP4_SOL)
 def _aiter_mxfp4_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    """Sol-Attn on the all-MXFP4 row, the only one where Q, K and V are all block scaled."""
+    """Sol-Attn on the all-MXFP4 row, its V packed in FP6-P order."""
     return _aiter_sol_attn_call(
         query, key, value, dropout_p, is_causal, attention_kwargs, "mxfp4"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_MXFP6_SOL)
+def _aiter_mxfp6_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the all-MXFP6 row, its V packed in FP6-P order."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "mxfp6"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F8F6_SOL)
+def _aiter_f8f6_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the per-tensor FP8 Q/K and MXFP6 V row."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "f8f6"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F6F8_SOL)
+def _aiter_f6f8_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the MXFP6 Q/K and per-channel FP8 V row."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "f6f8"
+    )
+
+
+@register_attention_function(AttentionBackendType.AITER_F6F4_SOL)
+def _aiter_f6f4_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """Sol-Attn on the MXFP6 Q/K and MXFP4 V row, its V packed in FP6-P order."""
+    return _aiter_sol_attn_call(
+        query, key, value, dropout_p, is_causal, attention_kwargs, "f6f4"
     )
 
 

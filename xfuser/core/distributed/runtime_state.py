@@ -400,10 +400,14 @@ class RuntimeState(metaclass=ABCMeta):
         elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
             from xfuser.core.sparge_attention.sol import check_sol_attn_recipe
             # Fail here rather than on the first attention call: which recipes exist depends on the
-            # device (gfx942 builds the per-tensor pair, gfx950 all of them), and the per-call check
-            # cannot be reached early enough to give a useful message during setup.
+            # device and the aiter build (gfx950 ships them all, gfx942 currently none), and whether
+            # --solattn_router error can run depends on the recipe (not with a packed K). The
+            # per-call check cannot be reached early enough to give a useful message during setup.
             # SolAttnUnsupported is a RuntimeError, matching the other branches.
-            check_sol_attn_recipe(AITER_MHA_V4_SOL_RECIPE[attention_backend])
+            check_sol_attn_recipe(
+                AITER_MHA_V4_SOL_RECIPE[attention_backend],
+                router=getattr(self.runtime_config, "solattn_router", "mean"),
+            )
         elif attention_backend == AttentionBackendType.AITER_SAGE_V2:
             try:
                 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import fav3_sage_mxfp4_wrapper
@@ -1309,6 +1313,16 @@ def get_scheduled_solattn_beta():
     right answer rather than an error.
     """
     return getattr(_RUNTIME, "scheduled_solattn_beta", None) if _RUNTIME is not None else None
+
+
+def get_configured_sol_options():
+    """(router, jensen) from --solattn_router / --solattn_jensen, or the defaults ("mean", False).
+
+    Tolerates an uninitialized runtime for the same reason get_scheduled_solattn_beta does. Only
+    python values are read, so a traced call folds them to constants; they are fixed for a run.
+    """
+    config = getattr(_RUNTIME, "runtime_config", None) if _RUNTIME is not None else None
+    return (getattr(config, "solattn_router", "mean"), bool(getattr(config, "solattn_jensen", False)))
 
 
 def initialize_runtime_state(pipeline: Optional[DiffusionPipeline] = None, engine_config: Optional[EngineConfig] = None):

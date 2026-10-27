@@ -299,6 +299,12 @@ class xFuserArgs:
     # Sol-Attn
     solattn_beta: float = 0.5
     solattn_beta_schedule: Optional[str] = None
+    solattn_router: str = "mean"
+    solattn_jensen: bool = False
+    solattn_exact_edge_frames: bool = False
+    # LoRA adapters loaded unfused through PEFT (Wan2.2 A14B runners)
+    lora_path: Optional[str] = None
+    lora_path_2: Optional[str] = None
     # AITER CK-Tile VSA attention
     vsa_block_size: int = 128
     vsa_top_k: int = 1
@@ -1283,6 +1289,46 @@ class xFuserArgs:
                  "reads the leading minus as another option.",
         )
         parser.add_argument(
+            "--solattn_router",
+            choices=("mean", "error"),
+            default="mean",
+            help="How the Sol backends score KV blocks against the beta threshold. 'mean' is the "
+                 "paper's pooled q.k proxy. 'error' scores a block by its second-order mass times "
+                 "the spread of the weights inside it, spending the exact budget where the pooled "
+                 "estimate is least reliable; it pairs with --solattn_jensen and is not available "
+                 "on the recipes with a packed MXFP4/MXFP6 K.",
+        )
+        parser.add_argument(
+            "--solattn_jensen",
+            action="store_true",
+            help="Pass each KV block's K variance to the Sol kernel, so a pooled block's logit "
+                 "carries its second-order term instead of stopping at its Jensen lower bound "
+                 "q.mean_k. Runs through aiter's packed API rather than mha_v4_sol.",
+        )
+        parser.add_argument(
+            "--lora_path",
+            type=nullable_str,
+            default=None,
+            help="Wan2.2 A14B: a LoRA .safetensors file loaded unfused through PEFT into "
+                 "`transformer`, the high-noise expert (e.g. Lightning's high_noise_model). It is "
+                 "attached after FP8 GEMM quantization, so its adapters stay BF16 on top.",
+        )
+        parser.add_argument(
+            "--lora_path_2",
+            type=nullable_str,
+            default=None,
+            help="Wan2.2 A14B: the same for `transformer_2`, the low-noise expert (e.g. "
+                 "Lightning's low_noise_model).",
+        )
+        parser.add_argument(
+            "--solattn_exact_edge_frames",
+            action="store_true",
+            help="Wan only: compute the first and last latent frames' self-attention queries "
+                 "exactly against every KV block on the Sol backends, leaving routing to the "
+                 "frames in between. The causal VAE decodes latent frame 0 on its own, which "
+                 "makes it where approximation error is most visible.",
+        )
+        parser.add_argument(
             "--vsa_block_size",
             type=int,
             default=128,
@@ -1546,6 +1592,8 @@ class xFuserArgs:
             use_spargeattn_head_balance=self.use_spargeattn_head_balance,
             solattn_beta=self.solattn_beta,
             solattn_beta_schedule=self.solattn_beta_schedule,
+            solattn_router=self.solattn_router,
+            solattn_jensen=self.solattn_jensen,
             vsa_block_size=self.vsa_block_size,
             vsa_top_k=self.vsa_top_k,
             vsa_top_k_ratio=self.vsa_top_k_ratio,

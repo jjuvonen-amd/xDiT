@@ -18,7 +18,11 @@ from xfuser.model_executor.models.runner_models.wan import (
     xFuserWan22TI2VModel,
 )
 
-SOL_BACKENDS = ["aiter_fp8_sol", "aiter_i8fp8_sol"]
+SOL_BACKENDS = [
+    "aiter_fp8_sol", "aiter_i8fp8_sol",
+    # The MXFP6 rows aiter's mha_v4-sol-attn branch added.
+    "aiter_mxfp6_sol", "aiter_f8f6_sol", "aiter_f6f8_sol", "aiter_f6f4_sol",
+]
 
 # The model class, a name it accepts, and any extra args its own validation demands.
 #
@@ -158,3 +162,53 @@ def test_a_model_without_the_capability_still_refuses_sol():
         xFuserFluxModel(
             xFuserArgs(model="FLUX.1-dev", attention_backend="aiter_fp8_sol")
         )
+
+
+def test_wan_edge_frame_flag_reaches_the_attention_kwargs():
+    """--solattn_exact_edge_frames is read by the transformer out of the shared attention kwargs."""
+    from xfuser.model_executor.models.runner_models.wan import _build_attention_kwargs
+
+    for flag in (False, True):
+        args = xFuserArgs(
+            model="Wan2.1-T2V",
+            attention_backend="aiter_fp8_sol",
+            cross_attention_backend="aiter",
+            solattn_exact_edge_frames=flag,
+        )
+        assert _build_attention_kwargs(args)["solattn_exact_edge_frames"] is flag
+
+
+def test_wan_edge_frame_tokens_flag_the_first_and_last_latent_frames():
+    """Frame-major tokens: frame t owns [t*HW, (t+1)*HW). The sequence-parallel pad stays unflagged."""
+    import torch
+
+    from xfuser.model_executor.models.transformers.transformer_wan import _edge_frame_tokens
+
+    mask = _edge_frame_tokens(num_frames=3, frame_tokens=4, pad_amount=2, device="cpu")
+    expected = [True] * 4 + [False] * 4 + [True] * 4 + [False] * 2
+    assert mask.dtype == torch.bool and mask.tolist() == expected
+
+
+@pytest.mark.parametrize(
+    "argv,router,jensen",
+    [([], "mean", False),
+     (["--solattn_router", "error", "--solattn_jensen"], "error", True)],
+)
+def test_sol_router_and_jensen_flags_reach_the_runtime_config(argv, router, jensen):
+    """Defaults leave Sol exactly as it was; the flags land where the backend reads them."""
+    from xfuser.config.args import FlexibleArgumentParser
+    from xfuser.config.config import RuntimeConfig
+
+    parser = xFuserArgs.add_runner_args(FlexibleArgumentParser(description="xDiT"))
+    args = xFuserArgs.from_cli_args(parser.parse_args(["--model", "Wan2.1-T2V", *argv]))
+    assert (args.solattn_router, args.solattn_jensen) == (router, jensen)
+    runtime = RuntimeConfig(solattn_router=args.solattn_router, solattn_jensen=args.solattn_jensen)
+    assert (runtime.solattn_router, runtime.solattn_jensen) == (router, jensen)
+
+
+def test_an_unknown_sol_router_is_refused_by_the_parser():
+    from xfuser.config.args import FlexibleArgumentParser
+
+    parser = xFuserArgs.add_runner_args(FlexibleArgumentParser(description="xDiT"))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model", "Wan2.1-T2V", "--solattn_router", "nearest"])
