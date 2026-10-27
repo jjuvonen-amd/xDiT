@@ -9,12 +9,13 @@ collective time is what a comm/GEMM overlap can still win back. Collectives
 are identified by the "Collective name" the profiler attaches to their kernels,
 on CUDA and ROCm alike.
 
-torch's symm_mem fused ops (XDIT_TP_COMM_OVERLAP=symm_mem) carry no such name:
-they move data with device-to-device memory copies from peer buffers and
-synchronize with their own small kernels. Those are reported as "symm_mem
-copies"/"symm_mem kernels" and counted as communication too. Local device
-copies are memcpys as well, so copies count as communication only in traces
-that hold symm_mem kernels.
+torch's symm_mem fused ops (XDIT_TP_COMM_OVERLAP=symm_mem) move data with
+memory copies from peer buffers and synchronize with their own kernels, which
+the profiler names "symm_mem::<op>". Both are reported as "symm_mem copies" /
+"symm_mem kernels" and counted as communication. CUDA labels peer copies
+"PtoP"; where a trace has symm_mem kernels but no PtoP copies (ROCm names
+them DtoD, or HtoD for IPC-mapped peer buffers), those copies are taken as the
+peer copies instead.
 """
 
 import argparse
@@ -62,7 +63,7 @@ def _intersection(a, b):
 def summarize(path):
     events = json.load(gzip.open(path))["traceEvents"]
     kernels = [e for e in events if e.get("cat") == "kernel"]
-    copies = [e for e in events if e.get("cat") == "gpu_memcpy" and "DtoD" in e.get("name", "")]
+    memcpys = [e for e in events if e.get("cat") == "gpu_memcpy"]
     by_category = collections.Counter()
     collectives = collections.defaultdict(list)
     symm_kernels = []
@@ -70,19 +71,21 @@ def summarize(path):
     for kernel in kernels:
         span = (kernel["ts"], kernel["ts"] + kernel["dur"])
         collective = kernel["args"].get("Collective name")
+        if str(collective).startswith("symm_mem") or (not collective and SYMM_MEM_KERNEL.search(kernel["name"])):
+            symm_kernels.append(kernel)
+            comm_spans.append(span)
+            continue
         if collective:
             collectives[collective].append(kernel)
             comm_spans.append(span)
             continue
-        if SYMM_MEM_KERNEL.search(kernel["name"]):
-            symm_kernels.append(kernel)
-            comm_spans.append(span)
-            continue
         compute_spans.append(span)
         by_category[next((c for c, rx in CATEGORIES if rx.search(kernel["name"])), "other")] += kernel["dur"]
-    if symm_kernels:
-        # Only symm_mem runs move data in peer copies; elsewhere they are local and left out.
-        comm_spans += [(c["ts"], c["ts"] + c["dur"]) for c in copies]
+    copies = [c for c in memcpys if "PtoP" in c.get("name", "")]
+    if not copies and symm_kernels:
+        # ROCm names peer copies DtoD or, from IPC-mapped peer buffers, HtoD.
+        copies = [c for c in memcpys if "DtoD" in c.get("name", "") or "HtoD" in c.get("name", "")]
+    comm_spans += [(c["ts"], c["ts"] + c["dur"]) for c in copies]
     comm, compute = _union(comm_spans), _union(compute_spans)
     busy = _length(_union(comm_spans + compute_spans))
 
