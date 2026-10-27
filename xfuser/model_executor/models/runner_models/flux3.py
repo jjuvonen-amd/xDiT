@@ -313,6 +313,16 @@ class xFuserFlux3KleinBaseModel(_Flux3Model):
         if self.config.use_cfg_parallel and guidance_scale is not None and math.isclose(guidance_scale, 1.0):
             raise ValueError("--use_cfg_parallel needs classifier-free guidance; --guidance_scale 1 disables it.")
 
+    def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
+        # The guider runs the two branches as two forwards on one rank, unless CFG parallel puts
+        # them on two rank groups or a scale of 1 leaves one. Per-step schedules (the Sol beta
+        # schedule) count forwards, so a step's two branches must share an entry.
+        guidance_scale = input_args.get("guidance_scale")
+        do_cfg = guidance_scale is not None and not math.isclose(guidance_scale, 1.0)
+        if do_cfg and not self.config.use_cfg_parallel:
+            return 2
+        return 1
+
     def _extra_pipe_kwargs(self, input_args: dict) -> dict:
         negative_prompt = input_args.get("negative_prompt")
         return {"negative_prompt": negative_prompt} if negative_prompt else {}

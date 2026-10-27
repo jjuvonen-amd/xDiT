@@ -66,6 +66,23 @@ def test_the_other_stages_keep_the_main_backend(calls):
     assert calls[-1]["attention_kwargs"] is None
 
 
+@pytest.mark.parametrize(
+    "model,guidance,forwards",
+    [("FLUX.3-image-klein-base", 3.5, 2), ("FLUX.3-image-klein-base", 1.0, 1), ("FLUX.3-image-klein", None, 1)],
+)
+def test_a_guided_step_is_two_forwards_for_the_per_step_schedules(model, guidance, forwards):
+    """The Sol beta schedule counts forwards; both branches of a guided step must share a beta."""
+    from xfuser.config import xFuserArgs
+    from xfuser.model_executor.models.runner_models.flux3 import (
+        xFuserFlux3KleinBaseModel,
+        xFuserFlux3KleinModel,
+    )
+
+    cls = xFuserFlux3KleinBaseModel if model.endswith("base") else xFuserFlux3KleinModel
+    runner = cls(xFuserArgs(model=model))
+    assert runner._calculate_hybrid_attention_step_multiplier({"guidance_scale": guidance}) == forwards
+
+
 def test_the_joint_stage_hands_the_prompt_to_sol_on_both_sides(calls):
     processor = transformer_flux3.xFuserFlux3AttnProcessor()
     processor.exact_tokens = transformer_flux3._joint_exact_tokens(4, 16, 0, "cpu")

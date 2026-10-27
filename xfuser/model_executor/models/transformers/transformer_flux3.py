@@ -237,6 +237,9 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
 
         batch_size, image_seq_len = hidden_states.shape[:2]
         dtype = hidden_states.dtype
+        # One forward is one entry of the per-step schedules (--solattn_beta_schedule, hybrid
+        # attention); without this they stay on their first step for the whole run.
+        get_runtime_state().increment_step_counter()
 
         # 1-4. Timestep embeddings, modulations, input projections and RoPE, as upstream.
         image_temb = self.time_proj(timestep.to(dtype) * 1000)
