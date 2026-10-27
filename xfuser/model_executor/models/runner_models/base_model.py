@@ -731,6 +731,10 @@ class xFuserModel(abc.ABC):
             if _ado is not None and hasattr(_ado, "spmd_check"):
                 _ado.spmd_check = False
 
+    def _prefer_blockwise_compile(self) -> bool:
+        """Compile per block even without FSDP or caching, for forwards that sync to host outside the block loop."""
+        return False
+
     def _compile_model(self, input_args: dict) -> None:
         """Compile pipe components with torch.compile.
 
@@ -747,7 +751,7 @@ class xFuserModel(abc.ABC):
             component = getattr(self.pipe, component_name, None)
             if component is None:
                 continue
-            if self.config.fully_shard_degree > 1 or self.config.cache_method:
+            if self.config.fully_shard_degree > 1 or self.config.cache_method or self._prefer_blockwise_compile():
                 # Per-block compile: leaves transformer as original object so cache-dit's
                 # transformer.forward patch remains visible during compiled execution.
                 wrap_attrs = self.settings.fsdp_strategy.get(component_name, {}).get("wrap_attrs", [])
