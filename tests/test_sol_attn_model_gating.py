@@ -7,6 +7,10 @@ row for a recipe is a separate check that runtime_state makes against the device
 import pytest
 
 from xfuser.config import xFuserArgs
+from xfuser.model_executor.models.runner_models.flux3 import (
+    xFuserFlux3KleinBaseModel,
+    xFuserFlux3KleinModel,
+)
 from xfuser.model_executor.models.runner_models.minimax_h3 import (
     xFuserFastH3DenseModel,
     xFuserFastH3Model,
@@ -46,7 +50,17 @@ WAN_MODELS = [
     ),
 ]
 
-MODELS = H3_MODELS + WAN_MODELS
+# FLUX.3 attends its prompt alone in the text-mode blocks (80-512 tokens), which is the same
+# short-KV hazard as Wan's cross-attention, so it too must name a dense backend for it.
+FLUX3_MODELS = [
+    (xFuserFlux3KleinModel, "FLUX.3-image-klein", {"cross_attention_backend": "aiter"}),
+    (xFuserFlux3KleinBaseModel, "FLUX.3-image-klein-base", {"cross_attention_backend": "aiter"}),
+]
+
+# Models with a short attention call that --cross_attention_backend serves.
+CROSS_MODELS = WAN_MODELS + FLUX3_MODELS
+
+MODELS = H3_MODELS + CROSS_MODELS
 
 
 def _build(cls, model, **kwargs):
@@ -93,9 +107,9 @@ def test_ring_is_refused_before_the_denoise_loop(cls, model, extra):
         )
 
 
-@pytest.mark.parametrize("cls,model,extra", WAN_MODELS)
+@pytest.mark.parametrize("cls,model,extra", CROSS_MODELS)
 def test_the_sol_ring_check_names_the_reason(cls, model, extra):
-    """Wan is the model that actually reaches it: it serves Sol-Attn and advertises ring_degree.
+    """Wan and FLUX.3 actually reach it: they serve Sol-Attn and advertise ring_degree.
 
     The H3 family bails out earlier on its own ring capability, so without Wan this check would
     only ever be exercised by calling it directly.
@@ -106,21 +120,22 @@ def test_the_sol_ring_check_names_the_reason(cls, model, extra):
         )
 
 
-@pytest.mark.parametrize("cls,model,extra", WAN_MODELS)
-def test_wan_sol_demands_a_cross_attention_backend(cls, model, extra):
-    """A routed backend must not be left to serve Wan's cross-attention by falling back.
+@pytest.mark.parametrize("cls,model,extra", CROSS_MODELS)
+def test_sol_demands_a_cross_attention_backend(cls, model, extra):
+    """A routed backend must not be left to serve a short text attention by falling back.
 
-    Wan's text KV is 512 tokens -- four KV blocks -- which is too few for a per-tile threshold to
-    select meaningfully and too few for a pooled correction to carry what it skips. It would not
-    fail, it would quietly answer with a worse number.
+    Wan's text KV is 512 tokens -- four KV blocks -- and FLUX.3's text-mode blocks attend 80-512
+    prompt tokens alone. That is too few for a per-tile threshold to select meaningfully and too
+    few for a pooled correction to carry what it skips. It would not fail, it would quietly
+    answer with a worse number.
     """
     without_cross = {k: v for k, v in extra.items() if k != "cross_attention_backend"}
     with pytest.raises(ValueError, match="cross_attention_backend must be"):
         _build(cls, model, attention_backend="aiter_fp8_sol", **without_cross)
 
 
-@pytest.mark.parametrize("cls,model,extra", WAN_MODELS)
-def test_wan_cross_attention_may_not_itself_be_routed(cls, model, extra):
+@pytest.mark.parametrize("cls,model,extra", CROSS_MODELS)
+def test_cross_attention_may_not_itself_be_routed(cls, model, extra):
     """Naming the same Sol row for cross-attention is the same hazard spelled differently."""
     routed = {**extra, "cross_attention_backend": "aiter_fp8_sol"}
     with pytest.raises(ValueError, match="cross_attention_backend cannot be"):

@@ -81,6 +81,13 @@ class _Flux3Model(xFuserModel):
         enable_tiling=True,
         enable_slicing=True,
         use_parallel_vae=True,
+        # The text-mode blocks attend over the prompt alone (80-512 tokens) on this backend.
+        cross_attention_backend=True,
+        # The image-mode and joint blocks are one long sequence at high resolution (2048² is
+        # ~16.4k image tokens), which is what Sol-Attn's per-tile threshold routes over. The
+        # short text stage is safe by construction: the Sparge gate forces it onto a dense
+        # --cross_attention_backend, and the joint blocks keep the prompt's tokens exact.
+        supports_sol_attention_backends=True,
     )
     # Shared by both checkpoints, which add their model and output names with replace().
     settings = ModelSettings(

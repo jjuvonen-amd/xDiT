@@ -15,6 +15,8 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
 )
+from xfuser.core.distributed.attention_backend import SOL_EXACT_QUERY_TOKENS_KEY, SOL_EXACT_TOKENS_KEY
+from xfuser.core.distributed.runtime_state import get_runtime_state
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.model_executor.layers.usp import USP, attention
 from xfuser.model_executor.models.transformers.transformers_utils import (
@@ -31,11 +33,18 @@ class xFuserFlux3AttnProcessor:
     ``valid_kv_len`` to the stage's real length when the SP pad made the sequence
     longer, so the pad keys are dropped after the all-to-all, and ``local`` when
     every rank holds the whole stream, so attention runs without collectives.
+
+    ``text_only`` marks the text stage's instance: it runs on the cross-attention
+    backend, which is the main backend unless ``--cross_attention_backend`` names
+    another. ``exact_tokens`` marks the joint stage's text tokens for Sol-Attn, over
+    the whole padded sequence; every other backend ignores it.
     """
 
-    def __init__(self):
+    def __init__(self, text_only: bool = False):
         self.valid_kv_len: Optional[int] = None
         self.local = False
+        self.text_only = text_only
+        self.exact_tokens: Optional[torch.Tensor] = None
 
     def __call__(
         self,
@@ -66,12 +75,27 @@ class xFuserFlux3AttnProcessor:
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
+        # The text stream is 80-512 tokens: too short for a routed backend to choose blocks in,
+        # so a Sol or Sparge run names a dense one for it with --cross_attention_backend.
+        backend = get_runtime_state().get_cross_attention_backend() if self.text_only else None
+
         if self.local:
-            hidden_states = attention(query, key, value)
+            hidden_states = attention(query, key, value, backend=backend)
         else:
-            attention_kwargs = None if self.valid_kv_len is None else {"valid_kv_len": self.valid_kv_len}
+            attention_kwargs = {}
+            if self.valid_kv_len is not None:
+                attention_kwargs["valid_kv_len"] = self.valid_kv_len
+            if self.exact_tokens is not None:
+                attention_kwargs[SOL_EXACT_TOKENS_KEY] = self.exact_tokens
+                attention_kwargs[SOL_EXACT_QUERY_TOKENS_KEY] = self.exact_tokens
             hidden_states = USP(
-                query, key, value, attn_layer=attn, attention_kwargs=attention_kwargs, combine_qkv_a2a=True
+                query,
+                key,
+                value,
+                attn_layer=attn,
+                backend=backend,
+                attention_kwargs=attention_kwargs or None,
+                combine_qkv_a2a=True,
             )
 
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
@@ -80,6 +104,19 @@ class xFuserFlux3AttnProcessor:
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
+
+
+def _joint_exact_tokens(txt_seq_len: int, joint_seq_len: int, pad: int, device) -> torch.Tensor:
+    """The joint blocks' text tokens, for Sol-Attn's exact KV blocks and exact query rows.
+
+    The prompt is a few percent of the joint sequence and is judged against block statistics
+    the image writes, so routing could drop it. Every image query keeps the prompt's KV blocks
+    exact, and the prompt's own rows are exact. Indexed over the padded sequence USP attends
+    over; the backend trims it with the pad.
+    """
+    exact_tokens = torch.zeros(joint_seq_len + pad, dtype=torch.bool, device=device)
+    exact_tokens[:txt_seq_len] = True
+    return exact_tokens
 
 
 def flux3_attn_modules(transformer) -> list[torch.nn.Module]:
@@ -121,7 +158,7 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
     @functools.wraps(Flux3Transformer2DModel.__init__)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._txt_processor = xFuserFlux3AttnProcessor()
+        self._txt_processor = xFuserFlux3AttnProcessor(text_only=True)
         self._image_processor = xFuserFlux3AttnProcessor()
         self._image_cond_processor = xFuserFlux3AttnProcessor()
         self._joint_processor = xFuserFlux3AttnProcessor()
@@ -276,6 +313,9 @@ class xFuserFlux3Transformer2DWrapper(Flux3Transformer2DModel):
         sp_world_size = get_sequence_parallel_world_size()
         pad = (sp_world_size - joint_seq_len % sp_world_size) % sp_world_size
         self._joint_processor.valid_kv_len = joint_seq_len if pad else None
+        self._joint_processor.exact_tokens = _joint_exact_tokens(
+            txt_seq_len, joint_seq_len, pad, joint_states.device
+        )
         joint_states, joint_mod, joint_rotary_emb = self._shard(
             sp_rank, sp_world_size, pad, joint_states, joint_mod, joint_rotary_emb
         )
