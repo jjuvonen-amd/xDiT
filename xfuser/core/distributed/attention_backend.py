@@ -1837,7 +1837,10 @@ def _sol_attn_beta(kwargs):
     """
     # Imported here rather than at module scope: runtime_state reaches back into this module for
     # the backend enum, so a top-level import would close the cycle.
-    from xfuser.core.distributed.runtime_state import get_scheduled_solattn_beta
+    from xfuser.core.distributed.runtime_state import (
+        get_configured_solattn_beta,
+        get_scheduled_solattn_beta,
+    )
 
     scheduled = get_scheduled_solattn_beta()
     if scheduled is not None:
@@ -1846,7 +1849,10 @@ def _sol_attn_beta(kwargs):
         # a constant, recompiling for every beta the schedule holds. The routing consumes it as a
         # scalar operand of the threshold either way.
         return scheduled
-    return float(kwargs.get("solattn_beta", 0.5))
+    # A model that does not pass the flag in its kwargs (FLUX.3) still gets --solattn_beta. Before
+    # this fallback such a model silently ran at 0.5 whatever the flag said.
+    beta = kwargs.get("solattn_beta")
+    return float(get_configured_solattn_beta() if beta is None else beta)
 
 
 def _sol_attn_options():

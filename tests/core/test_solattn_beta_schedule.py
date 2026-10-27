@@ -333,3 +333,20 @@ def test_beta_resolves_without_a_runtime_at_all(monkeypatch):
 
     assert attention_backend._sol_attn_beta({"solattn_beta": 0.75}) == pytest.approx(0.75)
     assert attention_backend._sol_attn_beta({}) == pytest.approx(0.5)
+
+
+def test_a_model_that_does_not_pass_the_flag_still_gets_it(monkeypatch):
+    """FLUX.3 threads no attention kwargs for beta; it used to run at 0.5 whatever the flag said."""
+    from types import SimpleNamespace
+
+    from xfuser.core.distributed import attention_backend, runtime_state
+
+    monkeypatch.setattr(
+        runtime_state, "_RUNTIME",
+        SimpleNamespace(scheduled_solattn_beta=None, runtime_config=SimpleNamespace(solattn_beta=-0.5)),
+        raising=False,
+    )
+
+    assert attention_backend._sol_attn_beta({}) == pytest.approx(-0.5)
+    # A model that does pass it (Wan, MiniMax-H3) keeps its own value.
+    assert attention_backend._sol_attn_beta({"solattn_beta": 0.25}) == pytest.approx(0.25)

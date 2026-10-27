@@ -1325,6 +1325,17 @@ def get_configured_sol_options():
     return (getattr(config, "solattn_router", "mean"), bool(getattr(config, "solattn_jensen", False)))
 
 
+def get_configured_solattn_beta() -> float:
+    """--solattn_beta, or Sol-Attn's default 0.5 when no runtime is configured.
+
+    For models that do not thread the flag through their own attention kwargs, as Wan and
+    MiniMax-H3 do. A python value, so a traced call folds it to a constant; it is fixed for a run.
+    """
+    config = getattr(_RUNTIME, "runtime_config", None) if _RUNTIME is not None else None
+    beta = getattr(config, "solattn_beta", None)
+    return 0.5 if beta is None else float(beta)
+
+
 def initialize_runtime_state(pipeline: Optional[DiffusionPipeline] = None, engine_config: Optional[EngineConfig] = None):
     global _RUNTIME
     if _RUNTIME is not None:
