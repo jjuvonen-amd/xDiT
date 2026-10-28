@@ -71,7 +71,7 @@ def _load():
     for name, argtypes in {
         "sag_init": [i, i, i],
         "sag_engine_plan": [i, ip, i, ip],
-        "sag_arm": [i],
+        "sag_arm": [i, i],
         "sag_release": [i, vp],
         "sag_issue": [i, u64p, u64p, u64, ip, ip, i, u64, u64, i],
         "sag_stream_wait_value32": [vp, u64, u32],
@@ -160,7 +160,14 @@ def sdma_all_gather_linear(
     stream = torch.cuda.current_stream()
     slot = _slot
     _slot = (_slot + 1) % _SLOTS
-    _check(lib.sag_arm(slot), "sag_arm")
+    rc = lib.sag_arm(slot, len(g.peers))
+    if rc <= -1000:
+        kind, i = ("data", -rc - 1000) if rc > -2000 else ("flag", -rc - 2000)
+        raise RuntimeError(
+            f"rank {g.rank}: the {kind} copy from peer {g.peers[i]} (SDMA engine {g.engines[i]}) of an earlier "
+            f"call on transport slot {slot} never finished"
+        )
+    _check(rc, "sag_arm")
     ws.barrier(channel=0)
     if trigger == "gpu":
         _check(lib.sag_release(slot, ctypes.c_void_p(stream.cuda_stream)), "sag_release")

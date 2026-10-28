@@ -12,6 +12,7 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -27,6 +28,7 @@ struct Slot {
   volatile hsa_signal_value_t* trigger_value;
   std::vector<hsa_signal_t> data;
   std::vector<hsa_signal_t> flag;
+  int armed = 0;  // signals of each kind the last call on this slot used
 };
 
 std::vector<Gpu> g_gpus;
@@ -55,8 +57,17 @@ int agent_of(int hip_dev, hsa_agent_t* out) {
   return -2;
 }
 
-void wait_done(hsa_signal_t s) {
-  hsa_signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_ACTIVE);
+// Waits until `s` drops below 1 (its copy finished); false after kWaitSeconds, so a copy
+// that never runs fails the call instead of hanging it.
+constexpr double kWaitSeconds = 60.0;
+
+bool wait_done(hsa_signal_t s) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(kWaitSeconds);
+  while (hsa_signal_load_scacquire(s) >= 1) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    hsa_signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, 1000000, HSA_WAIT_STATE_ACTIVE);
+  }
+  return true;
 }
 
 __global__ void release_trigger(hsa_signal_value_t* value) {
@@ -126,19 +137,23 @@ int sag_engine_plan(int local_dev, const int* peer_devs, int n, int* engines) {
   return 0;
 }
 
-// Arms `slot` for a call: waits for its previous use to finish and sets every signal to 1.
-// Call before sag_release and sag_issue.
-int sag_arm(int slot) {
+// Arms `slot` for a call of `n` peers: waits for the copies of its previous use to finish
+// and sets the trigger and the `n` peers' signals to 1. Only those `n` are armed, so a
+// later reuse waits on nothing that no copy will complete. Call before sag_release and
+// sag_issue.
+int sag_arm(int slot, int n) {
   Slot& s = g_slots[slot];
-  for (size_t i = 0; i < s.data.size(); ++i) {
-    wait_done(s.data[i]);
-    wait_done(s.flag[i]);
+  if (n > (int)s.data.size()) return -1;
+  for (int i = 0; i < s.armed; ++i) {
+    if (!wait_done(s.data[i])) return -1000 - i;  // peer i's data copy never finished
+    if (!wait_done(s.flag[i])) return -2000 - i;  // peer i's flag copy never finished
   }
   hsa_signal_store_relaxed(s.trigger, 1);
-  for (size_t i = 0; i < s.data.size(); ++i) {
+  for (int i = 0; i < n; ++i) {
     hsa_signal_store_relaxed(s.data[i], 1);
     hsa_signal_store_relaxed(s.flag[i], 1);
   }
+  s.armed = n;
   return 0;
 }
 
