@@ -4,8 +4,9 @@ TP shards the heads and the FFN, splits the residual rows across the TP group
 and normalizes Q/K over heads held by different ranks. Cross-attention is
 either sharded the same way or kept whole on every rank's own rows. The
 collectives run next to their GEMMs, pipelined against them in chunks (which
-holds the rows block-cyclically), or inside torch's fused symm_mem ops. The model pads the sequence to
-a multiple of SP x TP x chunks, so a short sequence also checks the pad.
+holds the rows block-cyclically), inside torch's fused symm_mem ops, or (ROCm) with the all-gathers
+on SDMA copy engines. The model pads the sequence to a multiple of SP x TP x chunks (x the SDMA
+row tile), so a short sequence also checks the pad.
 Tiny random weights in fp32 on SDPA_EFFICIENT, so only reduction order
 differs from one GPU; nothing is downloaded.
 """
@@ -64,8 +65,13 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         options["fused"],
     )
     import contextlib
+    import os
 
     import torch.distributed._symmetric_memory as symm_mem
+
+    if fused == "sdma":
+        # The parity runs in fp32, and torch's ROCm GEMM that waits per row tile is bf16 only.
+        os.environ["XDIT_TP_SDMA_CONSUMER"] = "per_peer"
 
     from xfuser.config.args import xFuserArgs
     from xfuser.core.distributed import (
@@ -116,7 +122,7 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         }
         # torch's symm_mem kernels segfault on ROCm; its test mode runs their collective + GEMM
         # fallback through the same op calls, so the wiring is still checked there.
-        fused_kernels = symm_mem._test_mode() if fused and torch.version.hip else contextlib.nullcontext()
+        fused_kernels = symm_mem._test_mode() if fused == "symm_mem" and torch.version.hip else contextlib.nullcontext()
         with torch.no_grad(), fused_kernels:
             output = model(**inputs, return_dict=False)[0]
         if rank == 0:
@@ -126,7 +132,7 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         destroy_distributed_environment()
 
 
-def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=False):
+def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=None):
     tp, ulysses, ring = MODES[mode] if mode else (1, 1, 1)
     output_path = directory / "output.pt"
     options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch, fused=fused)
@@ -230,7 +236,25 @@ def test_tensor_parallel_with_fused_comm_matches_one_gpu(tmp_path, one_gpu_outpu
         pytest.skip("requires an accelerator")
     expected = one_gpu_output("wan", latent_shape)
 
-    actual = _run(tmp_path, mode, "wan", latent_shape, cross_attention=cross_attention, fused=True)
+    actual = _run(tmp_path, mode, "wan", latent_shape, cross_attention=cross_attention, fused="symm_mem")
+
+    error = _relative_error(actual, expected)
+    assert error <= TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+@pytest.mark.parametrize("cross_attention", ["sharded", "replicated"])
+@pytest.mark.parametrize("mode", ["tp2", "tp4", "tp2-ulysses2"])
+def test_tensor_parallel_with_sdma_all_gather_matches_one_gpu(
+    tmp_path, one_gpu_output, mode, cross_attention, latent_shape
+):
+    """All-gathers on SDMA copy engines, as XDIT_TP_COMM_OVERLAP=sdma runs them, with the rows padded to its tile."""
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip("SDMA copy engines need ROCm")
+    expected = one_gpu_output("wan", latent_shape)
+
+    actual = _run(tmp_path, mode, "wan", latent_shape, cross_attention=cross_attention, fused="sdma")
 
     error = _relative_error(actual, expected)
     assert error <= TOLERANCE, f"relative error {error:.3e}"

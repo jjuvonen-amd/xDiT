@@ -62,11 +62,11 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         # Set by xFuserWanTransformer3DWrapper.shard_for_tensor_parallel: the layer
         # holds 1/tp of the heads, and its Q/K norms span all of them. It is then
         # given this rank's rows and gathers them into its Q/K/V projections in
-        # `tp_chunks` pipelined chunks, or through torch's fused symm_mem ops
-        # with `tp_fused` (see layers/tensor_parallel.py).
+        # `tp_chunks` pipelined chunks, or through the fused path `tp_fused`
+        # names, "symm_mem" or "sdma" (see layers/tensor_parallel.py).
         self.tensor_parallel = False
         self.tp_chunks = 1
-        self.tp_fused = False
+        self.tp_fused = None
 
     def _get_qkv_projections(
         self, attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor
@@ -309,7 +309,7 @@ class xFuserWanTPTransformerBlock(WanTransformerBlock):
     the FFN all-gather the group's rows into their column-parallel projections
     and reduce-scatter their row-parallel output projections (the attention
     processors do so inside attn1/attn2), in `tp_chunks` pipelined chunks or
-    through torch's fused symm_mem ops with `tp_fused`. Row-parallel biases are added once, after the reduction. Cross-attention
+    through the fused path `tp_fused` names. Row-parallel biases are added once, after the reduction. Cross-attention
     instead runs unsharded on the local rows when `shard_cross_attention` is
     False. The modulation, norms and gated residuals are diffusers', applied to
     the local rows.
@@ -435,9 +435,11 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         self._tp_size = 1
         self._tp_rank = 0
         self._tp_chunks = 1
+        # Each TP rank's rows are padded to a multiple of this (the SDMA all-gather's GEMM tile).
+        self._tp_row_align = 1
 
     def shard_for_tensor_parallel(
-        self, shard_cross_attention: bool = True, overlap_chunks: int = 1, fused_comm: bool = False
+        self, shard_cross_attention: bool = True, overlap_chunks: int = 1, fused_comm: Optional[str] = None
     ) -> None:
         """Split the blocks' weights across the TP group, Megatron style.
 
@@ -454,9 +456,13 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         weights and runs on each rank's own rows, without communication.
         `overlap_chunks` > 1 pipelines each collective against its GEMM in that
         many chunks, with the residual rows block-cyclic (see layers/tensor_parallel.py).
-        `fused_comm` runs each pair through torch's symm_mem fused ops instead,
-        on contiguous rows.
+        `fused_comm="symm_mem"` runs each pair through torch's symm_mem fused
+        ops instead, on contiguous rows; `fused_comm="sdma"` (ROCm) gathers
+        each all-gather + GEMM on SDMA copy engines (layers/sdma_all_gather.py),
+        with each rank's rows padded to that op's row tile.
         """
+        if fused_comm not in (None, "symm_mem", "sdma"):
+            raise ValueError(f"fused_comm must be None, 'symm_mem' or 'sdma'; got {fused_comm!r}")
         if fused_comm and overlap_chunks != 1:
             raise ValueError("fused_comm pipelines on its own; it takes no overlap_chunks")
         tp_size = get_tensor_model_parallel_world_size()
@@ -502,6 +508,10 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         self._tp_size = tp_size
         self._tp_rank = tp_rank
         self._tp_chunks = overlap_chunks
+        if fused_comm == "sdma":
+            from xfuser.model_executor.layers.sdma_all_gather import ROW_TILE
+
+            self._tp_row_align = ROW_TILE
 
     def _update_vsa_attention_kwargs(self, timestep: torch.LongTensor) -> None:
         """Publish the current AITER VSA schedule values to its backend."""
@@ -606,7 +616,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         # ranks of each SP rank (in tp_chunks blocks each, see tp_split_rows): the
         # blocks all-gather the TP group's rows back into this SP rank's chunk
         # before attention, which RoPE is chunked for.
-        rows_multiple = sp_world_size * self._tp_size * self._tp_chunks
+        rows_multiple = sp_world_size * self._tp_size * self._tp_chunks * self._tp_row_align
 
         # Part of sequence parallel: given the resolution, we may need to pad the sequence length to match this prior to chunking
         pad_amount = (rows_multiple - (hidden_states.shape[1] % rows_multiple)) % rows_multiple

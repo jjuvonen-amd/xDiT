@@ -18,11 +18,13 @@ all-gather output and reduce-scatter input are then contiguous rows of the
 natural order. `tp_split_rows` / `tp_gather_rows` convert between the layouts;
 with one chunk the layout is plain contiguous chunks.
 
-With `fused`, torch's symmetric-memory ops run each pair instead
+With `fused="symm_mem"`, torch's symmetric-memory ops run each pair instead
 (`symm_mem.fused_all_gather_matmul` / `fused_matmul_reduce_scatter`). They
 pipeline peer-to-peer copies against per-shard GEMMs themselves, on the
 contiguous layout. They work over NVLink; on torch 2.13 / ROCm 7.16 they
-segfault beyond ~10 MB.
+segfault beyond ~10 MB. With `fused="sdma"` (ROCm), each all-gather + GEMM
+gathers on SDMA copy engines, all peers at once (layers/sdma_all_gather.py),
+on the contiguous layout; reduce-scatters run as with one chunk.
 """
 
 from typing import List, Optional, Sequence
@@ -34,7 +36,9 @@ import torch.nn.functional as F
 from torch import nn
 from torch.profiler import record_function
 
+import xfuser.envs as envs
 from xfuser.core.distributed.parallel_state import get_tp_group
+from xfuser.model_executor.layers import sdma_all_gather  # noqa: F401  registers xfuser::tp_sdma_all_gather_linear
 
 
 def shard_linear_(linear: nn.Linear, dim: int, tp_rank: int, tp_size: int) -> Optional[torch.Tensor]:
@@ -122,8 +126,20 @@ def tp_gather_rows(x: torch.Tensor, chunks: int) -> torch.Tensor:
     return blocks.transpose(1, 2).reshape(batch, rows, *rest)
 
 
-def tp_column_parallel(x: torch.Tensor, linear: nn.Linear, site: str, chunks: int, fused: bool = False) -> torch.Tensor:
+def tp_column_parallel(
+    x: torch.Tensor, linear: nn.Linear, site: str, chunks: int, fused: Optional[str] = None
+) -> torch.Tensor:
     """`linear` over the TP group's rows of `x` (dim 1): all-gather, then the column-parallel GEMM."""
+    if fused == "sdma":
+        with record_function(f"tp_ag:{site}"):
+            return torch.ops.xfuser.tp_sdma_all_gather_linear(
+                x,
+                linear.weight,
+                linear.bias,
+                get_tp_group().device_group.group_name,
+                envs.environment_variables["XDIT_TP_SDMA_CONSUMER"]().strip().lower(),
+                envs.environment_variables["XDIT_TP_SDMA_TRIGGER"]().strip().lower(),
+            )
     if fused:
         with record_function(f"tp_ag:{site}"):
             _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(
@@ -140,10 +156,15 @@ def tp_column_parallel(x: torch.Tensor, linear: nn.Linear, site: str, chunks: in
 
 
 def tp_row_parallel(
-    x: torch.Tensor, linear: nn.Linear, bias: Optional[torch.Tensor], site: str, chunks: int, fused: bool = False
+    x: torch.Tensor,
+    linear: nn.Linear,
+    bias: Optional[torch.Tensor],
+    site: str,
+    chunks: int,
+    fused: Optional[str] = None,
 ) -> torch.Tensor:
     """Row-parallel `linear` over all rows of `x`, reduce-scattered to this rank's rows, plus `bias` once."""
-    if fused:
+    if fused == "symm_mem":
         with record_function(f"tp_rs:{site}"):
             out = torch.ops.symm_mem.fused_matmul_reduce_scatter(
                 x, linear.weight.t(), "sum", 1, get_tp_group().device_group.group_name
