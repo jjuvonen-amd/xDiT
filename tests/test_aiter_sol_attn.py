@@ -1662,15 +1662,26 @@ def test_the_uncapped_term_is_the_variance_as_routed(monkeypatch):
     assert "sol_tilt" not in seen
 
 
-@pytest.mark.parametrize("options", [dict(jensen=True), dict(tilt_rank=2)], ids=["capped", "tilt2"])
-def test_the_capped_term_and_the_tilt_hold_one_graph(options):
+# Eager is fine; compiled, the f8f6 tilt returns NaN everywhere on aiter 0c56c8d (with the fp32
+# scalar patch). Strict, so the case reports itself once aiter fixes it.
+_F8F6_TILT_NAN = pytest.mark.xfail(strict=True, reason="f8f6 tilt is NaN under torch.compile")
+
+
+@pytest.mark.parametrize("recipe,options", [
+    pytest.param(recipe, options, id=f"{label}-{recipe}",
+                 marks=[_F8F6_TILT_NAN] if (recipe, label) == ("f8f6", "tilt2") else [])
+    for recipe in ["fp8", "bf16", "mxfp6", "f8f6", "i8fp8"]
+    for label, options in [("capped", dict(jensen=True)), ("tilt2", dict(tilt_rank=2))]
+])
+def test_the_capped_term_and_the_tilt_hold_one_graph(recipe, options):
     """fullgraph=True: the cap and the tilt builders launch Triton kernels inside the forward.
 
-    torch.compile hands their Python-float arguments to Triton as fp64, which an FP8 store cannot
-    take on AMD; aiter's kernels have to pin them to fp32 for this to compile.
+    torch.compile hands their Python-float arguments to Triton as fp64, which an FP8 store or a
+    dword bitcast cannot take on AMD; aiter's kernels have to pin them to fp32 for this to compile.
+    The recipes differ in which parameter kernel builds their tilt, so each is compiled.
     """
     _require_sol_attn()
-    _require_sol_recipe("fp8")
+    _require_sol_recipe(recipe)
     _require_second_order()
 
     from xfuser.core.sparge_attention.sol import sol_attn_bhsd
@@ -1678,7 +1689,7 @@ def test_the_capped_term_and_the_tilt_hold_one_graph(options):
     query, key, value = _correlated_operands(seqlen=1024)
 
     def run(q, k, v):
-        return sol_attn_bhsd(q, k, v, beta=0.5, recipe="fp8", **options)[0]
+        return sol_attn_bhsd(q, k, v, beta=0.5, recipe=recipe, **options)[0]
 
     torch._dynamo.reset()
     with torch.no_grad():
