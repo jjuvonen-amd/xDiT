@@ -14,15 +14,23 @@ model does today and with the collective pipelined against the GEMM:
   symm_mem    torch.ops.symm_mem.fused_all_gather_matmul / fused_matmul_reduce_scatter.
               Opt-in: peer access through torch symmetric memory segfaulted
               beyond ~10 MB on torch 2.13 / ROCm 7.16.
+  sdma_async  ROCm, opt-in (--sdma): xfuser's all-gather + GEMM with the gather on SDMA
+  sdma_per_peer  copy engines, all peers at once, consumed by torch's ROCm GEMM that waits
+              per row tile (async) or by a stream wait + GEMM per shard (per_peer); see
+              xfuser/model_executor/layers/sdma_all_gather.py. AG sites only: an RS site
+              reports its baseline, as XDIT_TP_COMM_OVERLAP=sdma runs it. Rows per rank
+              are padded to the GEMM's 256-row tile.
 
 `comm_only` and `gemm_only` time each half alone; `ideal` is their max. Each
 variant is checked against baseline. Times are the slowest rank's median.
+--hidden / --ffn set other model widths, e.g. to find where the GEMM outlasts the gather.
 
   torchrun --nproc_per_node 4 benchmarks/tp_comm_gemm_overlap.py
 """
 
 import argparse
 import importlib
+import math
 import os
 import statistics
 from pathlib import Path
@@ -54,6 +62,8 @@ def _parse_args():
     parser.add_argument("--sites", nargs="+", default=list(_SITES), choices=list(_SITES))
     parser.add_argument("--chunks", nargs="+", type=int, default=[2, 4, 8])
     parser.add_argument("--symm-mem", action="store_true", help="also time torch's fused symm_mem ops")
+    parser.add_argument("--sdma", action="store_true", help="also time the SDMA all-gather + GEMM (ROCm)")
+    parser.add_argument("--sdma-trigger", default="gpu", choices=["gpu", "host"])
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--output-dir", default="/output/fusion_bench")
@@ -66,8 +76,9 @@ class Bench:
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.group_name = dist.group.WORLD.group_name
         self.comm = torch.cuda.Stream()
-        # Pad so every chunk count splits the sequence into whole blocks per rank.
-        align = self.world * max(args.chunks)
+        # Pad so every chunk count splits the sequence into whole blocks per rank, and
+        # with --sdma so each rank's rows are whole 256-row GEMM tiles.
+        align = self.world * (math.lcm(max(args.chunks), 256) if args.sdma else max(args.chunks))
         self.seq = -(-args.seq // align) * align
         self.rows = self.seq // self.world
 
@@ -105,6 +116,12 @@ class Bench:
     def ag_symm_mem(self, a_local, weight, out_buf):
         _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(a_local, [weight.t()], 0, self.group_name)
         return out
+
+    def ag_sdma(self, a_local, weight, consumer):
+        from xfuser.model_executor.layers.sdma_all_gather import sdma_all_gather_linear
+
+        out = sdma_all_gather_linear(a_local[None], weight, None, self.group_name, consumer, self.args.sdma_trigger)
+        return out[0]
 
     # ---- GEMM + reduce-scatter -----------------------------------------------------------------
     def rs_baseline(self, a_full, weight, out_buf):
@@ -179,6 +196,10 @@ class Bench:
             if self.args.symm_mem:
                 self.check("symm_mem", self.ag_symm_mem(a_local, weight, out), expected)
                 results["symm_mem"] = self.time(lambda: self.ag_symm_mem(a_local, weight, out))
+            if self.args.sdma:
+                for variant, consumer in (("sdma_async", "async_mm"), ("sdma_per_peer", "per_peer")):
+                    self.check(variant, self.ag_sdma(a_local, weight, consumer), expected)
+                    results[variant] = self.time(lambda: self.ag_sdma(a_local, weight, consumer))
         else:
             a_full = torch.randn(self.seq, k_in, **bf16)
             out = torch.empty(self.rows, n, **bf16)
@@ -197,17 +218,24 @@ class Bench:
             if self.args.symm_mem:
                 self.check("symm_mem", self.rs_symm_mem(a_full, weight, out), expected_local)
                 results["symm_mem"] = self.time(lambda: self.rs_symm_mem(a_full, weight, out))
+            if self.args.sdma:
+                results["sdma_async"] = results["sdma_per_peer"] = results["baseline"]
         results["ideal"] = max(results["comm_only"], results["gemm_only"])
         return results
 
 
 def _report(bench, table):
     args = bench.args
-    variants = ["baseline"] + [f"chunked_k{k}" for k in args.chunks] + (["symm_mem"] if args.symm_mem else [])
+    variants = (
+        ["baseline"]
+        + [f"chunked_k{k}" for k in args.chunks]
+        + (["symm_mem"] if args.symm_mem else [])
+        + (["sdma_async", "sdma_per_peer"] if args.sdma else [])
+    )
     columns = ["comm_only", "gemm_only", "ideal", *variants]
     channels = os.environ.get("NCCL_MAX_NCHANNELS", "default")
     lines = [
-        f"# TP{bench.world} comm/GEMM overlap at Wan2.2-14B shapes",
+        f"# TP{bench.world} comm/GEMM overlap, hidden {args.hidden}, ffn {args.ffn}",
         "",
         f"seq {bench.seq} ({bench.rows} rows/rank), hidden {args.hidden}, ffn {args.ffn}, bf16, "
         f"NCCL_MAX_NCHANNELS={channels}. Slowest rank's median ms over {args.iters} iterations.",
