@@ -112,6 +112,15 @@ int sch_engine_for(int dst_dev, int src_dev) {
   return -3;
 }
 
+// Mask of the SDMA engines available for copies from `src_dev` into `dst_dev`. Negative on failure.
+int sch_engine_mask(int dst_dev, int src_dev) {
+  hsa_agent_t dst_agent, src_agent;
+  if (agent_of(dst_dev, &dst_agent) || agent_of(src_dev, &src_agent)) return -1;
+  uint32_t mask = 0;
+  if (hsa_amd_memory_copy_engine_status(dst_agent, src_agent, &mask) != HSA_STATUS_SUCCESS) return -2;
+  return (int)(mask & 0x7fffffff);
+}
+
 int sch_hsa_wait(int num_slots) {
   for (int i = 0; i < num_slots; ++i)
     hsa_signal_wait_scacquire(g_signals[i], HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_ACTIVE);

@@ -16,6 +16,9 @@ at once (an all-gather's traffic), through each path:
                  copy and runs a shader blit, not SDMA
   hsa_local_sdma the same copy forced onto SDMA (hsa_amd_memory_async_copy_on_engine),
                  on the engine ROCr prefers for that peer link
+  hsa_local_sdma_distinct  the same, one distinct available engine per peer: with the
+                 local GPU on both sides all copies use the local GPU's engines, so
+                 peers sharing a preferred engine queue behind each other
   hip_peer      hipMemcpyPeerAsync with the peer's device id       (opt-in)
   hsa_peer       ROCr async copy with the peer GPU as source agent  (opt-in)
 
@@ -55,9 +58,10 @@ def parse_args():
     p.add_argument("--helper", default="/tmp/symm_copy_helper.so")
     p.add_argument(
         "--paths",
-        default="torch,hip_default,hip_d2d,hsa_local,hsa_local_sdma",
+        default="torch,hip_default,hip_d2d,hsa_local,hsa_local_sdma,hsa_local_sdma_distinct",
         type=lambda s: s.split(","),
-        help="comma list of: torch, hip_default, hip_d2d, hsa_local, hsa_local_sdma, hip_peer, hsa_peer "
+        help="comma list of: torch, hip_default, hip_d2d, hsa_local, hsa_local_sdma, hsa_local_sdma_distinct, "
+        "hip_peer, hsa_peer "
         "(the last two name the peer GPU and can fault; run them alone)",
     )
     return p.parse_args()
@@ -80,6 +84,7 @@ def load_helper(path, rank):
         "sch_hsa_copy": [vp, i, vp, i, sz, i],
         "sch_hsa_copy_on_engine": [vp, i, vp, i, sz, i, i],
         "sch_engine_for": [i, i],
+        "sch_engine_mask": [i, i],
         "sch_hsa_wait": [i],
         "sch_hip_pointer": [vp, ip, ip],
         "sch_hsa_pointer": [vp, ip, ip],
@@ -182,14 +187,22 @@ def main():
     # Per peer, the SDMA engine ROCr prefers for that link (the choice that scaled in
     # sdma_p2p_bandwidth.cpp), used with the local GPU named on both sides.
     engines = [lib.sch_engine_for(local_rank, p) for p in peers]
+    # With the local GPU named on both sides every copy runs on the local GPU's engines,
+    # so peers that share a preferred engine queue behind each other. Also try one
+    # distinct available engine per peer.
+    distinct = []
+    for p in peers:
+        mask = lib.sch_engine_mask(local_rank, p)
+        free = [e for e in range(31) if mask > 0 and mask & (1 << e) and e not in distinct]
+        distinct.append(free[0] if free else -1)
 
-    def hsa_copy_sdma(count):
+    def hsa_copy_sdma(count, picks):
         for i in range(count):
-            if engines[i] < 0:
-                raise RuntimeError(f"no SDMA engine for peer {peers[i]} ({engines[i]})")
+            if picks[i] < 0:
+                raise RuntimeError(f"no SDMA engine for peer {peers[i]} ({picks[i]})")
             check(
                 lib.sch_hsa_copy_on_engine(
-                    dst[i].data_ptr(), local_rank, remote[peers[i]].data_ptr(), local_rank, nbytes, i, engines[i]
+                    dst[i].data_ptr(), local_rank, remote[peers[i]].data_ptr(), local_rank, nbytes, i, picks[i]
                 ),
                 "hsa_amd_memory_async_copy_on_engine",
             )
@@ -200,7 +213,14 @@ def main():
         "hip_default": ("hipMemcpyAsync, kind Default", lambda c: hip_copy(c, HIP_MEMCPY_DEFAULT)),
         "hip_d2d": ("hipMemcpyAsync, kind DeviceToDevice", lambda c: hip_copy(c, HIP_MEMCPY_D2D)),
         "hsa_local": ("ROCr async copy, src agent = local GPU", lambda c: hsa_copy(c, False)),
-        "hsa_local_sdma": ("ROCr copy on SDMA engine, src agent = local GPU", hsa_copy_sdma),
+        "hsa_local_sdma": (
+            "ROCr copy on preferred SDMA engine, src agent = local GPU",
+            lambda c: hsa_copy_sdma(c, engines),
+        ),
+        "hsa_local_sdma_distinct": (
+            "ROCr copy on one distinct SDMA engine per peer, src agent = local GPU",
+            lambda c: hsa_copy_sdma(c, distinct),
+        ),
         # Opt-in: these name the peer GPU for a buffer only the local GPU maps and have
         # faulted the GPU (memory access fault, GPU core dump) on MI355X.
         "hip_peer": ("hipMemcpyPeerAsync (peer device id)", hip_copy_peer),
@@ -253,6 +273,7 @@ def main():
         lines += [f"| {k} | {v[0]} | {v[1]} |" for k, v in views.items()]
         lines += ["", f"PCI bus per HIP device: {', '.join(f'{r}:{b:02x}' for r, b in bus.items())}", ""]
         lines += [f"SDMA engine per peer (rank 0, hsa_local_sdma): {dict(zip(peers, engines))}", ""]
+        lines += [f"SDMA engine per peer (rank 0, hsa_local_sdma_distinct): {dict(zip(peers, distinct))}", ""]
         lines += ["| copy path | peers read | ms | GB/s per rank | data ok |", "|---|---|---|---|---|"]
         for name, count, t_ms, gbps, ok, err in rows:
             note = f" ({err})" if err else ""
