@@ -398,7 +398,11 @@ class RuntimeState(metaclass=ABCMeta):
                 VSA_H3_AITER_RECIPE_BY_BACKEND[attention_backend]
             )
         elif attention_backend in AITER_MHA_V4_SOL_BACKEND_SET:
-            from xfuser.core.sparge_attention.sol import check_sol_attn_recipe
+            from xfuser.core.sparge_attention.sol import (
+                _resolve_recipe,
+                check_sol_attn_recipe,
+                check_sol_second_order,
+            )
             # Fail here rather than on the first attention call: which recipes exist depends on the
             # device and the aiter build (gfx950 ships them all, gfx942 currently none), and whether
             # --solattn_router error can run depends on the recipe (not with a packed K). The
@@ -407,6 +411,15 @@ class RuntimeState(metaclass=ABCMeta):
             check_sol_attn_recipe(
                 AITER_MHA_V4_SOL_RECIPE[attention_backend],
                 router=getattr(self.runtime_config, "solattn_router", "mean"),
+            )
+            config = self.runtime_config
+            tilt_rank = int(getattr(config, "solattn_tilt_rank", 0) or 0)
+            check_sol_second_order(
+                _resolve_recipe(AITER_MHA_V4_SOL_RECIPE[attention_backend]),
+                jensen=bool(getattr(config, "solattn_jensen", False)
+                            or getattr(config, "solattn_jensen_uncapped", False) or tilt_rank),
+                jensen_cap=not getattr(config, "solattn_jensen_uncapped", False),
+                tilt_rank=tilt_rank,
             )
         elif attention_backend == AttentionBackendType.AITER_SAGE_V2:
             try:
@@ -1322,7 +1335,21 @@ def get_configured_sol_options():
     python values are read, so a traced call folds them to constants; they are fixed for a run.
     """
     config = getattr(_RUNTIME, "runtime_config", None) if _RUNTIME is not None else None
-    return (getattr(config, "solattn_router", "mean"), bool(getattr(config, "solattn_jensen", False)))
+    jensen = (bool(getattr(config, "solattn_jensen", False))
+              or bool(getattr(config, "solattn_jensen_uncapped", False))
+              or int(getattr(config, "solattn_tilt_rank", 0) or 0) > 0)
+    return (getattr(config, "solattn_router", "mean"), jensen)
+
+
+def get_configured_sol_second_order():
+    """(jensen_cap, tilt_rank) from --solattn_jensen_uncapped / --solattn_tilt_rank.
+
+    The cap is on unless the uncapped term was asked for; the tilt implies the term (see
+    get_configured_sol_options). Python values, fixed for a run, so a traced call folds them.
+    """
+    config = getattr(_RUNTIME, "runtime_config", None) if _RUNTIME is not None else None
+    return (not bool(getattr(config, "solattn_jensen_uncapped", False)),
+            int(getattr(config, "solattn_tilt_rank", 0) or 0))
 
 
 def get_configured_solattn_beta() -> float:

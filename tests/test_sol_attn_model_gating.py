@@ -227,3 +227,29 @@ def test_an_unknown_sol_router_is_refused_by_the_parser():
     parser = xFuserArgs.add_runner_args(FlexibleArgumentParser(description="xDiT"))
     with pytest.raises(SystemExit):
         parser.parse_args(["--model", "Wan2.1-T2V", "--solattn_router", "nearest"])
+
+
+@pytest.mark.parametrize(
+    "argv,jensen,cap,rank",
+    [([], False, True, 0),
+     (["--solattn_jensen"], True, True, 0),
+     (["--solattn_jensen_uncapped"], True, False, 0),
+     (["--solattn_tilt_rank", "2"], True, True, 2)],
+)
+def test_the_jensen_cap_and_tilt_flags_reach_the_backend_options(monkeypatch, argv, jensen, cap, rank):
+    """The tilt implies the term; the cap is on unless the uncapped term was asked for."""
+    from types import SimpleNamespace
+
+    from xfuser.config.args import FlexibleArgumentParser
+    from xfuser.config.config import RuntimeConfig
+    from xfuser.core.distributed import runtime_state
+
+    parser = xFuserArgs.add_runner_args(FlexibleArgumentParser(description="xDiT"))
+    args = xFuserArgs.from_cli_args(parser.parse_args(["--model", "Wan2.1-T2V", *argv]))
+    config = RuntimeConfig(solattn_jensen=args.solattn_jensen,
+                           solattn_jensen_uncapped=args.solattn_jensen_uncapped,
+                           solattn_tilt_rank=args.solattn_tilt_rank)
+    monkeypatch.setattr(runtime_state, "_RUNTIME", SimpleNamespace(runtime_config=config),
+                        raising=False)
+    assert runtime_state.get_configured_sol_options() == ("mean", jensen)
+    assert runtime_state.get_configured_sol_second_order() == (cap, rank)

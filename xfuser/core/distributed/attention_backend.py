@@ -1911,7 +1911,10 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         if sequence_inverse_permutation is not None:
             sequence_inverse_permutation = sequence_inverse_permutation[:query_seqlen]
 
+    from xfuser.core.distributed.runtime_state import get_configured_sol_second_order
+
     router, jensen = _sol_attn_options()
+    jensen_cap, tilt_rank = get_configured_sol_second_order()
     output, head_cost = sol_attn_bhsd(
         query,
         key,
@@ -1933,6 +1936,8 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         sequence_inverse_permutation=sequence_inverse_permutation,
         router=router,
         jensen=jensen,
+        jensen_cap=jensen_cap,
+        tilt_rank=tilt_rank,
     )
     if cost_sink is not None:
         cost_sink.copy_(head_cost)

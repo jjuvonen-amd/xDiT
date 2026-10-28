@@ -301,6 +301,8 @@ class xFuserArgs:
     solattn_beta_schedule: Optional[str] = None
     solattn_router: str = "mean"
     solattn_jensen: bool = False
+    solattn_jensen_uncapped: bool = False
+    solattn_tilt_rank: int = 0
     solattn_exact_edge_frames: bool = False
     # LoRA adapters loaded unfused through PEFT (Wan2.2 A14B runners)
     lora_path: Optional[str] = None
@@ -1303,7 +1305,23 @@ class xFuserArgs:
             action="store_true",
             help="Pass each KV block's K variance to the Sol kernel, so a pooled block's logit "
                  "carries its second-order term instead of stopping at its Jensen lower bound "
-                 "q.mean_k. Runs through aiter's packed API rather than mha_v4_sol.",
+                 "q.mean_k, capped per block at ln(kv_tile) (aiter's sol_jensen_cap). Runs through "
+                 "aiter's packed API rather than mha_v4_sol.",
+        )
+        parser.add_argument(
+            "--solattn_jensen_uncapped",
+            action="store_true",
+            help="--solattn_jensen without the per-block cap, the term as aiter shipped it before "
+                 "sol_jensen_cap. For comparison: uncapped, late Wan layers hand pooled blocks "
+                 "most of the softmax.",
+        )
+        parser.add_argument(
+            "--solattn_tilt_rank",
+            type=int,
+            default=0,
+            help="Add each pooled KV block's leading Cov(v, k) q terms, up to this rank, to its "
+                 "mean value (aiter's pooled value tilt, experimental). Implies --solattn_jensen. "
+                 "0 (default) is off.",
         )
         parser.add_argument(
             "--lora_path",
@@ -1594,6 +1612,8 @@ class xFuserArgs:
             solattn_beta_schedule=self.solattn_beta_schedule,
             solattn_router=self.solattn_router,
             solattn_jensen=self.solattn_jensen,
+            solattn_jensen_uncapped=self.solattn_jensen_uncapped,
+            solattn_tilt_rank=self.solattn_tilt_rank,
             vsa_block_size=self.vsa_block_size,
             vsa_top_k=self.vsa_top_k,
             vsa_top_k_ratio=self.vsa_top_k_ratio,

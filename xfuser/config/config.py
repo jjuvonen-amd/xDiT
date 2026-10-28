@@ -78,6 +78,8 @@ class RuntimeConfig:
     solattn_beta_schedule: Optional[str] = None
     solattn_router: str = "mean"
     solattn_jensen: bool = False
+    solattn_jensen_uncapped: bool = False
+    solattn_tilt_rank: int = 0
     vsa_block_size: int = 128
     vsa_top_k: int = 1
     vsa_top_k_ratio: float = 0.0

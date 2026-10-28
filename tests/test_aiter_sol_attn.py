@@ -1569,3 +1569,135 @@ def test_every_recipe_serves_the_default_block_tile(monkeypatch):
         assert _serves(recipe, tile), (
             f"the '{recipe}' recipe has no {tile[0]}x{tile[1]} Sol-Attn row, so the default "
             "geometry it resolves to is one it cannot run")
+
+
+def _require_second_order():
+    """Skip unless aiter ships the Jensen cap and the pooled value tilt (mha_v4-sol-attn 0c56c8d+)."""
+    from xfuser.core.sparge_attention import sol
+
+    if sol._jensen_cap is None or sol._tilt_factors is None:
+        pytest.skip("this aiter has no sol_jensen_cap / sol_tilt builders")
+
+
+def _correlated_operands(seqlen=4096, heads=2, seed=1234):
+    """_operands with V partly a linear function of K: the in-block covariance the tilt models.
+
+    Sharpness 0.5 rather than _operands' 2.0, so the skipped blocks keep real attention mass: at
+    2.0 the selected blocks hold nearly all of it, there is nothing pooled to correct, and every
+    second-order option returns plain Sol's answer.
+    """
+    query, key, value = _operands(seqlen=seqlen, heads=heads, seed=seed, sharpness=0.5)
+    generator = torch.Generator(device=key.device).manual_seed(seed + 1)
+    mix = torch.randn(key.shape[-1], value.shape[-1], generator=generator, device=key.device)
+    mixed = key.float() @ (mix / key.shape[-1] ** 0.5)
+    value = (0.5 * value.float() + mixed).to(torch.bfloat16)
+    return query, key, value
+
+
+TILT_RECIPES = ["fp8", "bf16", "bf16fp8", "mxfp6", "f8f6", "i8fp8", "mxfp8", "mxfp4", "f6f4"]
+
+
+@pytest.mark.parametrize("recipe", TILT_RECIPES)
+@pytest.mark.parametrize("options", [dict(jensen=True), dict(tilt_rank=2)], ids=["capped", "tilt2"])
+def test_the_capped_term_and_the_tilt_run_on_every_recipe_that_has_them(recipe, options):
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+    _require_second_order()
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _correlated_operands()
+    with torch.no_grad():
+        out, _ = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe, **options)
+    assert out.shape == query.shape and torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("recipe", ["fp8", "bf16", "mxfp6"])
+def test_the_tilt_recovers_what_the_capped_term_leaves(recipe):
+    """With V moving with K inside a block, the block's mean value alone misses Cov(v, k) q."""
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+    _require_second_order()
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _correlated_operands()
+    reference = torch.nn.functional.scaled_dot_product_attention(query, key, value).float()
+
+    def error(**options):
+        with torch.no_grad():
+            out, _ = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe, **options)
+        return ((out.float() - reference).norm() / reference.norm()).item()
+
+    assert error(tilt_rank=2) < error(jensen=True)
+
+
+def test_the_uncapped_term_is_the_variance_as_routed(monkeypatch):
+    """jensen_cap=False hands the kernel routing's mean_k_var untouched: the old behaviour."""
+    _require_sol_attn()
+    _require_sol_recipe("fp8")
+    _require_second_order()
+
+    from xfuser.core.sparge_attention import sol
+
+    seen = {}
+    packed = sol._AITER.packed
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return packed(*args, **kwargs)
+
+    def routed(*args, **kwargs):
+        routing = prepare(*args, **kwargs)
+        seen["routed_var"] = routing["mean_k_var"]
+        return routing
+
+    prepare = sol._AITER.prepare
+    monkeypatch.setattr(sol._AITER, "packed", spy)
+    monkeypatch.setattr(sol._AITER, "prepare", routed)
+    query, key, value = _operands(seqlen=1024, heads=2)
+    with torch.no_grad():
+        sol.sol_attn_bhsd(query, key, value, beta=0.5, recipe="fp8", jensen=True, jensen_cap=False)
+    assert seen["mean_k_var"] is seen["routed_var"]
+    assert "sol_tilt" not in seen
+
+
+@pytest.mark.parametrize("options", [dict(jensen=True), dict(tilt_rank=2)], ids=["capped", "tilt2"])
+def test_the_capped_term_and_the_tilt_hold_one_graph(options):
+    """fullgraph=True: the cap and the tilt builders launch Triton kernels inside the forward.
+
+    torch.compile hands their Python-float arguments to Triton as fp64, which an FP8 store cannot
+    take on AMD; aiter's kernels have to pin them to fp32 for this to compile.
+    """
+    _require_sol_attn()
+    _require_sol_recipe("fp8")
+    _require_second_order()
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _correlated_operands(seqlen=1024)
+
+    def run(q, k, v):
+        return sol_attn_bhsd(q, k, v, beta=0.5, recipe="fp8", **options)[0]
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        compiled = torch.compile(run, fullgraph=True)(query, key, value)
+        eager = run(query, key, value)
+    torch.testing.assert_close(compiled.float(), eager.float(), atol=2e-2, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "recipe,options,match",
+    [("fp8", dict(tilt_rank=2, jensen_cap=False), "uncapped"),
+     ("fp8", dict(tilt_rank=-1), ">= 0"),
+     ("f6f8", dict(tilt_rank=2), "served by")],
+)
+def test_second_order_requests_the_build_cannot_serve_are_refused(recipe, options, match):
+    _require_sol_attn()
+    _require_second_order()
+
+    from xfuser.core.sparge_attention.sol import SolAttnUnsupported, _resolve_recipe, check_sol_second_order
+
+    with pytest.raises(SolAttnUnsupported, match=match):
+        check_sol_second_order(_resolve_recipe(recipe), jensen=True, **options)
