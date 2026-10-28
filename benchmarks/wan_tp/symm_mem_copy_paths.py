@@ -8,14 +8,23 @@ concurrently, while ROCr copies between hipMalloc buffers with both GPUs named
 scale with the number of peers. This reads the same symmetric-memory peer buffers, all ranks
 at once (an all-gather's traffic), through each path:
 
-  torch copy_          what the fused ops do
-  hipMemcpyAsync       kind Default, and kind DeviceToDevice
-  hipMemcpyPeerAsync   with both device ids
-  ROCr async copy      hsa_amd_memory_async_copy, both agents named, ROCr picks the engine
+  torch          torch copy_: what the fused ops do
+  hip_default    hipMemcpyAsync, kind Default
+  hip_d2d        hipMemcpyAsync, kind DeviceToDevice
+  hsa_local      ROCr hsa_amd_memory_async_copy with the local GPU as source agent:
+                 the peer buffer is mapped for it. ROCr treats this as a same-device
+                 copy and runs a shader blit, not SDMA
+  hsa_local_sdma the same copy forced onto SDMA (hsa_amd_memory_async_copy_on_engine),
+                 on the engine ROCr prefers for that peer link
+  hip_peer      hipMemcpyPeerAsync with the peer's device id       (opt-in)
+  hsa_peer       ROCr async copy with the peer GPU as source agent  (opt-in)
 
-each for one peer and for all peers at once (one stream or signal per peer),
-with RCCL's all-gather as the reference. It also reports how HIP and ROCr
-classify a peer buffer pointer. Builds symm_copy_helper.cpp with hipcc on first use.
+The opt-in paths name the peer GPU for a buffer this process maps only for the
+local GPU; on MI355X they faulted the GPU (memory access fault, core dump), so
+run them alone with --paths. Each path runs for one peer and for all peers at
+once (one stream or signal per peer), with RCCL's all-gather as the reference.
+It also reports how HIP and ROCr classify a peer buffer pointer. Builds
+symm_copy_helper.cpp with hipcc on first use.
 GB/s = bytes received per rank / time, slowest rank, median. Every mode checks what it received.
 """
 
@@ -44,6 +53,13 @@ def parse_args():
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--output-dir", default="/output/p2p")
     p.add_argument("--helper", default="/tmp/symm_copy_helper.so")
+    p.add_argument(
+        "--paths",
+        default="torch,hip_default,hip_d2d,hsa_local,hsa_local_sdma",
+        type=lambda s: s.split(","),
+        help="comma list of: torch, hip_default, hip_d2d, hsa_local, hsa_local_sdma, hip_peer, hsa_peer "
+        "(the last two name the peer GPU and can fault; run them alone)",
+    )
     return p.parse_args()
 
 
@@ -62,6 +78,8 @@ def load_helper(path, rank):
         "sch_hip_copy_peer": [vp, i, vp, i, sz, i],
         "sch_hip_sync": [i],
         "sch_hsa_copy": [vp, i, vp, i, sz, i],
+        "sch_hsa_copy_on_engine": [vp, i, vp, i, sz, i, i],
+        "sch_engine_for": [i, i],
         "sch_hsa_wait": [i],
         "sch_hip_pointer": [vp, ip, ip],
         "sch_hsa_pointer": [vp, ip, ip],
@@ -150,24 +168,53 @@ def main():
             )
         check(lib.sch_hip_sync(count), "hipStreamSynchronize")
 
-    def hsa_copy(count):
+    def hsa_copy(count, src_is_peer):
+        # The peer buffer is mapped in this process for the local GPU only, so naming the
+        # peer GPU as source agent can send ROCr to an engine without that mapping.
         for i in range(count):
+            src_dev = peers[i] if src_is_peer else local_rank
             check(
-                lib.sch_hsa_copy(dst[i].data_ptr(), local_rank, remote[peers[i]].data_ptr(), peers[i], nbytes, i),
+                lib.sch_hsa_copy(dst[i].data_ptr(), local_rank, remote[peers[i]].data_ptr(), src_dev, nbytes, i),
                 "hsa_amd_memory_async_copy",
             )
         check(lib.sch_hsa_wait(count), "hsa wait")
 
-    paths = [
-        ("torch copy_", torch_copy),
-        ("hipMemcpyAsync, kind Default", lambda c: hip_copy(c, HIP_MEMCPY_DEFAULT)),
-        ("hipMemcpyAsync, kind DeviceToDevice", lambda c: hip_copy(c, HIP_MEMCPY_D2D)),
-        ("hipMemcpyPeerAsync", hip_copy_peer),
-        ("ROCr async copy, both agents named", hsa_copy),
-    ]
+    # Per peer, the SDMA engine ROCr prefers for that link (the choice that scaled in
+    # sdma_p2p_bandwidth.cpp), used with the local GPU named on both sides.
+    engines = [lib.sch_engine_for(local_rank, p) for p in peers]
+
+    def hsa_copy_sdma(count):
+        for i in range(count):
+            if engines[i] < 0:
+                raise RuntimeError(f"no SDMA engine for peer {peers[i]} ({engines[i]})")
+            check(
+                lib.sch_hsa_copy_on_engine(
+                    dst[i].data_ptr(), local_rank, remote[peers[i]].data_ptr(), local_rank, nbytes, i, engines[i]
+                ),
+                "hsa_amd_memory_async_copy_on_engine",
+            )
+        check(lib.sch_hsa_wait(count), "hsa wait")
+
+    all_paths = {
+        "torch": ("torch copy_", torch_copy),
+        "hip_default": ("hipMemcpyAsync, kind Default", lambda c: hip_copy(c, HIP_MEMCPY_DEFAULT)),
+        "hip_d2d": ("hipMemcpyAsync, kind DeviceToDevice", lambda c: hip_copy(c, HIP_MEMCPY_D2D)),
+        "hsa_local": ("ROCr async copy, src agent = local GPU", lambda c: hsa_copy(c, False)),
+        "hsa_local_sdma": ("ROCr copy on SDMA engine, src agent = local GPU", hsa_copy_sdma),
+        # Opt-in: these name the peer GPU for a buffer only the local GPU maps and have
+        # faulted the GPU (memory access fault, GPU core dump) on MI355X.
+        "hip_peer": ("hipMemcpyPeerAsync (peer device id)", hip_copy_peer),
+        "hsa_peer": ("ROCr async copy, src agent = peer GPU", lambda c: hsa_copy(c, True)),
+    }
+    unknown = set(args.paths) - set(all_paths)
+    if unknown:
+        raise SystemExit(f"unknown --paths {sorted(unknown)}; choose from {sorted(all_paths)}")
     rows = []
-    for name, fn in paths:
+    for key in args.paths:
+        name, fn = all_paths[key]
         for count in (1, len(peers)):
+            if rank == 0:
+                print(f"running: {name}, {count} peer(s)", flush=True)
             dst.zero_()
             torch.cuda.synchronize()
             try:
@@ -180,6 +227,9 @@ def main():
             ok_all = torch.tensor([int(ok)], device="cuda")
             dist.all_reduce(ok_all, op=dist.ReduceOp.MIN)
             rows.append((name, count, ms, count * nbytes / (ms * 1e-3) / 1e9, bool(ok_all.item()), err))
+            if rank == 0:
+                # Printed as it goes: a GPU fault in a later path kills the job before the table.
+                print(f"  {rows[-1][2]:.2f} ms, {rows[-1][3]:.0f} GB/s, data ok: {rows[-1][4]} {err}", flush=True)
 
     gathered = torch.empty(world * numel, dtype=torch.bfloat16, device="cuda")
     local = src.clone()
@@ -202,6 +252,7 @@ def main():
         ]
         lines += [f"| {k} | {v[0]} | {v[1]} |" for k, v in views.items()]
         lines += ["", f"PCI bus per HIP device: {', '.join(f'{r}:{b:02x}' for r, b in bus.items())}", ""]
+        lines += [f"SDMA engine per peer (rank 0, hsa_local_sdma): {dict(zip(peers, engines))}", ""]
         lines += ["| copy path | peers read | ms | GB/s per rank | data ok |", "|---|---|---|---|---|"]
         for name, count, t_ms, gbps, ok, err in rows:
             note = f" ({err})" if err else ""

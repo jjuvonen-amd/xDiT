@@ -2,7 +2,7 @@
 //   hipcc -O2 -shared -fPIC -o symm_copy_helper.so symm_copy_helper.cpp -lhsa-runtime64
 //
 // Issues peer copies the ways a framework can on ROCm (HIP memcpy kinds, hipMemcpyPeerAsync,
-// ROCr's hsa_amd_memory_async_copy with both agents named) and reports how HIP and ROCr
+// ROCr's hsa_amd_memory_async_copy, optionally on a chosen SDMA engine) and reports how HIP and ROCr
 // classify a pointer. Functions return 0 on success, a negative code otherwise.
 #include <hip/hip_runtime.h>
 #include <hsa/hsa.h>
@@ -78,13 +78,38 @@ int sch_hip_sync(int num_streams) {
   return 0;
 }
 
-// ROCr async copy with both agents named; ROCr picks the engine.
+// ROCr async copy between the named agents; ROCr picks the engine. With the same GPU as
+// both agents ROCr treats it as a device-to-device copy (a shader blit, not SDMA).
 int sch_hsa_copy(void* dst, int dst_dev, const void* src, int src_dev, size_t bytes, int slot) {
   hsa_agent_t dst_agent, src_agent;
   if (agent_of(dst_dev, &dst_agent) || agent_of(src_dev, &src_agent)) return -1;
   hsa_signal_store_relaxed(g_signals[slot], 1);
   hsa_status_t s = hsa_amd_memory_async_copy(dst, dst_agent, src, src_agent, bytes, 0, nullptr, g_signals[slot]);
   return s == HSA_STATUS_SUCCESS ? 0 : -(int)s;
+}
+
+// ROCr async copy forced onto SDMA engine `engine` (bit index) of the named agents.
+int sch_hsa_copy_on_engine(void* dst, int dst_dev, const void* src, int src_dev, size_t bytes, int slot,
+                           int engine) {
+  hsa_agent_t dst_agent, src_agent;
+  if (agent_of(dst_dev, &dst_agent) || agent_of(src_dev, &src_agent)) return -1;
+  hsa_signal_store_relaxed(g_signals[slot], 1);
+  hsa_status_t s = hsa_amd_memory_async_copy_on_engine(dst, dst_agent, src, src_agent, bytes, 0, nullptr,
+                                                       g_signals[slot], (hsa_amd_sdma_engine_id_t)(1u << engine), true);
+  return s == HSA_STATUS_SUCCESS ? 0 : -(int)s;
+}
+
+// The engine (bit index) ROCr prefers for copies from `src_dev` into `dst_dev`: the lowest
+// bit of the preferred mask, else of the available mask. Negative on failure.
+int sch_engine_for(int dst_dev, int src_dev) {
+  hsa_agent_t dst_agent, src_agent;
+  if (agent_of(dst_dev, &dst_agent) || agent_of(src_dev, &src_agent)) return -1;
+  uint32_t mask = 0;
+  if (hsa_amd_memory_get_preferred_copy_engine(dst_agent, src_agent, &mask) != HSA_STATUS_SUCCESS || mask == 0)
+    if (hsa_amd_memory_copy_engine_status(dst_agent, src_agent, &mask) != HSA_STATUS_SUCCESS) return -2;
+  for (int e = 0; e < 32; ++e)
+    if (mask & (1u << e)) return e;
+  return -3;
 }
 
 int sch_hsa_wait(int num_slots) {
