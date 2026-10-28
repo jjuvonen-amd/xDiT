@@ -19,6 +19,8 @@ at once (an all-gather's traffic), through each path:
   hsa_local_sdma_fixed     the same, with peers that share a preferred engine moved
                  to a free engine: with the local GPU on both sides all copies use
                  the local GPU's engines, so a shared engine runs its copies in turn
+  hsa_local_sdma_pairfree  the same, also keeping peers off both engines of a pair
+                 2k/2k+1, in case such a pair shares bandwidth
   hsa_local_sdma_distinct  one distinct available engine per peer (lowest first)
   hsa_local_sdma_distinct_rev  the same engines, issued in reverse order: tells a
                  slow engine from a slow issue position
@@ -62,11 +64,11 @@ def parse_args():
     p.add_argument("--helper", default="/tmp/symm_copy_helper.so")
     p.add_argument(
         "--paths",
-        default="torch,hip_default,hip_d2d,hsa_local,hsa_local_sdma,hsa_local_sdma_fixed,"
+        default="torch,hip_default,hip_d2d,hsa_local,hsa_local_sdma,hsa_local_sdma_fixed,hsa_local_sdma_pairfree,"
         "hsa_local_sdma_distinct,hsa_local_sdma_distinct_rev,hsa_local_sdma_split",
         type=lambda s: s.split(","),
         help="comma list of: torch, hip_default, hip_d2d, hsa_local, hsa_local_sdma, hsa_local_sdma_fixed, "
-        "hsa_local_sdma_distinct, hsa_local_sdma_distinct_rev, hsa_local_sdma_split, hip_peer, hsa_peer "
+        "hsa_local_sdma_pairfree, hsa_local_sdma_distinct, hsa_local_sdma_distinct_rev, hsa_local_sdma_split, hip_peer, hsa_peer "
         "(the last two name the peer GPU and can fault; run them alone)",
     )
     return p.parse_args()
@@ -110,6 +112,7 @@ def sdma_plans(lib, local_rank, peers):
 
     preferred  ROCr's preferred engine for each peer link (peers can share one)
     fixed      preferred, with each clash moved to a free engine no peer prefers
+    pairfree   fixed, but no two peers on engines 2k and 2k+1 (which may share bandwidth)
     distinct   the lowest available engine not yet taken, one per peer
     split      two distinct engines per peer, each copying half
     """
@@ -134,6 +137,16 @@ def sdma_plans(lib, local_rank, peers):
         if fixed[i] < 0:
             fixed[i] = take(i, used, avoid=set(preferred))
             used.add(fixed[i])
+    pairfree, used = [-1] * len(peers), set()
+    for i, e in enumerate(preferred):
+        if e >= 0 and e not in used and e ^ 1 not in used:
+            pairfree[i] = e
+            used.add(e)
+    for i in range(len(peers)):
+        if pairfree[i] < 0:
+            partners = used | {e ^ 1 for e in used} | set(preferred) | {e ^ 1 for e in preferred}
+            pairfree[i] = take(i, used, avoid=partners)
+            used.add(pairfree[i])
     second, used = [], set(distinct)
     for i in range(len(peers)):
         second.append(take(i, used))
@@ -141,6 +154,7 @@ def sdma_plans(lib, local_rank, peers):
     return {
         "preferred": [[e] for e in preferred],
         "fixed": [[e] for e in fixed],
+        "pairfree": [[e] for e in pairfree],
         "distinct": [[e] for e in distinct],
         "split": [[a, b] for a, b in zip(distinct, second)],
     }
@@ -272,6 +286,10 @@ def main():
         "hsa_local_sdma_fixed": (
             "ROCr copy on preferred SDMA engine, clashes moved to a free engine",
             lambda c: hsa_copy_sdma(c, "fixed"),
+        ),
+        "hsa_local_sdma_pairfree": (
+            "ROCr copy on preferred SDMA engine, clashes moved, no engine pair 2k/2k+1 shared",
+            lambda c: hsa_copy_sdma(c, "pairfree"),
         ),
         "hsa_local_sdma_distinct": (
             "ROCr copy on one distinct SDMA engine per peer, src agent = local GPU",

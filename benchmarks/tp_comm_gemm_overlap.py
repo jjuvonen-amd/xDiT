@@ -14,12 +14,10 @@ model does today and with the collective pipelined against the GEMM:
   symm_mem    torch.ops.symm_mem.fused_all_gather_matmul / fused_matmul_reduce_scatter.
               Opt-in: peer access through torch symmetric memory segfaulted
               beyond ~10 MB on torch 2.13 / ROCm 7.16.
-  sdma_async  ROCm, opt-in (--sdma): xfuser's all-gather + GEMM with the gather on SDMA
-  sdma_per_peer  copy engines, all peers at once, consumed by torch's ROCm GEMM that waits
-              per row tile (async) or by a stream wait + GEMM per shard (per_peer); see
-              xfuser/model_executor/layers/sdma_all_gather.py. AG sites only: an RS site
-              reports its baseline, as XDIT_TP_COMM_OVERLAP=sdma runs it. Rows per rank
-              are padded to the GEMM's 256-row tile.
+  sdma_kN     ROCm, opt-in (--sdma): xfuser's all-gather + GEMM with the gather on SDMA
+              copy engines, all peers at once, in N pieces on the block-cyclic rows; each
+              piece's GEMM starts as it lands (xfuser/model_executor/layers/sdma_all_gather.py).
+              AG sites only: an RS site reports chunked_kN, as XDIT_TP_COMM_OVERLAP=sdma runs it.
 
 `comm_only` and `gemm_only` time each half alone; `ideal` is their max. Each
 variant is checked against baseline. Times are the slowest rank's median.
@@ -64,6 +62,7 @@ def _parse_args():
     parser.add_argument("--symm-mem", action="store_true", help="also time torch's fused symm_mem ops")
     parser.add_argument("--sdma", action="store_true", help="also time the SDMA all-gather + GEMM (ROCm)")
     parser.add_argument("--sdma-trigger", default="gpu", choices=["gpu", "host"])
+    parser.add_argument("--sdma-engines", default="fixed", choices=["fixed", "pairfree"])
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--output-dir", default="/output/fusion_bench")
@@ -76,9 +75,8 @@ class Bench:
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.group_name = dist.group.WORLD.group_name
         self.comm = torch.cuda.Stream()
-        # Pad so every chunk count splits the sequence into whole blocks per rank, and
-        # with --sdma so each rank's rows are whole 256-row GEMM tiles.
-        align = self.world * (math.lcm(max(args.chunks), 256) if args.sdma else max(args.chunks))
+        # Pad so every chunk count splits the sequence into whole blocks per rank.
+        align = self.world * math.lcm(*args.chunks)
         self.seq = -(-args.seq // align) * align
         self.rows = self.seq // self.world
 
@@ -117,11 +115,13 @@ class Bench:
         _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(a_local, [weight.t()], 0, self.group_name)
         return out
 
-    def ag_sdma(self, a_local, weight, consumer):
+    def ag_sdma(self, a_cyclic, weight, k):
         from xfuser.model_executor.layers.sdma_all_gather import sdma_all_gather_linear
 
-        out = sdma_all_gather_linear(a_local[None], weight, None, self.group_name, consumer, self.args.sdma_trigger)
-        return out[0]
+        args = self.args
+        return sdma_all_gather_linear(
+            a_cyclic[None], weight, None, self.group_name, k, args.sdma_trigger, args.sdma_engines
+        )[0]
 
     # ---- GEMM + reduce-scatter -----------------------------------------------------------------
     def rs_baseline(self, a_full, weight, out_buf):
@@ -197,9 +197,10 @@ class Bench:
                 self.check("symm_mem", self.ag_symm_mem(a_local, weight, out), expected)
                 results["symm_mem"] = self.time(lambda: self.ag_symm_mem(a_local, weight, out))
             if self.args.sdma:
-                for variant, consumer in (("sdma_async", "async_mm"), ("sdma_per_peer", "per_peer")):
-                    self.check(variant, self.ag_sdma(a_local, weight, consumer), expected)
-                    results[variant] = self.time(lambda: self.ag_sdma(a_local, weight, consumer))
+                for k in self.args.chunks:
+                    a_cyclic = self.cyclic_rows(x_full, k).contiguous()
+                    self.check(f"sdma_k{k}", self.ag_sdma(a_cyclic, weight, k), expected)
+                    results[f"sdma_k{k}"] = self.time(lambda: self.ag_sdma(a_cyclic, weight, k))
         else:
             a_full = torch.randn(self.seq, k_in, **bf16)
             out = torch.empty(self.rows, n, **bf16)
@@ -219,7 +220,8 @@ class Bench:
                 self.check("symm_mem", self.rs_symm_mem(a_full, weight, out), expected_local)
                 results["symm_mem"] = self.time(lambda: self.rs_symm_mem(a_full, weight, out))
             if self.args.sdma:
-                results["sdma_async"] = results["sdma_per_peer"] = results["baseline"]
+                for k in self.args.chunks:
+                    results[f"sdma_k{k}"] = results[f"chunked_k{k}"]
         results["ideal"] = max(results["comm_only"], results["gemm_only"])
         return results
 
@@ -230,7 +232,7 @@ def _report(bench, table):
         ["baseline"]
         + [f"chunked_k{k}" for k in args.chunks]
         + (["symm_mem"] if args.symm_mem else [])
-        + (["sdma_async", "sdma_per_peer"] if args.sdma else [])
+        + ([f"sdma_k{k}" for k in args.chunks] if args.sdma else [])
     )
     columns = ["comm_only", "gemm_only", "ideal", *variants]
     channels = os.environ.get("NCCL_MAX_NCHANNELS", "default")
@@ -238,7 +240,9 @@ def _report(bench, table):
         f"# TP{bench.world} comm/GEMM overlap, hidden {args.hidden}, ffn {args.ffn}",
         "",
         f"seq {bench.seq} ({bench.rows} rows/rank), hidden {args.hidden}, ffn {args.ffn}, bf16, "
-        f"NCCL_MAX_NCHANNELS={channels}. Slowest rank's median ms over {args.iters} iterations.",
+        f"NCCL_MAX_NCHANNELS={channels}"
+        + (f", SDMA engines {args.sdma_engines}, trigger {args.sdma_trigger}" if args.sdma else "")
+        + f". Slowest rank's median ms over {args.iters} iterations.",
         "",
         "| site | " + " | ".join(columns) + " | best vs baseline |",
         "|---|" + "---|" * (len(columns) + 1),
