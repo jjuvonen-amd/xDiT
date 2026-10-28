@@ -147,7 +147,9 @@ _mha_v4_ragged_kv = _AITER.ragged_kv if _AITER is not None else None
 
 
 def _probe_second_order():
-    """aiter's Jensen cap and pooled value tilt builders (mha_v4-sol-attn 0c56c8d+), or Nones.
+    """aiter's Jensen cap and pooled value tilt builders, or Nones.
+
+    mha_v4-sol-attn 0c56c8d added them; c81d657 is needed to run them under torch.compile.
 
     Held as module globals like the tile queries above, so a compiled call reaches them without
     Dynamo binding an owner. Older builds lack them; asking for the cap or the tilt then fails at
@@ -343,7 +345,7 @@ def _check_router(recipe, router):
             f"router only")
 
 
-# The rows aiter builds with the pooled value tilt (0c56c8d), at the block tiles each is built for.
+# The rows aiter builds with the pooled value tilt (0c56c8d+), at the block tiles each is built for.
 # f6f8 has no tilt object.
 _TILT_BLOCK_TILES = {
     "fp8": {(256, 128), (64, 64)}, "i8fp8": {(256, 128), (64, 64)}, "mxfp8": {(256, 128), (64, 64)},
@@ -366,14 +368,14 @@ def check_sol_second_order(recipe, jensen=False, jensen_cap=True, tilt_rank=0):
             "with --solattn_jensen_uncapped")
     if (jensen or tilt_rank) and jensen_cap and _jensen_cap is None:
         raise SolAttnUnsupported(
-            "the capped Jensen term needs aiter's sol_jensen_cap (mha_v4-sol-attn 0c56c8d or "
+            "the capped Jensen term needs aiter's sol_jensen_cap (mha_v4-sol-attn c81d657 or "
             "later); this aiter does not have it")
     if not tilt_rank:
         return
     if _tilt_factors is None:
         raise SolAttnUnsupported(
             "--solattn_tilt_rank needs aiter's sol_tilt builders and tilt-enabled Sol kernels "
-            "(mha_v4-sol-attn 0c56c8d or later); this aiter has neither")
+            "(mha_v4-sol-attn c81d657 or later); this aiter has neither")
     tile = sol_attn_block_tile(recipe)
     if tile not in _TILT_BLOCK_TILES.get(recipe.id, ()):
         served = ", ".join(

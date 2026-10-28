@@ -15,6 +15,8 @@ through a Sparge block mask, and it rejects ring parallelism outright because it
 is taken over the blocks one call is shown.
 """
 
+import functools
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -1662,23 +1664,21 @@ def test_the_uncapped_term_is_the_variance_as_routed(monkeypatch):
     assert "sol_tilt" not in seen
 
 
-# Eager is fine; compiled, the f8f6 tilt returns NaN everywhere on aiter 0c56c8d (with the fp32
-# scalar patch). Strict, so the case reports itself once aiter fixes it.
-_F8F6_TILT_NAN = pytest.mark.xfail(strict=True, reason="f8f6 tilt is NaN under torch.compile")
+# The recipes whose compiled cap and tilt match eager bitwise (aiter c81d657 builds every tilt plane
+# in a kernel, so Inductor can no longer cut the stack to plane 0). MXFP6's compiled path differs
+# from eager in the low bits even without the cap or the tilt, so it is held to a tolerance.
+_BITWISE_COMPILE_RECIPES = ("fp8", "i8fp8", "mxfp8", "bf16fp8", "bf16", "f8f6")
 
 
-@pytest.mark.parametrize("recipe,options", [
-    pytest.param(recipe, options, id=f"{label}-{recipe}",
-                 marks=[_F8F6_TILT_NAN] if (recipe, label) == ("f8f6", "tilt2") else [])
-    for recipe in ["fp8", "bf16", "mxfp6", "f8f6", "i8fp8"]
-    for label, options in [("capped", dict(jensen=True)), ("tilt2", dict(tilt_rank=2))]
-])
+@pytest.mark.parametrize("recipe", [*_BITWISE_COMPILE_RECIPES, "mxfp6"])
+@pytest.mark.parametrize("options", [dict(jensen=True), dict(tilt_rank=2)], ids=["capped", "tilt2"])
 def test_the_capped_term_and_the_tilt_hold_one_graph(recipe, options):
     """fullgraph=True: the cap and the tilt builders launch Triton kernels inside the forward.
 
     torch.compile hands their Python-float arguments to Triton as fp64, which an FP8 store or a
-    dword bitcast cannot take on AMD; aiter's kernels have to pin them to fp32 for this to compile.
-    The recipes differ in which parameter kernel builds their tilt, so each is compiled.
+    dword bitcast cannot take on AMD, and it used to cut the stacked tilt planes down to plane 0;
+    aiter casts the scalars and writes every plane in a kernel. The recipes differ in which
+    builder and parameter kernel make their tilt, so each is compiled.
     """
     _require_sol_attn()
     _require_sol_recipe(recipe)
@@ -1695,7 +1695,32 @@ def test_the_capped_term_and_the_tilt_hold_one_graph(recipe, options):
     with torch.no_grad():
         compiled = torch.compile(run, fullgraph=True)(query, key, value)
         eager = run(query, key, value)
-    torch.testing.assert_close(compiled.float(), eager.float(), atol=2e-2, rtol=0)
+    if recipe in _BITWISE_COMPILE_RECIPES:
+        assert torch.equal(compiled, eager)
+    else:
+        torch.testing.assert_close(compiled.float(), eager.float(), atol=1e-1, rtol=0)
+
+
+@pytest.mark.parametrize("recipe", ["fp8", "bf16", "mxfp6", "f8f6"])
+def test_the_compiled_tilt_is_not_the_capped_term_alone(recipe):
+    """A tilt whose planes 1..rank were dropped would leave only the capped term; it must not."""
+    _require_sol_attn()
+    _require_sol_recipe(recipe)
+    _require_second_order()
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _correlated_operands()
+
+    def run(q, k, v, **options):
+        return sol_attn_bhsd(q, k, v, beta=0.5, recipe=recipe, **options)[0]
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        capped = torch.compile(functools.partial(run, jensen=True))(query, key, value).float()
+        torch._dynamo.reset()
+        tilted = torch.compile(functools.partial(run, tilt_rank=2))(query, key, value).float()
+    assert ((tilted - capped).norm() / capped.norm()).item() > 1e-2
 
 
 @pytest.mark.parametrize(
