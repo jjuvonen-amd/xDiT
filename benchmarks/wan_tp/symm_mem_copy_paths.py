@@ -13,7 +13,7 @@ at once (an all-gather's traffic), through each path:
   hip_d2d        hipMemcpyAsync, kind DeviceToDevice
   hsa_local      ROCr hsa_amd_memory_async_copy with the local GPU as source agent:
                  the peer buffer is mapped for it. ROCr treats this as a same-device
-                 copy and runs a shader blit, not SDMA
+                 copy; on MI355X concurrent ones run one at a time (rocprofv3)
   hsa_local_sdma the same copy forced onto SDMA (hsa_amd_memory_async_copy_on_engine),
                  on the engine ROCr prefers for that peer link
   hsa_local_sdma_distinct  the same, one distinct available engine per peer: with the

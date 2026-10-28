@@ -79,7 +79,7 @@ int sch_hip_sync(int num_streams) {
 }
 
 // ROCr async copy between the named agents; ROCr picks the engine. With the same GPU as
-// both agents ROCr treats it as a device-to-device copy (a shader blit, not SDMA).
+// both agents ROCr treats it as a same-device copy; concurrent ones run one at a time.
 int sch_hsa_copy(void* dst, int dst_dev, const void* src, int src_dev, size_t bytes, int slot) {
   hsa_agent_t dst_agent, src_agent;
   if (agent_of(dst_dev, &dst_agent) || agent_of(src_dev, &src_agent)) return -1;
