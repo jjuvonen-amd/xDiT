@@ -5,8 +5,8 @@ and normalizes Q/K over heads held by different ranks. Cross-attention is
 either sharded the same way or kept whole on every rank's own rows. The
 collectives run next to their GEMMs, pipelined against them in chunks (which
 holds the rows block-cyclically), inside torch's fused symm_mem ops, or (ROCm) with the all-gathers
-on SDMA copy engines. The model pads the sequence to a multiple of SP x TP x chunks (x the SDMA
-row tile), so a short sequence also checks the pad.
+on SDMA copy engines in pieces. The model pads the sequence to a multiple of SP x TP x chunks, so
+a short sequence also checks the pad.
 Tiny random weights in fp32 on SDPA_EFFICIENT, so only reduction order
 differs from one GPU; nothing is downloaded.
 """
@@ -65,13 +65,8 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         options["fused"],
     )
     import contextlib
-    import os
 
     import torch.distributed._symmetric_memory as symm_mem
-
-    if fused == "sdma":
-        # The parity runs in fp32, and torch's ROCm GEMM that waits per row tile is bf16 only.
-        os.environ["XDIT_TP_SDMA_CONSUMER"] = "per_peer"
 
     from xfuser.config.args import xFuserArgs
     from xfuser.core.distributed import (
@@ -245,16 +240,16 @@ def test_tensor_parallel_with_fused_comm_matches_one_gpu(tmp_path, one_gpu_outpu
 @pytest.mark.rocm
 @pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
 @pytest.mark.parametrize("cross_attention", ["sharded", "replicated"])
-@pytest.mark.parametrize("mode", ["tp2", "tp4", "tp2-ulysses2"])
+@pytest.mark.parametrize("mode, chunks", [("tp2", 1), ("tp2", 2), ("tp4", 2), ("tp2-ulysses2", 2)])
 def test_tensor_parallel_with_sdma_all_gather_matches_one_gpu(
-    tmp_path, one_gpu_output, mode, cross_attention, latent_shape
+    tmp_path, one_gpu_output, mode, chunks, cross_attention, latent_shape
 ):
-    """All-gathers on SDMA copy engines, as XDIT_TP_COMM_OVERLAP=sdma runs them, with the rows padded to its tile."""
+    """All-gathers on SDMA copy engines in pieces, as XDIT_TP_COMM_OVERLAP=sdma runs them."""
     if not torch.cuda.is_available() or torch.version.hip is None:
         pytest.skip("SDMA copy engines need ROCm")
     expected = one_gpu_output("wan", latent_shape)
 
-    actual = _run(tmp_path, mode, "wan", latent_shape, cross_attention=cross_attention, fused="sdma")
+    actual = _run(tmp_path, mode, "wan", latent_shape, cross_attention=cross_attention, chunks=chunks, fused="sdma")
 
     error = _relative_error(actual, expected)
     assert error <= TOLERANCE, f"relative error {error:.3e}"

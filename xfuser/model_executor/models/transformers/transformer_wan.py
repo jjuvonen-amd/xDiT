@@ -435,8 +435,6 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         self._tp_size = 1
         self._tp_rank = 0
         self._tp_chunks = 1
-        # Each TP rank's rows are padded to a multiple of this (the SDMA all-gather's GEMM tile).
-        self._tp_row_align = 1
 
     def shard_for_tensor_parallel(
         self, shard_cross_attention: bool = True, overlap_chunks: int = 1, fused_comm: Optional[str] = None
@@ -458,13 +456,13 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         many chunks, with the residual rows block-cyclic (see layers/tensor_parallel.py).
         `fused_comm="symm_mem"` runs each pair through torch's symm_mem fused
         ops instead, on contiguous rows; `fused_comm="sdma"` (ROCm) gathers
-        each all-gather + GEMM on SDMA copy engines (layers/sdma_all_gather.py),
-        with each rank's rows padded to that op's row tile.
+        each all-gather + GEMM on SDMA copy engines in `overlap_chunks` pieces
+        (layers/sdma_all_gather.py), reduce-scatters as with chunks alone.
         """
         if fused_comm not in (None, "symm_mem", "sdma"):
             raise ValueError(f"fused_comm must be None, 'symm_mem' or 'sdma'; got {fused_comm!r}")
-        if fused_comm and overlap_chunks != 1:
-            raise ValueError("fused_comm pipelines on its own; it takes no overlap_chunks")
+        if fused_comm == "symm_mem" and overlap_chunks != 1:
+            raise ValueError("fused_comm='symm_mem' pipelines on its own; it takes no overlap_chunks")
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size == 1 or self._tp_size > 1:
             return
@@ -508,10 +506,6 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         self._tp_size = tp_size
         self._tp_rank = tp_rank
         self._tp_chunks = overlap_chunks
-        if fused_comm == "sdma":
-            from xfuser.model_executor.layers.sdma_all_gather import ROW_TILE
-
-            self._tp_row_align = ROW_TILE
 
     def _update_vsa_attention_kwargs(self, timestep: torch.LongTensor) -> None:
         """Publish the current AITER VSA schedule values to its backend."""
@@ -616,7 +610,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         # ranks of each SP rank (in tp_chunks blocks each, see tp_split_rows): the
         # blocks all-gather the TP group's rows back into this SP rank's chunk
         # before attention, which RoPE is chunked for.
-        rows_multiple = sp_world_size * self._tp_size * self._tp_chunks * self._tp_row_align
+        rows_multiple = sp_world_size * self._tp_size * self._tp_chunks
 
         # Part of sequence parallel: given the resolution, we may need to pad the sequence length to match this prior to chunking
         pad_amount = (rows_multiple - (hidden_states.shape[1] % rows_multiple)) % rows_multiple

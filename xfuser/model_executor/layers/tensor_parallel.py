@@ -23,8 +23,9 @@ With `fused="symm_mem"`, torch's symmetric-memory ops run each pair instead
 pipeline peer-to-peer copies against per-shard GEMMs themselves, on the
 contiguous layout. They work over NVLink; on torch 2.13 / ROCm 7.16 they
 segfault beyond ~10 MB. With `fused="sdma"` (ROCm), each all-gather + GEMM
-gathers on SDMA copy engines, all peers at once (layers/sdma_all_gather.py),
-on the contiguous layout; reduce-scatters run as with one chunk.
+gathers on SDMA copy engines, all peers at once, in `chunks` pieces on the
+block-cyclic layout, each piece's GEMM starting as it lands
+(layers/sdma_all_gather.py); reduce-scatters run as with `fused` unset.
 """
 
 from typing import List, Optional, Sequence
@@ -137,8 +138,9 @@ def tp_column_parallel(
                 linear.weight,
                 linear.bias,
                 get_tp_group().device_group.group_name,
-                envs.environment_variables["XDIT_TP_SDMA_CONSUMER"]().strip().lower(),
+                chunks,
                 envs.environment_variables["XDIT_TP_SDMA_TRIGGER"]().strip().lower(),
+                envs.environment_variables["XDIT_TP_SDMA_ENGINES"]().strip().lower(),
             )
     if fused:
         with record_function(f"tp_ag:{site}"):

@@ -70,15 +70,16 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     #             (benchmarks/tp_comm_gemm_overlap.py measures the gain per site).
     #   symm_mem - torch's symm_mem fused AG+GEMM / GEMM+RS ops (NVLink; they
     #             segfault on torch 2.13 / ROCm 7.16).
-    #   sdma    - ROCm: each all-gather + GEMM fused with the gather on SDMA copy engines, all
-    #             peers at once (layers/sdma_all_gather.py); reduce-scatters as with none.
+    #   sdma    - ROCm: each all-gather + GEMM with the gather on SDMA copy engines, all peers at
+    #             once, in XDIT_TP_OVERLAP_CHUNKS pieces whose GEMMs start as they land
+    #             (layers/sdma_all_gather.py); reduce-scatters as with chunked.
     "XDIT_TP_COMM_OVERLAP": lambda: os.environ.get("XDIT_TP_COMM_OVERLAP", "none"),
     "XDIT_TP_OVERLAP_CHUNKS": lambda: os.environ.get("XDIT_TP_OVERLAP_CHUNKS", "4"),
-    # For sdma: the GEMM that consumes the gathered rows (async_mm: torch's ROCm GEMM that waits
-    # per row tile; per_peer: a stream wait and a GEMM per shard), and what releases the copies
-    # (gpu: a kernel after the symmetric-memory barrier; host: the host, after waiting for it).
-    "XDIT_TP_SDMA_CONSUMER": lambda: os.environ.get("XDIT_TP_SDMA_CONSUMER", "async_mm"),
+    # For sdma: what releases the copies (gpu: a kernel after the symmetric-memory barrier; host:
+    # the host, after waiting for it), and the engine plan (fixed: ROCr's preferred engine per
+    # peer, clashes moved; pairfree: also no two peers on engines 2k and 2k+1).
     "XDIT_TP_SDMA_TRIGGER": lambda: os.environ.get("XDIT_TP_SDMA_TRIGGER", "gpu"),
+    "XDIT_TP_SDMA_ENGINES": lambda: os.environ.get("XDIT_TP_SDMA_ENGINES", "fixed"),
 }
 
 

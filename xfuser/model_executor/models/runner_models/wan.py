@@ -834,7 +834,7 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
             if overlap == "sdma" and torch.version.hip is None:
                 raise ValueError("XDIT_TP_COMM_OVERLAP=sdma needs ROCm (SDMA copy engines).")
             chunks = 1
-            if overlap == "chunked":
+            if overlap in ("chunked", "sdma"):
                 raw_chunks = envs.environment_variables["XDIT_TP_OVERLAP_CHUNKS"]()
                 if not raw_chunks.strip().isdigit() or int(raw_chunks) < 2:
                     raise ValueError(f"XDIT_TP_OVERLAP_CHUNKS must be an integer >= 2; got {raw_chunks!r}.")

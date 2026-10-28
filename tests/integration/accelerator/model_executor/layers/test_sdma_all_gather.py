@@ -1,7 +1,9 @@
-"""The SDMA all-gather + GEMM matches an RCCL all-gather followed by the same GEMM.
+"""The SDMA all-gather + GEMM matches the GEMM over the whole gathered input.
 
-Each rank's rows are distinct, so a peer shard copied to the wrong place, left
-unwritten, or read before the peer filled it shows up in the output. Each case
+Each rank holds its block-cyclic rows of one global input, as under chunked
+overlap, and the op returns the GEMM over all rows in natural order. Rows
+differ across ranks and pieces, so a piece copied to the wrong place, left
+unwritten, or read before its peer filled it shows up in the output. Each case
 runs more calls than the transport has signal slots, with fresh inputs, so a
 reused slot that gates or flags the wrong call fails too.
 """
@@ -15,11 +17,11 @@ pytestmark = [pytest.mark.multi_gpu, pytest.mark.rocm]
 
 ROWS, FEATURES, OUT_FEATURES = 256, 1024, 512
 CALLS = 6
-# bf16 inputs; the consumers' GEMMs and the reference differ only in accumulation order.
+# bf16 inputs; the per-piece GEMMs and the reference differ only in accumulation order.
 TOLERANCE = 1e-2
 
 
-def _worker(rank, world_size, init_method, consumer, trigger, bias):
+def _worker(rank, world_size, init_method, chunks, trigger, plan, bias):
     import torch.distributed as dist
 
     from xfuser.model_executor.layers.sdma_all_gather import sdma_all_gather_linear
@@ -32,14 +34,17 @@ def _worker(rank, world_size, init_method, consumer, trigger, bias):
         generator = torch.Generator().manual_seed(0)
         weight = torch.randn(OUT_FEATURES, FEATURES, generator=generator).to(device, torch.bfloat16)
         b = torch.randn(OUT_FEATURES, generator=generator).to(device, torch.bfloat16) if bias else None
+        block = ROWS // chunks
         for call in range(CALLS):
-            local = torch.randn(1, ROWS, FEATURES, generator=torch.Generator().manual_seed(100 * call + rank))
-            local = (local + rank).to(device, torch.bfloat16)
-            gathered = torch.empty(world_size * ROWS, FEATURES, dtype=torch.bfloat16, device=device)
-            dist.all_gather_into_tensor(gathered, local[0])
-            expected = torch.nn.functional.linear(gathered, weight, b).float()
+            # The same global rows on every rank, each row offset by its block so misplaced pieces show.
+            full = torch.randn(world_size * ROWS, FEATURES, generator=torch.Generator().manual_seed(100 + call))
+            full += torch.arange(world_size * chunks).repeat_interleave(block)[:, None]
+            full = full.to(device, torch.bfloat16)
+            # Blocks rank, world + rank, ... of world * chunks: this rank's block-cyclic rows.
+            local = full.view(chunks, world_size, block, FEATURES)[:, rank].reshape(1, ROWS, FEATURES)
+            expected = torch.nn.functional.linear(full, weight, b).float()
 
-            actual = sdma_all_gather_linear(local, weight, b, group_name, consumer, trigger)[0].float()
+            actual = sdma_all_gather_linear(local, weight, b, group_name, chunks, trigger, plan)[0].float()
 
             assert actual.shape == expected.shape
             error = ((actual - expected).norm() / expected.norm()).item()
@@ -49,12 +54,14 @@ def _worker(rank, world_size, init_method, consumer, trigger, bias):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("bias", [False, True], ids=["no-bias", "bias"])
+@pytest.mark.parametrize("plan", ["fixed", "pairfree"])
 @pytest.mark.parametrize("trigger", ["gpu", "host"])
-@pytest.mark.parametrize("consumer", ["async_mm", "per_peer"])
+@pytest.mark.parametrize("chunks", [1, 2, 4])
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_sdma_all_gather_linear_matches_rccl(tmp_path, world_size, consumer, trigger, bias):
+def test_sdma_all_gather_linear_matches_full_gemm(tmp_path, world_size, chunks, trigger, plan):
     if torch.version.hip is None:
         pytest.skip("SDMA copy engines need ROCm")
+    # The bias goes into every piece's GEMM; one piece checks the plain GEMM.
+    bias = chunks > 1
 
-    spawn_accelerator_ranks(_worker, tmp_path, world_size=world_size, timeout=600, args=(consumer, trigger, bias))
+    spawn_accelerator_ranks(_worker, tmp_path, world_size=world_size, timeout=300, args=(chunks, trigger, plan, bias))
