@@ -2,9 +2,10 @@
 //
 // Each peer's shard is copied by its own SDMA engine, all peers at once, in pieces queued in
 // order on that engine. Each copy names the local GPU on both sides: the peer's
-// symmetric-memory buffer is mapped in this process for the local GPU only. A 4-byte copy on
-// the same engine, dependent on each piece, then sets that piece's flag, which the compute
-// stream waits on before the piece's GEMM. The data copies depend on a trigger signal that a
+// symmetric-memory buffer is mapped in this process for the local GPU only. Once piece c of
+// every peer has landed, a 4-byte copy on a spare engine, dependent on all of them, sets piece
+// c's flag, which the compute stream waits on before the piece's GEMM. The spare engine keeps
+// that wait from holding up the peers' later pieces. The data copies depend on a trigger signal that a
 // one-thread kernel releases on the compute stream after the symmetric-memory barrier, so no
 // copy starts before every peer's shard is in place.
 //
@@ -27,9 +28,10 @@ struct Gpu {
 struct Slot {
   hsa_signal_t trigger;
   volatile hsa_signal_value_t* trigger_value;
-  std::vector<hsa_signal_t> data;  // one per copy of a call
-  std::vector<hsa_signal_t> flag;
-  int armed = 0;  // copies the last call on this slot made
+  std::vector<hsa_signal_t> data;  // one per data copy of a call
+  std::vector<hsa_signal_t> flag;  // one per piece
+  int armed_data = 0;              // what the last call on this slot used
+  int armed_flags = 0;
 };
 
 std::vector<Gpu> g_gpus;
@@ -77,8 +79,6 @@ int lowest(uint32_t mask) {
   return -1;
 }
 
-uint32_t pair_of(uint32_t mask) { return ((mask & 0x55555555u) << 1) | ((mask & 0xAAAAAAAAu) >> 1); }
-
 __global__ void release_trigger(hsa_signal_value_t* value) {
   __hip_atomic_store(value, (hsa_signal_value_t)0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
@@ -110,12 +110,11 @@ int sag_init(int local_dev, int max_copies, int slots) {
   return 0;
 }
 
-// One SDMA engine (bit index) per peer for copies into `local_dev`.
-//   mode 0 (fixed): ROCr's preferred engine for that link; a peer whose preferred engine is
-//     taken gets the lowest available engine no peer prefers (then any free one).
-//   mode 1 (pairfree): the same, but no two peers use engines 2k and 2k+1, which may share
-//     bandwidth; falls back to mode 0's choice when no such engine is left.
-int sag_engine_plan(int local_dev, const int* peer_devs, int n, int mode, int* engines) {
+// One SDMA engine (bit index) per peer for copies into `local_dev`, in engines[0..n-1]: ROCr's
+// preferred engine for that link; a peer whose preferred engine is taken gets the lowest
+// available engine no peer prefers (then any free one). engines[n] is a spare engine, used by
+// no peer, for the flag copies.
+int sag_engine_plan(int local_dev, const int* peer_devs, int n, int* engines) {
   hsa_agent_t local, peer;
   if (agent_of(local_dev, &local)) return -1;
   std::vector<uint32_t> avail(n), preferred(n, 0);
@@ -125,15 +124,15 @@ int sag_engine_plan(int local_dev, const int* peer_devs, int n, int mode, int* e
     uint32_t mask = 0;
     if (hsa_amd_memory_get_preferred_copy_engine(local, peer, &mask) == HSA_STATUS_SUCCESS) preferred[i] = mask;
   }
-  uint32_t used = 0, wanted = 0;
+  uint32_t used = 0, wanted = 0, everywhere = ~0u;
   for (int i = 0; i < n; ++i) {
     engines[i] = lowest(preferred[i] & avail[i]);
     if (engines[i] >= 0) wanted |= 1u << engines[i];
+    everywhere &= avail[i];
   }
   for (int i = 0; i < n; ++i) {
     uint32_t bit = engines[i] >= 0 ? 1u << engines[i] : 0;
-    uint32_t blocked = used | (mode == 1 ? pair_of(used) : 0);
-    if (bit && !(blocked & bit)) {
+    if (bit && !(used & bit)) {
       used |= bit;
       continue;
     }
@@ -141,32 +140,34 @@ int sag_engine_plan(int local_dev, const int* peer_devs, int n, int mode, int* e
   }
   for (int i = 0; i < n; ++i) {
     if (engines[i] >= 0) continue;
-    int e = -1;
-    if (mode == 1) e = lowest(avail[i] & ~used & ~pair_of(used) & ~wanted & ~pair_of(wanted));
-    if (e < 0) e = lowest(avail[i] & ~used & ~wanted);
+    int e = lowest(avail[i] & ~used & ~wanted);
     if (e < 0) e = lowest(avail[i] & ~used);
     if (e < 0) return -4;
     engines[i] = e;
     used |= 1u << e;
   }
-  return 0;
+  // The flag copies name the local GPU on both sides, like the data copies; any engine that
+  // every link offers will do, preferably one no peer uses.
+  engines[n] = lowest(everywhere & ~used);
+  if (engines[n] < 0) engines[n] = lowest(everywhere);
+  return engines[n] < 0 ? -5 : 0;
 }
 
-// Arms `slot` for a call of `n` copies: waits for the copies of its previous use to finish
-// and sets the trigger and the `n` copies' signals to 1. Call before sag_release and sag_issue.
-int sag_arm(int slot, int n) {
+// Arms `slot` for a call of `n_data` data copies in `n_flags` pieces: waits for the copies of
+// its previous use to finish and sets the trigger and the signals the call will use to 1.
+// Call before sag_release and sag_issue.
+int sag_arm(int slot, int n_data, int n_flags) {
   Slot& s = g_slots[slot];
-  if (n > (int)s.data.size()) return -1;
-  for (int i = 0; i < s.armed; ++i) {
-    if (!wait_done(s.data[i])) return -1000 - i;  // copy i's data never landed
-    if (!wait_done(s.flag[i])) return -2000 - i;  // copy i's flag never landed
-  }
+  if (n_data > (int)s.data.size() || n_flags > (int)s.flag.size()) return -1;
+  for (int i = 0; i < s.armed_data; ++i)
+    if (!wait_done(s.data[i])) return -1000 - i;  // data copy i never landed
+  for (int i = 0; i < s.armed_flags; ++i)
+    if (!wait_done(s.flag[i])) return -2000 - i;  // piece i's flag never landed
   hsa_signal_store_relaxed(s.trigger, 1);
-  for (int i = 0; i < n; ++i) {
-    hsa_signal_store_relaxed(s.data[i], 1);
-    hsa_signal_store_relaxed(s.flag[i], 1);
-  }
-  s.armed = n;
+  for (int i = 0; i < n_data; ++i) hsa_signal_store_relaxed(s.data[i], 1);
+  for (int i = 0; i < n_flags; ++i) hsa_signal_store_relaxed(s.flag[i], 1);
+  s.armed_data = n_data;
+  s.armed_flags = n_flags;
   return 0;
 }
 
@@ -184,25 +185,25 @@ int sag_open(int slot) {
   return 0;
 }
 
-// Copies i = 0..n-1 of the call, using the slot's signals first + i: `bytes` from src[i] to
-// dst[i] on SDMA engine engines[i] once the slot's trigger is released, then the 4 bytes at
-// `one` to flags + 4 * flag_index[i]. Copies on one engine run in the order issued.
-int sag_issue(int slot, int first, const uint64_t* dst, const uint64_t* src, uint64_t bytes, const int* engines,
-              const int* flag_index, int n, uint64_t flags, uint64_t one) {
+// Piece `piece` of the call: n data copies, using the slot's data signals piece * n + i, each
+// `bytes` from src[i] to dst[i] on SDMA engine engines[i] once the slot's trigger is released
+// (copies on one engine run in the order issued); then, on engine engines[n] and once all n
+// have landed, the 4 bytes at `one` to `flag`.
+int sag_issue(int slot, int piece, const uint64_t* dst, const uint64_t* src, uint64_t bytes, const int* engines,
+              int n, uint64_t flag, uint64_t one) {
   Slot& s = g_slots[slot];
-  if (first + n > s.armed) return -1;
+  int first = piece * n;
+  if (first + n > s.armed_data || piece >= s.armed_flags) return -1;
   for (int i = 0; i < n; ++i) {
     hsa_amd_sdma_engine_id_t engine = (hsa_amd_sdma_engine_id_t)(1u << engines[i]);
-    hsa_signal_t& data = s.data[first + i];
     hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)dst[i], g_local, (const void*)src[i], g_local,
-                                                          bytes, 1, &s.trigger, data, engine, true);
+                                                          bytes, 1, &s.trigger, s.data[first + i], engine, true);
     if (st != HSA_STATUS_SUCCESS) return -100 - (int)st;
-    st = hsa_amd_memory_async_copy_on_engine((void*)(flags + 4 * (uint64_t)flag_index[i]), g_local,
-                                             (const void*)one, g_local, 4, 1, &data, s.flag[first + i], engine,
-                                             true);
-    if (st != HSA_STATUS_SUCCESS) return -200 - (int)st;
   }
-  return 0;
+  hsa_status_t st = hsa_amd_memory_async_copy_on_engine(
+      (void*)flag, g_local, (const void*)one, g_local, 4, n, &s.data[first], s.flag[piece],
+      (hsa_amd_sdma_engine_id_t)(1u << engines[n]), true);
+  return st == HSA_STATUS_SUCCESS ? 0 : -200 - (int)st;
 }
 
 // Enqueues a wait on `stream` until the 32-bit value at `ptr` equals `value`.

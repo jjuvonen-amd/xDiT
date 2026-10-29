@@ -140,7 +140,6 @@ def tp_column_parallel(
                 get_tp_group().device_group.group_name,
                 chunks,
                 envs.environment_variables["XDIT_TP_SDMA_TRIGGER"]().strip().lower(),
-                envs.environment_variables["XDIT_TP_SDMA_ENGINES"]().strip().lower(),
             )
     if fused:
         with record_function(f"tp_ag:{site}"):

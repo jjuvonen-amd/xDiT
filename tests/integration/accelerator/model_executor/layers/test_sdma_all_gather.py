@@ -21,7 +21,7 @@ CALLS = 6
 TOLERANCE = 1e-2
 
 
-def _worker(rank, world_size, init_method, chunks, trigger, plan, bias):
+def _worker(rank, world_size, init_method, chunks, trigger, bias):
     import torch.distributed as dist
 
     from xfuser.model_executor.layers.sdma_all_gather import sdma_all_gather_linear
@@ -44,7 +44,7 @@ def _worker(rank, world_size, init_method, chunks, trigger, plan, bias):
             local = full.view(chunks, world_size, block, FEATURES)[:, rank].reshape(1, ROWS, FEATURES)
             expected = torch.nn.functional.linear(full, weight, b).float()
 
-            actual = sdma_all_gather_linear(local, weight, b, group_name, chunks, trigger, plan)[0].float()
+            actual = sdma_all_gather_linear(local, weight, b, group_name, chunks, trigger)[0].float()
 
             assert actual.shape == expected.shape
             error = ((actual - expected).norm() / expected.norm()).item()
@@ -54,14 +54,13 @@ def _worker(rank, world_size, init_method, chunks, trigger, plan, bias):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("plan", ["fixed", "pairfree"])
 @pytest.mark.parametrize("trigger", ["gpu", "host"])
 @pytest.mark.parametrize("chunks", [1, 2, 4])
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_sdma_all_gather_linear_matches_full_gemm(tmp_path, world_size, chunks, trigger, plan):
+def test_sdma_all_gather_linear_matches_full_gemm(tmp_path, world_size, chunks, trigger):
     if torch.version.hip is None:
         pytest.skip("SDMA copy engines need ROCm")
     # The bias goes into every piece's GEMM; one piece checks the plain GEMM.
     bias = chunks > 1
 
-    spawn_accelerator_ranks(_worker, tmp_path, world_size=world_size, timeout=300, args=(chunks, trigger, plan, bias))
+    spawn_accelerator_ranks(_worker, tmp_path, world_size=world_size, timeout=300, args=(chunks, trigger, bias))

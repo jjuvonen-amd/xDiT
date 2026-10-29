@@ -76,10 +76,8 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_TP_COMM_OVERLAP": lambda: os.environ.get("XDIT_TP_COMM_OVERLAP", "none"),
     "XDIT_TP_OVERLAP_CHUNKS": lambda: os.environ.get("XDIT_TP_OVERLAP_CHUNKS", "4"),
     # For sdma: what releases the copies (gpu: a kernel after the symmetric-memory barrier; host:
-    # the host, after waiting for it), and the engine plan (fixed: ROCr's preferred engine per
-    # peer, clashes moved; pairfree: also no two peers on engines 2k and 2k+1).
+    # the host, after waiting for it).
     "XDIT_TP_SDMA_TRIGGER": lambda: os.environ.get("XDIT_TP_SDMA_TRIGGER", "gpu"),
-    "XDIT_TP_SDMA_ENGINES": lambda: os.environ.get("XDIT_TP_SDMA_ENGINES", "fixed"),
 }
 
 
