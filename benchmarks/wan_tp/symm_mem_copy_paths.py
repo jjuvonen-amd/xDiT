@@ -21,6 +21,8 @@ at once (an all-gather's traffic), through each path:
                  the local GPU's engines, so a shared engine runs its copies in turn
   hsa_local_sdma_pairfree  the same, also keeping peers off both engines of a pair
                  2k/2k+1, in case such a pair shares bandwidth
+  hsa_local_sdma_push      the fixed engines writing instead: each rank copies its buffer
+                 into every peer's symmetric-memory inbox (push, not pull)
   hsa_local_sdma_distinct  one distinct available engine per peer (lowest first)
   hsa_local_sdma_distinct_rev  the same engines, issued in reverse order: tells a
                  slow engine from a slow issue position
@@ -65,10 +67,10 @@ def parse_args():
     p.add_argument(
         "--paths",
         default="torch,hip_default,hip_d2d,hsa_local,hsa_local_sdma,hsa_local_sdma_fixed,hsa_local_sdma_pairfree,"
-        "hsa_local_sdma_distinct,hsa_local_sdma_distinct_rev,hsa_local_sdma_split",
+        "hsa_local_sdma_push,hsa_local_sdma_distinct,hsa_local_sdma_distinct_rev,hsa_local_sdma_split",
         type=lambda s: s.split(","),
         help="comma list of: torch, hip_default, hip_d2d, hsa_local, hsa_local_sdma, hsa_local_sdma_fixed, "
-        "hsa_local_sdma_pairfree, hsa_local_sdma_distinct, hsa_local_sdma_distinct_rev, hsa_local_sdma_split, hip_peer, hsa_peer "
+        "hsa_local_sdma_pairfree, hsa_local_sdma_push, hsa_local_sdma_distinct, hsa_local_sdma_distinct_rev, hsa_local_sdma_split, hip_peer, hsa_peer "
         "(the last two name the peer GPU and can fault; run them alone)",
     )
     return p.parse_args()
@@ -213,6 +215,10 @@ def main():
     peers = [(rank + step) % world for step in range(1, world)]
     remote = {p: handle.get_buffer(p, (numel,), torch.bfloat16) for p in peers}
     dst = torch.empty(len(peers), numel, dtype=torch.bfloat16, device="cuda")
+    # For the push paths: rank r writes its buffer into row r of every peer's `inbox`.
+    inbox = symm_mem.empty(world, numel, dtype=torch.bfloat16, device="cuda")
+    inbox_handle = symm_mem.rendezvous(inbox, dist.group.WORLD.group_name)
+    peer_inbox = {p: inbox_handle.get_buffer(p, (world, numel), torch.bfloat16) for p in peers}
     streams = [torch.cuda.Stream() for _ in peers]
     torch.cuda.synchronize()
     dist.barrier()
@@ -274,6 +280,20 @@ def main():
         n = issue_sdma(lib, local_rank, dst_ptrs, src_ptrs, nbytes, plans[plan], order)
         check(lib.sch_hsa_wait(n), "hsa wait")
 
+    push_dst = [peer_inbox[p][rank].data_ptr() for p in peers]
+
+    def hsa_push_sdma(count, plan):
+        # Writes instead of reads: the local engines copy this rank's buffer into the peers'
+        # inboxes. Done when this rank's own copies are; the slowest rank sets the time.
+        n = issue_sdma(lib, local_rank, push_dst, [src.data_ptr()] * len(peers), nbytes, plans[plan], range(count))
+        check(lib.sch_hsa_wait(n), "hsa wait")
+
+    def pushed_ok(count):
+        # Rank r pushes to its first `count` peers, r + 1 onward, so this rank hears from rank - 1 back.
+        dist.barrier()
+        torch.cuda.synchronize()
+        return all(bool((inbox[(rank - step) % world] == (rank - step) % world).all()) for step in range(1, count + 1))
+
     all_paths = {
         "torch": ("torch copy_", torch_copy),
         "hip_default": ("hipMemcpyAsync, kind Default", lambda c: hip_copy(c, HIP_MEMCPY_DEFAULT)),
@@ -290,6 +310,11 @@ def main():
         "hsa_local_sdma_pairfree": (
             "ROCr copy on preferred SDMA engine, clashes moved, no engine pair 2k/2k+1 shared",
             lambda c: hsa_copy_sdma(c, "pairfree"),
+        ),
+        "hsa_local_sdma_push": (
+            "ROCr copy on preferred SDMA engine, clashes moved, pushed to the peers (writes)",
+            lambda c: hsa_push_sdma(c, "fixed"),
+            pushed_ok,
         ),
         "hsa_local_sdma_distinct": (
             "ROCr copy on one distinct SDMA engine per peer, src agent = local GPU",
@@ -312,16 +337,22 @@ def main():
     if unknown:
         raise SystemExit(f"unknown --paths {sorted(unknown)}; choose from {sorted(all_paths)}")
     rows = []
+
+    def read_ok(count):
+        return all(bool((dst[i] == peers[i]).all()) for i in range(count))
+
     for key in args.paths:
-        name, fn = all_paths[key]
+        name, fn, verify = (*all_paths[key], read_ok)[:3]
         for count in (1, len(peers)):
             if rank == 0:
                 print(f"running: {name}, {count} peer(s)", flush=True)
             dst.zero_()
+            inbox.zero_()
             torch.cuda.synchronize()
+            dist.barrier()
             try:
                 fn(count)
-                ok = all(bool((dst[i] == peers[i]).all()) for i in range(count))
+                ok = verify(count)
                 ms = timed(lambda: fn(count), args.warmup, args.iters)
                 err = ""
             except RuntimeError as e:

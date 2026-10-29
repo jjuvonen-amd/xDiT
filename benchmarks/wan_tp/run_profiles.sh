@@ -19,7 +19,7 @@
 #   STEPS       denoising steps per profiled iteration (default 4; both experts run)
 #   ATTN        --attention_backend, e.g. FLASH_4 or CUDNN (default: the model's)
 #   CHUNKS      XDIT_TP_OVERLAP_CHUNKS for _ov configs (default 4)
-#   XDIT_TP_SDMA_TRIGGER, XDIT_TP_SDMA_ENGINES  passed through for _sdma configs (which use CHUNKS too)
+#   XDIT_TP_SDMA_TRIGGER  passed through for _sdma configs (which use CHUNKS too)
 #   PROFILE     1 to profile one iteration after one warmup (default), 0 for a warmed-up timed run
 #   EXTRA_ARGS  appended to every xdit command line
 #

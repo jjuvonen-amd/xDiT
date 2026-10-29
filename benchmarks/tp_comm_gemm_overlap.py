@@ -62,7 +62,6 @@ def _parse_args():
     parser.add_argument("--symm-mem", action="store_true", help="also time torch's fused symm_mem ops")
     parser.add_argument("--sdma", action="store_true", help="also time the SDMA all-gather + GEMM (ROCm)")
     parser.add_argument("--sdma-trigger", default="gpu", choices=["gpu", "host"])
-    parser.add_argument("--sdma-engines", default="fixed", choices=["fixed", "pairfree"])
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--output-dir", default="/output/fusion_bench")
@@ -119,9 +118,7 @@ class Bench:
         from xfuser.model_executor.layers.sdma_all_gather import sdma_all_gather_linear
 
         args = self.args
-        return sdma_all_gather_linear(
-            a_cyclic[None], weight, None, self.group_name, k, args.sdma_trigger, args.sdma_engines
-        )[0]
+        return sdma_all_gather_linear(a_cyclic[None], weight, None, self.group_name, k, args.sdma_trigger)[0]
 
     # ---- GEMM + reduce-scatter -----------------------------------------------------------------
     def rs_baseline(self, a_full, weight, out_buf):
@@ -241,7 +238,7 @@ def _report(bench, table):
         "",
         f"seq {bench.seq} ({bench.rows} rows/rank), hidden {args.hidden}, ffn {args.ffn}, bf16, "
         f"NCCL_MAX_NCHANNELS={channels}"
-        + (f", SDMA engines {args.sdma_engines}, trigger {args.sdma_trigger}" if args.sdma else "")
+        + (f", SDMA trigger {args.sdma_trigger}" if args.sdma else "")
         + f". Slowest rank's median ms over {args.iters} iterations.",
         "",
         "| site | " + " | ".join(columns) + " | best vs baseline |",
