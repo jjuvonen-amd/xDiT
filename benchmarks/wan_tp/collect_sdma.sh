@@ -74,16 +74,20 @@ fi
 step parity_tests python -m pytest -q -p no:cacheprovider \
   tests/integration/accelerator/model_executor/test_wan_tensor_parallel.py -k sdma
 
-# 3. Raw 7-peer SDMA bandwidth on torch's buffers: reads (pull, what the op does) vs writes (push).
+# 3. Raw 7-peer SDMA bandwidth on torch's buffers: reads (pull) vs writes (push), the latter on
+#    the read-preferred and on the write-preferred engines (what the op's push uses).
 gpu_check copy_direction
 step copy_direction torchrun --nproc_per_node 8 benchmarks/wan_tp/symm_mem_copy_paths.py \
-  --paths hsa_local_sdma_fixed,hsa_local_sdma_push --output-dir "$OUT/copy_direction"
+  --paths hsa_local_sdma_fixed,hsa_local_sdma_push,hsa_local_sdma_push_out --output-dir "$OUT/copy_direction"
 
 # 4. Per site at Wan2.2 TP8 widths, and 5. wider column-parallel GEMMs (AG sites), for 2, 4
-#    and 8 pieces next to chunked overlap with as many chunks.
+#    and 8 pieces next to chunked overlap with as many chunks; push (the default), and pull
+#    once for comparison.
 gpu_check fusion_bench_wan
 step fusion_bench_wan torchrun --nproc_per_node 8 benchmarks/tp_comm_gemm_overlap.py --sdma \
   --sdma-trigger "$XDIT_TP_SDMA_TRIGGER" --chunks 2 4 8 --output-dir "$OUT/fusion_bench_wan"
+step fusion_bench_wan_pull torchrun --nproc_per_node 8 benchmarks/tp_comm_gemm_overlap.py --sdma \
+  --sdma-direction pull --sdma-trigger "$XDIT_TP_SDMA_TRIGGER" --chunks 2 4 8 --output-dir "$OUT/fusion_bench_wan_pull"
 for shape in 5120:27648 5120:55296 8192:57344; do
   h=${shape%:*} f=${shape#*:}
   gpu_check "sweep_h${h}_f${f}"
