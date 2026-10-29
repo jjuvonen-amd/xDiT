@@ -76,8 +76,10 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_TP_COMM_OVERLAP": lambda: os.environ.get("XDIT_TP_COMM_OVERLAP", "none"),
     "XDIT_TP_OVERLAP_CHUNKS": lambda: os.environ.get("XDIT_TP_OVERLAP_CHUNKS", "4"),
     # For sdma: what releases the copies (gpu: a kernel after the symmetric-memory barrier; host:
-    # the host, after waiting for it).
+    # the host, after waiting for it), and which way they move (push: each rank writes its pieces
+    # into its peers; pull: each rank reads its peers' pieces).
     "XDIT_TP_SDMA_TRIGGER": lambda: os.environ.get("XDIT_TP_SDMA_TRIGGER", "gpu"),
+    "XDIT_TP_SDMA_DIRECTION": lambda: os.environ.get("XDIT_TP_SDMA_DIRECTION", "push"),
 }
 
 
