@@ -21,7 +21,7 @@ CALLS = 6
 TOLERANCE = 1e-2
 
 
-def _worker(rank, world_size, init_method, chunks, trigger, direction, bias):
+def _worker(rank, world_size, init_method, chunks, trigger, direction, bias, batch=1):
     import torch.distributed as dist
 
     from xfuser.model_executor.layers.sdma_all_gather import sdma_all_gather_linear
@@ -37,14 +37,16 @@ def _worker(rank, world_size, init_method, chunks, trigger, direction, bias):
         block = ROWS // chunks
         for call in range(CALLS):
             # The same global rows on every rank, each row offset by its block so misplaced pieces show.
-            full = torch.randn(world_size * ROWS, FEATURES, generator=torch.Generator().manual_seed(100 + call))
+            gen = torch.Generator().manual_seed(100 + call)
+            full = torch.randn(batch, world_size * ROWS, FEATURES, generator=gen)
             full += torch.arange(world_size * chunks).repeat_interleave(block)[:, None]
+            full += 100 * torch.arange(batch)[:, None, None]
             full = full.to(device, torch.bfloat16)
             # Blocks rank, world + rank, ... of world * chunks: this rank's block-cyclic rows.
-            local = full.view(chunks, world_size, block, FEATURES)[:, rank].reshape(1, ROWS, FEATURES)
+            local = full.view(batch, chunks, world_size, block, FEATURES)[:, :, rank].reshape(batch, ROWS, FEATURES)
             expected = torch.nn.functional.linear(full, weight, b).float()
 
-            actual = sdma_all_gather_linear(local, weight, b, group_name, chunks, trigger, direction)[0].float()
+            actual = sdma_all_gather_linear(local, weight, b, group_name, chunks, trigger, direction).float()
 
             assert actual.shape == expected.shape
             error = ((actual - expected).norm() / expected.norm()).item()
@@ -69,10 +71,59 @@ def test_sdma_all_gather_linear_matches_full_gemm(tmp_path, world_size, chunks, 
     )
 
 
+@pytest.mark.parametrize("direction", ["push", "pull"])
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_sdma_all_gather_linear_batch_of_two(tmp_path, world_size, direction):
+    """Two batch items: every item's piece moves with the others, and the output keeps them apart."""
+    if torch.version.hip is None:
+        pytest.skip("SDMA copy engines need ROCm")
+
+    spawn_accelerator_ranks(_worker, tmp_path, world_size=world_size, timeout=300, args=(2, "gpu", direction, True, 2))
+
+
+def _two_groups_worker(rank, world_size, init_method):
+    import torch.distributed as dist
+
+    from xfuser.model_executor.layers.sdma_all_gather import sdma_all_gather_linear
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", init_method=init_method, rank=rank, world_size=world_size, device_id=device)
+    try:
+        pairs = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+        pair = pairs[rank // 2]
+        weight = torch.randn(OUT_FEATURES, FEATURES, generator=torch.Generator().manual_seed(0)).to(
+            device, torch.bfloat16
+        )
+        # The TP4 group first, so the TP2 groups come second; then alternate.
+        for call, (group, size, index) in enumerate([(dist.group.WORLD, 4, rank), (pair, 2, rank % 2)] * 3):
+            full = torch.randn(1, size * ROWS, FEATURES, generator=torch.Generator().manual_seed(call))
+            full = (full + torch.arange(size * 2).repeat_interleave(ROWS // 2)[:, None]).to(device, torch.bfloat16)
+            local = full.view(1, 2, size, ROWS // 2, FEATURES)[:, :, index].reshape(1, ROWS, FEATURES)
+            expected = torch.nn.functional.linear(full, weight).float()
+
+            actual = sdma_all_gather_linear(local, weight, None, group.group_name, 2, "gpu", "push").float()
+
+            error = ((actual - expected).norm() / expected.norm()).item()
+            assert error <= TOLERANCE, f"call {call} on a group of {size}: relative error {error:.3e}"
+        torch.cuda.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sdma_all_gather_linear_on_two_group_sizes(tmp_path):
+    """Calls alternate between a TP4 group and two TP2 groups in the same processes."""
+    if torch.version.hip is None:
+        pytest.skip("SDMA copy engines need ROCm")
+
+    spawn_accelerator_ranks(_two_groups_worker, tmp_path, world_size=4, timeout=300)
+
+
 def _lost_flag_worker(rank, world_size, init_method):
     import os
 
     os.environ["XDIT_TP_SDMA_WAIT_S"] = "2"
+    os.environ["XDIT_TP_SDMA_ON_TIMEOUT"] = "raise"
     import time
 
     import torch.distributed as dist
@@ -115,3 +166,53 @@ def test_lost_flag_gives_up_and_is_reported_instead_of_hanging(tmp_path):
         pytest.skip("SDMA copy engines need ROCm")
 
     spawn_accelerator_ranks(_lost_flag_worker, tmp_path, world_size=2, timeout=300)
+
+
+def _abort_worker(rank, world_size, init_method):
+    import os
+
+    os.environ["XDIT_TP_SDMA_WAIT_S"] = "2"
+    os.environ["XDIT_TP_SDMA_ON_TIMEOUT"] = "abort"
+    import torch.distributed as dist
+
+    from xfuser.model_executor.layers import sdma_all_gather as sdma
+
+    os.environ["RANK"], os.environ["LOCAL_RANK"], os.environ["WORLD_SIZE"] = str(rank), str(rank), str(world_size)
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", init_method=init_method, rank=rank, world_size=world_size, device_id=device)
+    group_name = dist.group.WORLD.group_name
+    weight = torch.randn(OUT_FEATURES, FEATURES, device=device, dtype=torch.bfloat16)
+    local = torch.randn(1, ROWS, FEATURES, device=device, dtype=torch.bfloat16)
+    sdma.sdma_all_gather_linear(local, weight, None, group_name, 2, "gpu", "push")
+    torch.cuda.synchronize()
+    if rank == 0:
+        sdma.debug_drop_flag(1, 0)
+    sdma.sdma_all_gather_linear(local, weight, None, group_name, 2, "gpu", "push")
+    # Rank 1's stream is held by its wait; its watchdog aborts the process during this synchronize.
+    torch.cuda.synchronize()
+
+
+def test_lost_flag_aborts_the_waiting_process(tmp_path):
+    """With XDIT_TP_SDMA_ON_TIMEOUT=abort, a flag that never lands aborts the rank waiting for it, never hangs it."""
+    import signal
+    import time
+
+    if torch.version.hip is None:
+        pytest.skip("SDMA copy engines need ROCm")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 accelerator devices")
+    context = torch.multiprocessing.get_context("spawn")
+    init_method = f"file://{tmp_path / 'dist-init'}"
+    processes = [context.Process(target=_abort_worker, args=(r, 2, init_method)) for r in range(2)]
+    for process in processes:
+        process.start()
+    start = time.monotonic()
+    processes[1].join(240)
+    elapsed = time.monotonic() - start
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+        process.join(10)
+    assert processes[1].exitcode == -signal.SIGABRT, f"rank 1 exit code {processes[1].exitcode}, expected SIGABRT"
+    assert elapsed < 240, "rank 1 did not abort"

@@ -86,6 +86,15 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # For sdma: on, the reduce-scatters too push their partial sums on SDMA engines and reduce
     # them chunk by chunk; off, they run as with chunked.
     "XDIT_TP_SDMA_REDUCE_SCATTER": lambda: os.environ.get("XDIT_TP_SDMA_REDUCE_SCATTER", "off"),
+    # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
+    # thread logs what was missing and aborts the process (no wrong output is used); raise: the
+    # stream moves on (that call's output is wrong) and the next SDMA call raises.
+    "XDIT_TP_SDMA_ON_TIMEOUT": lambda: os.environ.get("XDIT_TP_SDMA_ON_TIMEOUT", "abort"),
+    # For sdma: run on a GPU architecture it has not been validated on (see sdma_all_gather.py).
+    "XDIT_TP_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_TP_SDMA_ALLOW_UNTESTED", "0"),
+    # For sdma: a prebuilt transport library (python -m xfuser.model_executor.layers.sdma_all_gather
+    # build); unset, it is built with hipcc on first use and cached.
+    "XDIT_SDMA_LIB": lambda: os.environ.get("XDIT_SDMA_LIB", ""),
 }
 
 

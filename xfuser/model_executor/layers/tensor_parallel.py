@@ -175,11 +175,7 @@ def tp_row_parallel(
             )
     elif chunks == 1:
         out = tp_reduce_scatter_seq(linear(x), site)
-    elif (
-        fused == "sdma"
-        and x.shape[0] == 1
-        and envs.environment_variables["XDIT_TP_SDMA_REDUCE_SCATTER"]().strip().lower() == "on"
-    ):
+    elif fused == "sdma" and envs.environment_variables["XDIT_TP_SDMA_REDUCE_SCATTER"]().strip().lower() == "on":
         group = get_tp_group()
         with record_function(f"tp_rs:{site}"):
             out = torch.ops.xfuser.tp_sdma_linear_reduce_scatter(

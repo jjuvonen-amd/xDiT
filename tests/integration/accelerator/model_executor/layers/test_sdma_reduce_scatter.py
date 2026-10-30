@@ -21,7 +21,7 @@ CALLS = 6
 TOLERANCE = 1e-2
 
 
-def _worker(rank, world_size, init_method, chunks, trigger):
+def _worker(rank, world_size, init_method, chunks, trigger, batch=1):
     import torch.distributed as dist
 
     from xfuser.model_executor.layers.sdma_all_gather import sdma_linear_reduce_scatter
@@ -34,14 +34,15 @@ def _worker(rank, world_size, init_method, chunks, trigger):
         rows = world_size * chunks * BLOCK_ROWS
         for call in range(CALLS):
             generator = torch.Generator().manual_seed(1000 * call + rank)
-            x = torch.randn(1, rows, FEATURES, generator=generator).to(device, torch.bfloat16)
+            x = torch.randn(batch, rows, FEATURES, generator=generator).to(device, torch.bfloat16)
             weight = torch.randn(OUT_FEATURES, FEATURES, generator=generator).to(device, torch.bfloat16)
-            full = (x[0].float() @ weight.float().t()).contiguous()
+            full = (x.float() @ weight.float().t()).contiguous()
             dist.all_reduce(full)
-            # This rank's blocks rank, world + rank, ... of world * chunks, stacked.
-            expected = full.view(chunks, world_size, BLOCK_ROWS, OUT_FEATURES)[:, rank].reshape(-1, OUT_FEATURES)
+            # This rank's blocks rank, world + rank, ... of world * chunks, stacked, per batch item.
+            expected = full.view(batch, chunks, world_size, BLOCK_ROWS, OUT_FEATURES)[:, :, rank]
+            expected = expected.reshape(batch, -1, OUT_FEATURES)
 
-            actual = sdma_linear_reduce_scatter(x, weight, group_name, chunks, trigger)[0].float()
+            actual = sdma_linear_reduce_scatter(x, weight, group_name, chunks, trigger).float()
 
             assert actual.shape == expected.shape
             error = ((actual - expected).norm() / expected.norm()).item()
@@ -61,10 +62,20 @@ def test_sdma_linear_reduce_scatter_matches_all_reduced_gemm(tmp_path, world_siz
     spawn_accelerator_ranks(_worker, tmp_path, world_size=world_size, timeout=300, args=(chunks, trigger))
 
 
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_sdma_linear_reduce_scatter_batch_of_two(tmp_path, world_size):
+    """Two batch items: every item's partial sums move with the others and are reduced apart."""
+    if torch.version.hip is None:
+        pytest.skip("SDMA copy engines need ROCm")
+
+    spawn_accelerator_ranks(_worker, tmp_path, world_size=world_size, timeout=300, args=(2, "gpu", 2))
+
+
 def _lost_flag_worker(rank, world_size, init_method):
     import os
 
     os.environ["XDIT_TP_SDMA_WAIT_S"] = "2"
+    os.environ["XDIT_TP_SDMA_ON_TIMEOUT"] = "raise"
     import torch.distributed as dist
 
     from xfuser.model_executor.layers import sdma_all_gather as sdma

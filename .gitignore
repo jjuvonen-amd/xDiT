@@ -11,3 +11,7 @@ xfuser.egg-info/
 xfuser/__version__.py
 dist/*
 *.mp4
+
+# SDMA transport built into the package (python -m xfuser.model_executor.layers.sdma_all_gather build)
+xfuser/model_executor/layers/libsdma_all_gather.so
+xfuser/model_executor/layers/libsdma_all_gather.so.source-sha1

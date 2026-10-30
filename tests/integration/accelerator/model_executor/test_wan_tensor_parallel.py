@@ -37,6 +37,9 @@ PADDED = (3, 2, 6)
 UNPADDED = (4, 16, 16)
 # (tensor parallel, ulysses, ring)
 MODES = {"tp2": (2, 1, 1), "tp4": (4, 1, 1), "tp2-ulysses2": (2, 2, 1), "tp2-ring2": (2, 1, 2)}
+# Eight GPUs, so only for the cases that ask for it: two TP4 groups next to ring attention (the tiny
+# model has too few heads for TP4 with Ulysses).
+WIDE_MODES = {"tp4-ring2": (4, 1, 2)}
 # Largest relative L2 error against one GPU, measured <= 3.2e-7 on MI350X. Q/K normalized over one
 # rank's heads errs by 2.5e-3 at TP 2, a dropped row-parallel FFN bias by 4.3e-3.
 TOLERANCE = 1e-5
@@ -132,7 +135,7 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
 
 
 def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=None, **extra):
-    tp, ulysses, ring = MODES[mode] if mode else (1, 1, 1)
+    tp, ulysses, ring = {**MODES, **WIDE_MODES}[mode] if mode else (1, 1, 1)
     output_path = directory / "output.pt"
     options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch, fused=fused, **extra)
     spawn_accelerator_ranks(
@@ -262,6 +265,30 @@ def test_tensor_parallel_with_sdma_all_gather_matches_one_gpu(
         latent_shape,
         cross_attention=cross_attention,
         chunks=chunks,
+        fused="sdma",
+        sdma_reduce_scatter=reduce_scatter == "sdma",
+    )
+
+    error = _relative_error(actual, expected)
+    assert error <= TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("reduce_scatter", ["chunked", "sdma"])
+@pytest.mark.parametrize("mode, batch", [("tp4-ring2", 1), ("tp2", 2)])
+def test_tensor_parallel_with_sdma_on_several_groups_and_batches(tmp_path, one_gpu_output, mode, batch, reduce_scatter):
+    """SDMA all-gathers (and reduce-scatters) with two TP4 groups next to ring attention on 8 GPUs, and with two samples."""
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip("SDMA copy engines need ROCm")
+    expected = one_gpu_output("wan", PADDED, batch=batch)
+
+    actual = _run(
+        tmp_path,
+        mode,
+        "wan",
+        PADDED,
+        chunks=2,
+        batch=batch,
         fused="sdma",
         sdma_reduce_scatter=reduce_scatter == "sdma",
     )
