@@ -57,7 +57,7 @@ def _worker(rank, world_size, init_method, chunks, trigger, direction, bias):
 @pytest.mark.parametrize("direction", ["push", "pull"])
 @pytest.mark.parametrize("trigger", ["gpu", "host"])
 @pytest.mark.parametrize("chunks", [1, 2, 4])
-@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_sdma_all_gather_linear_matches_full_gemm(tmp_path, world_size, chunks, trigger, direction):
     if torch.version.hip is None:
         pytest.skip("SDMA copy engines need ROCm")
@@ -67,3 +67,51 @@ def test_sdma_all_gather_linear_matches_full_gemm(tmp_path, world_size, chunks, 
     spawn_accelerator_ranks(
         _worker, tmp_path, world_size=world_size, timeout=300, args=(chunks, trigger, direction, bias)
     )
+
+
+def _lost_flag_worker(rank, world_size, init_method):
+    import os
+
+    os.environ["XDIT_TP_SDMA_WAIT_S"] = "2"
+    import time
+
+    import torch.distributed as dist
+
+    from xfuser.model_executor.layers import sdma_all_gather as sdma
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", init_method=init_method, rank=rank, world_size=world_size, device_id=device)
+    try:
+        group_name = dist.group.WORLD.group_name
+        weight = torch.randn(OUT_FEATURES, FEATURES, device=device, dtype=torch.bfloat16)
+        local = torch.randn(1, ROWS, FEATURES, device=device, dtype=torch.bfloat16)
+        sdma.sdma_all_gather_linear(local, weight, None, group_name, 2, "gpu", "push")
+        torch.cuda.synchronize()
+        sdma.raise_if_waits_gave_up(group_name)
+        if rank == 0:
+            # Rank 0's push of piece 1 to its first peer, rank 1, loses its flag.
+            sdma.debug_drop_flag(1, 0)
+        start = time.monotonic()
+        sdma.sdma_all_gather_linear(local, weight, None, group_name, 2, "gpu", "push")
+        torch.cuda.synchronize()
+        elapsed = time.monotonic() - start
+        dist.barrier()
+        if rank == 1:
+            assert 2 <= elapsed < 30, f"the call took {elapsed:.1f} s: its wait should give up after 2 s"
+            with pytest.raises(RuntimeError, match=r"piece 1, flag words \[0\] never set"):
+                sdma.raise_if_waits_gave_up(group_name)
+        else:
+            sdma.raise_if_waits_gave_up(group_name)
+        # Recorded once: the next check is clean.
+        sdma.raise_if_waits_gave_up(group_name)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_lost_flag_gives_up_and_is_reported_instead_of_hanging(tmp_path):
+    """A flag that never lands ends its wait after XDIT_TP_SDMA_WAIT_S and is reported, not a GPU hang."""
+    if torch.version.hip is None:
+        pytest.skip("SDMA copy engines need ROCm")
+
+    spawn_accelerator_ranks(_lost_flag_worker, tmp_path, world_size=2, timeout=300)

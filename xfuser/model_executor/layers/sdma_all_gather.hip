@@ -8,10 +8,12 @@
 //   on a spare engine, dependent on all of them, sets piece c's flag; the spare engine keeps
 //   that wait from holding up the peers' later pieces.
 // push (sag_issue_push): this rank writes its piece c into every peer's inbox; once each lands,
-//   a 1-byte write on the spare engine sets this rank's byte in that peer's flag word for piece
-//   c. The receiver waits for all its peers' bytes at once (sag_stream_wait_value64). On the
-//   data engines, a flag write that waits for its piece would stall the next piece behind it.
-// The compute stream waits for piece c's flag(s) before the piece's GEMM. The data copies depend on a trigger signal that a
+//   a 4-byte write on the spare engine sets this rank's own flag word for piece c at that peer
+//   (one word per sender, so no two engines write the same word). On the data engines, a flag
+//   write that waits for its piece would stall the next piece behind it.
+// The compute stream waits for piece c's flags with sag_wait_flags, a one-thread kernel whose
+// wait is bounded: a flag that never lands is recorded (sag_take_error) and the stream moves
+// on, instead of hanging the GPU. Every data copy also waits for a trigger signal that a
 // one-thread kernel releases on the compute stream after the symmetric-memory barrier, so no
 // copy starts before every peer's shard is in place.
 //
@@ -24,6 +26,14 @@
 #include <cstdint>
 #include <vector>
 
+// A bounded flag wait that ran out of time, written by sag_wait_flags into host-visible memory.
+struct SagError {
+  unsigned long long count;    // waits that timed out since the last sag_take_error
+  unsigned long long missing;  // first one: bit i set if flag word i never read 1
+  int piece;                   // first one: piece and call id it waited for
+  int call;
+};
+
 namespace {
 
 struct Gpu {
@@ -31,9 +41,11 @@ struct Gpu {
   uint32_t bus;
 };
 
+constexpr int kTriggers = 16;  // per slot: one per piece at most (the all-gather uses only the first)
+
 struct Slot {
-  hsa_signal_t trigger;
-  volatile hsa_signal_value_t* trigger_value;
+  hsa_signal_t trigger[kTriggers];
+  volatile hsa_signal_value_t* trigger_value[kTriggers];
   std::vector<hsa_signal_t> data;  // one per data copy of a call
   std::vector<hsa_signal_t> flag;  // one per piece
   int armed_data = 0;              // what the last call on this slot used
@@ -43,6 +55,10 @@ struct Slot {
 std::vector<Gpu> g_gpus;
 std::vector<Slot> g_slots;
 hsa_agent_t g_local;
+SagError* g_error = nullptr;       // host-mapped
+int* g_scratch = nullptr;          // device word that a dropped flag write goes to
+int g_drop_piece = -1, g_drop_index = -1;
+unsigned long long g_ticks_per_s = 0;
 
 hsa_status_t collect(hsa_agent_t agent, void*) {
   hsa_device_type_t type;
@@ -89,6 +105,29 @@ __global__ void release_trigger(hsa_signal_value_t* value) {
   __hip_atomic_store(value, (hsa_signal_value_t)0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+// Waits until all `count` words at `words` read 1 (acquire, system scope), or `budget` wall-clock
+// ticks have passed; then records which words were missing and returns.
+__global__ void wait_flags(const int* words, int count, unsigned long long budget, SagError* err, int piece,
+                           int call) {
+  unsigned long long start = wall_clock64();
+  while (true) {
+    unsigned long long missing = 0;
+    for (int i = 0; i < count; ++i)
+      if (__hip_atomic_load(words + i, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1) missing |= 1ull << i;
+    if (!missing) return;
+    if (wall_clock64() - start > budget) {
+      if (__hip_atomic_fetch_add(&err->count, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0) {
+        err->missing = missing;
+        err->piece = piece;
+        err->call = call;
+      }
+      __threadfence_system();
+      return;
+    }
+    __builtin_amdgcn_s_sleep(2);
+  }
+}
+
 }  // namespace
 
 extern "C" {
@@ -100,12 +139,21 @@ int sag_init(int local_dev, int max_copies, int slots) {
   if (hsa_init() != HSA_STATUS_SUCCESS) return -1;
   if (hsa_iterate_agents(collect, nullptr) != HSA_STATUS_SUCCESS) return -2;
   if (agent_of(local_dev, &g_local)) return -3;
+  if (hipHostMalloc((void**)&g_error, sizeof(SagError), hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess)
+    return -8;
+  *g_error = SagError{};
+  if (hipMalloc((void**)&g_scratch, 64) != hipSuccess) return -9;
+  int khz = 0;
+  if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, local_dev) != hipSuccess || khz <= 0) return -10;
+  g_ticks_per_s = (unsigned long long)khz * 1000ull;
   g_slots.resize(slots);
   for (Slot& s : g_slots) {
-    // The trigger is written by a kernel, so its value must be addressable: GPU-only signal.
-    if (hsa_amd_signal_create(0, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &s.trigger) != HSA_STATUS_SUCCESS)
-      return -4;
-    if (hsa_amd_signal_value_pointer(s.trigger, &s.trigger_value) != HSA_STATUS_SUCCESS) return -5;
+    // Triggers are written by a kernel, so their values must be addressable: GPU-only signals.
+    for (int k = 0; k < kTriggers; ++k) {
+      if (hsa_amd_signal_create(0, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &s.trigger[k]) != HSA_STATUS_SUCCESS)
+        return -4;
+      if (hsa_amd_signal_value_pointer(s.trigger[k], &s.trigger_value[k]) != HSA_STATUS_SUCCESS) return -5;
+    }
     s.data.resize(max_copies);
     s.flag.resize(max_copies);
     for (int i = 0; i < max_copies; ++i)
@@ -161,9 +209,9 @@ int sag_engine_plan(int local_dev, const int* peer_devs, int n, int push, int* e
   return engines[n] < 0 ? -5 : 0;
 }
 
-// Arms `slot` for a call of `n_data` data copies in `n_flags` pieces: waits for the copies of
-// its previous use to finish and sets the trigger and the signals the call will use to 1.
-// Call before sag_release and sag_issue.
+// Arms `slot` for a call of `n_data` data copies and `n_flags` flag copies: waits for the
+// copies of its previous use to finish and sets its triggers and the signals the call will use
+// to 1. Call before sag_release and sag_issue.
 int sag_arm(int slot, int n_data, int n_flags) {
   Slot& s = g_slots[slot];
   if (n_data > (int)s.data.size() || n_flags > (int)s.flag.size()) return -1;
@@ -171,7 +219,7 @@ int sag_arm(int slot, int n_data, int n_flags) {
     if (!wait_done(s.data[i])) return -1000 - i;  // data copy i never landed
   for (int i = 0; i < s.armed_flags; ++i)
     if (!wait_done(s.flag[i])) return -2000 - i;  // piece i's flag never landed
-  hsa_signal_store_relaxed(s.trigger, 1);
+  for (int k = 0; k < kTriggers; ++k) hsa_signal_store_relaxed(s.trigger[k], 1);
   for (int i = 0; i < n_data; ++i) hsa_signal_store_relaxed(s.data[i], 1);
   for (int i = 0; i < n_flags; ++i) hsa_signal_store_relaxed(s.flag[i], 1);
   s.armed_data = n_data;
@@ -179,35 +227,37 @@ int sag_arm(int slot, int n_data, int n_flags) {
   return 0;
 }
 
-// Enqueues the release of `slot`'s trigger on `stream`: copies gated on it start once the
+// Enqueues the release of `slot`'s trigger `k` on `stream`: copies gated on it start once the
 // stream reaches this point. Without it (host release), sag_open must be called instead.
-int sag_release(int slot, hipStream_t stream) {
+int sag_release(int slot, int k, hipStream_t stream) {
+  if (k < 0 || k >= kTriggers) return -2;
   hipLaunchKernelGGL(release_trigger, dim3(1), dim3(1), 0, stream,
-                     const_cast<hsa_signal_value_t*>(g_slots[slot].trigger_value));
+                     const_cast<hsa_signal_value_t*>(g_slots[slot].trigger_value[k]));
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-// Releases `slot`'s trigger from the host, for copies issued after the host waited for the barrier.
-int sag_open(int slot) {
-  hsa_signal_store_screlease(g_slots[slot].trigger, 0);
+// Releases `slot`'s trigger `k` from the host, for copies issued after the host waited for the
+// work they depend on.
+int sag_open(int slot, int k) {
+  if (k < 0 || k >= kTriggers) return -2;
+  hsa_signal_store_screlease(g_slots[slot].trigger[k], 0);
   return 0;
 }
 
-// Piece `piece` of the call: n data copies, using the slot's data signals piece * n + i, each
-// `bytes` from src[i] to dst[i] on SDMA engine engines[i] once the slot's trigger is released
+// Pull, piece `piece` of the call: n data copies, using the slot's data signals piece * n + i,
+// each `bytes` from src[i] to dst[i] on SDMA engine engines[i] once the slot's trigger k is released
 // (copies on one engine run in the order issued, so piece 0's copies must be issued first);
 // then, on engine engines[n] and once all n have landed, the 4 bytes at `one` to `flag`.
-int sag_issue(int slot, int piece, const uint64_t* dst, const uint64_t* src, uint64_t bytes, const int* engines,
-              int n, uint64_t flag, uint64_t one) {
+int sag_issue(int slot, int piece, int k, const uint64_t* dst, const uint64_t* src, uint64_t bytes,
+              const int* engines, int n, uint64_t flag, uint64_t one) {
   Slot& s = g_slots[slot];
   int first = piece * n;
-  if (first + n > s.armed_data || piece >= s.armed_flags) return -1;
-  // Later pieces queue behind piece 0 on each engine, so only piece 0 waits for the trigger.
-  int gate = piece == 0 ? 1 : 0;
+  if (first + n > s.armed_data || piece >= s.armed_flags || k < 0 || k >= kTriggers) return -1;
+  // Every piece waits for the trigger itself, rather than relying on queueing behind piece 0.
   for (int i = 0; i < n; ++i) {
     hsa_amd_sdma_engine_id_t engine = (hsa_amd_sdma_engine_id_t)(1u << engines[i]);
     hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)dst[i], g_local, (const void*)src[i], g_local,
-                                                          bytes, gate, gate ? &s.trigger : nullptr, s.data[first + i], engine, true);
+                                                          bytes, 1, &s.trigger[k], s.data[first + i], engine, true);
     if (st != HSA_STATUS_SUCCESS) return -100 - (int)st;
   }
   hsa_status_t st = hsa_amd_memory_async_copy_on_engine(
@@ -218,38 +268,63 @@ int sag_issue(int slot, int piece, const uint64_t* dst, const uint64_t* src, uin
 
 // Push, piece `piece` of the call: n data copies, using the slot's data and flag signals
 // piece * n + i, each `bytes` from src[i] to dst[i] on SDMA engine engines[i] once the slot's
-// trigger is released; then, on the spare engine engines[n] and once copy i has landed, the
-// byte at `one` to flag_dst[i].
-int sag_issue_push(int slot, int piece, const uint64_t* dst, const uint64_t* src, uint64_t bytes, const int* engines,
-                   int n, const uint64_t* flag_dst, uint64_t one) {
+// trigger k is released; then, on the spare engine engines[n] and once copy i has landed, the
+// 4 bytes at `one` to flag_dst[i] (4-byte aligned).
+int sag_issue_push(int slot, int piece, int k, const uint64_t* dst, const uint64_t* src, uint64_t bytes,
+                   const int* engines, int n, const uint64_t* flag_dst, uint64_t one) {
   Slot& s = g_slots[slot];
   int first = piece * n;
-  if (first + n > s.armed_data || first + n > s.armed_flags) return -1;
-  // Later pieces queue behind piece 0 on each engine, so only piece 0 waits for the trigger.
-  int gate = piece == 0 ? 1 : 0;
+  if (first + n > s.armed_data || first + n > s.armed_flags || k < 0 || k >= kTriggers) return -1;
+  // Every piece waits for the trigger itself, rather than relying on queueing behind piece 0.
   for (int i = 0; i < n; ++i) {
     hsa_amd_sdma_engine_id_t engine = (hsa_amd_sdma_engine_id_t)(1u << engines[i]);
     hsa_signal_t& data = s.data[first + i];
     hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)dst[i], g_local, (const void*)src[i], g_local,
-                                                          bytes, gate, gate ? &s.trigger : nullptr, data, engine, true);
+                                                          bytes, 1, &s.trigger[k], data, engine, true);
     if (st != HSA_STATUS_SUCCESS) return -100 - (int)st;
   }
   hsa_amd_sdma_engine_id_t spare = (hsa_amd_sdma_engine_id_t)(1u << engines[n]);
   for (int i = 0; i < n; ++i) {
-    hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)flag_dst[i], g_local, (const void*)one, g_local, 1,
-                                                          1, &s.data[first + i], s.flag[first + i], spare, true);
+    void* flag = (void*)flag_dst[i];
+    if (piece == g_drop_piece && i == g_drop_index) {  // test hook: this flag goes nowhere
+      flag = g_scratch;
+      g_drop_piece = g_drop_index = -1;
+    }
+    hsa_status_t st = hsa_amd_memory_async_copy_on_engine(flag, g_local, (const void*)one, g_local, 4, 1,
+                                                          &s.data[first + i], s.flag[first + i], spare, true);
     if (st != HSA_STATUS_SUCCESS) return -200 - (int)st;
   }
   return 0;
 }
 
-// Enqueues a wait on `stream` until the 64-bit value at `ptr`, masked, equals `value`.
-int sag_stream_wait_value64(hipStream_t stream, uint64_t ptr, uint64_t value, uint64_t mask) {
-  return hipStreamWaitValue64(stream, (void*)ptr, value, hipStreamWaitValueEq, mask) == hipSuccess ? 0 : -1;
+// Enqueues on `stream` a wait until the `count` 32-bit flags at `words` all read 1, bounded by
+// `seconds`; a wait that runs out is recorded for sag_take_error and the stream moves on.
+int sag_wait_flags(hipStream_t stream, uint64_t words, int count, double seconds, int piece, int call) {
+  if (count > 64) return -1;
+  unsigned long long budget = (unsigned long long)(seconds * (double)g_ticks_per_s);
+  hipLaunchKernelGGL(wait_flags, dim3(1), dim3(1), 0, stream, (const int*)words, count, budget, g_error, piece, call);
+  return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
-// Enqueues a wait on `stream` until the 32-bit value at `ptr` equals `value`.
-int sag_stream_wait_value32(hipStream_t stream, uint64_t ptr, uint32_t value) {
-  return hipStreamWaitValue32(stream, (void*)ptr, value, hipStreamWaitValueEq, 0xFFFFFFFFu) == hipSuccess ? 0 : -1;
+// Returns how many bounded waits ran out since the last call (0 if none) and the first one's
+// piece, call id and missing-flag mask; clears the record.
+int sag_take_error(int* piece, int* call, uint64_t* missing) {
+  volatile SagError* e = g_error;
+  unsigned long long count = e->count;
+  if (count == 0) return 0;
+  *piece = e->piece;
+  *call = e->call;
+  *missing = e->missing;
+  e->count = 0;
+  return (int)(count > 0x7fffffff ? 0x7fffffff : count);
 }
+
+// Test hook: the next push of piece `piece` diverts its flag write for peer index `index` to a
+// scratch word, as if it were lost.
+int sag_debug_drop_flag(int piece, int index) {
+  g_drop_piece = piece;
+  g_drop_index = index;
+  return 0;
+}
+
 }

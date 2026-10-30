@@ -80,6 +80,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # into its peers; pull: each rank reads its peers' pieces).
     "XDIT_TP_SDMA_TRIGGER": lambda: os.environ.get("XDIT_TP_SDMA_TRIGGER", "gpu"),
     "XDIT_TP_SDMA_DIRECTION": lambda: os.environ.get("XDIT_TP_SDMA_DIRECTION", "push"),
+    # For sdma: seconds a GPU-side wait for a piece (or a symmetric-memory barrier) may take before
+    # it gives up; the op then raises on the next call instead of hanging.
+    "XDIT_TP_SDMA_WAIT_S": lambda: os.environ.get("XDIT_TP_SDMA_WAIT_S", "30"),
 }
 
 

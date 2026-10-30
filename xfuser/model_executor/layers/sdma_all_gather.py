@@ -16,11 +16,17 @@ later pieces are in flight.
 
 `direction="push"` (default): each rank's engines write its pieces into every
 peer's symmetric-memory inbox, on the engines ROCr prefers for writing to that
-peer, each piece followed by a 1-byte write of the sender's byte in the
-receiver's flag word for that piece; the receiver waits for all bytes at once.
-`direction="pull"`: each rank's engines read the peers' pieces, and a 4-byte
-copy on a spare engine flags piece c once every peer's has landed. On MI3xx,
-writing on the write-preferred engines moves the gather faster than reading.
+peer; once a piece lands, a 4-byte write on a spare engine sets the sender's own
+flag word for that piece at the receiver. `direction="pull"`: each rank's
+engines read the peers' pieces, and a 4-byte copy on a spare engine flags piece
+c once every peer's has landed. On MI3xx, writing on the write-preferred engines
+moves the gather faster than reading.
+
+Waits are bounded. The compute stream waits for a piece's flags with a
+one-thread kernel that gives up after XDIT_TP_SDMA_WAIT_S seconds (default 30)
+and records which flags never landed; the next call on this process raises an
+error naming them. The symmetric-memory barriers time out too, after long
+enough for a peer's own waits to give up first.
 
 Copies wait for a trigger the compute stream releases after the
 symmetric-memory barrier (`trigger="gpu"`). `trigger="host"` instead waits on
@@ -44,20 +50,26 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+import xfuser.envs as envs
+
 _SOURCE = Path(__file__).with_name("sdma_all_gather.hip")
 _SLOTS = 4
 MAX_CHUNKS = 16
-_FLAG_WORD = 8  # bytes per piece in a push receiver's flags: one per rank
 
 _lib = None
 _groups = {}
 _slot = 0
+_call = 0
 _ones = {}
 
 
 def _check(rc: int, what: str) -> None:
     if rc != 0:
         raise RuntimeError(f"{what} failed with {rc}")
+
+
+def _wait_seconds() -> float:
+    return float(envs.environment_variables["XDIT_TP_SDMA_WAIT_S"]())
 
 
 def _load():
@@ -78,18 +90,19 @@ def _load():
             )
             tmp.rename(so)
     lib = ctypes.CDLL(str(so))
-    i, u32, u64, vp = ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_void_p
+    i, u64, vp, dbl = ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_double
     ip, u64p = ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint64)
     for name, argtypes in {
         "sag_init": [i, i, i],
         "sag_engine_plan": [i, ip, i, i, ip],
         "sag_arm": [i, i, i],
-        "sag_release": [i, vp],
-        "sag_open": [i],
-        "sag_issue": [i, i, u64p, u64p, u64, ip, i, u64, u64],
-        "sag_issue_push": [i, i, u64p, u64p, u64, ip, i, u64p, u64],
-        "sag_stream_wait_value32": [vp, u64, u32],
-        "sag_stream_wait_value64": [vp, u64, u64, u64],
+        "sag_release": [i, i, vp],
+        "sag_open": [i, i],
+        "sag_issue": [i, i, i, u64p, u64p, u64, ip, i, u64, u64],
+        "sag_issue_push": [i, i, i, u64p, u64p, u64, ip, i, u64p, u64],
+        "sag_wait_flags": [vp, u64, i, dbl, i, i],
+        "sag_take_error": [ip, ip, u64p],
+        "sag_debug_drop_flag": [i, i],
     }.items():
         getattr(lib, name).argtypes = argtypes
         getattr(lib, name).restype = i
@@ -131,27 +144,95 @@ def engine_plan(group_name: str, direction: str = "push") -> dict:
     return {**dict(zip(g.peers, g.engines)), "flags": g.flag_engine}
 
 
+def debug_drop_flag(piece: int, peer_index: int) -> None:
+    """Test hook: the next push of `piece` loses its flag write to peer g.peers[peer_index]."""
+    _load().sag_debug_drop_flag(piece, peer_index)
+
+
 def _one(device: torch.device) -> torch.Tensor:
-    """A device int32 1, whose first byte is the 1 a push flag write copies."""
+    """A device int32 1, the value every flag write copies."""
     if device not in _ones:
         _ones[device] = torch.ones(1, dtype=torch.int32, device=device)
     return _ones[device]
 
 
-def _arm(lib, g: _Group, slot: int, chunks: int, n_flags: int) -> None:
-    n = len(g.peers)
-    rc = lib.sag_arm(slot, chunks * n, n_flags)
-    if rc <= -2000:
+def _raise_timeouts(lib, g: _Group) -> None:
+    """Raise if a bounded wait of an earlier call ran out (recorded on the GPU by sag_wait_flags)."""
+    piece, call, missing = ctypes.c_int(), ctypes.c_int(), ctypes.c_uint64()
+    count = lib.sag_take_error(ctypes.byref(piece), ctypes.byref(call), ctypes.byref(missing))
+    if count:
+        words = [i for i in range(64) if missing.value >> i & 1]
         raise RuntimeError(
-            f"rank {g.rank}: flag copy {-rc - 2000} of an earlier call on transport slot {slot} never landed"
+            f"rank {g.rank}: {count} SDMA flag wait(s) gave up after {_wait_seconds():g} s. First: call "
+            f"{call.value}, piece {piece.value}, flag words {words} never set (for a push or reduce-scatter, "
+            f"word r is rank r's; for a pull, word 0 is the whole piece). Peer engines (rank: engine): "
+            f"{dict(zip(g.peers, g.engines))}"
         )
+
+
+def raise_if_waits_gave_up(group_name: str, direction: str = "push") -> None:
+    """Raise if a bounded flag wait of an earlier call on this process ran out; every call checks this first."""
+    _raise_timeouts(_load(), _group(group_name, direction))
+
+
+def _start(lib, g: _Group, n_data: int, n_flags: int):
+    """Begin a call: check earlier calls' waits, take the next slot and arm it. Returns (slot, call id)."""
+    global _slot, _call
+    _raise_timeouts(lib, g)
+    slot, _slot = _slot, (_slot + 1) % _SLOTS
+    _call += 1
+    n = len(g.peers)
+    rc = lib.sag_arm(slot, n_data, n_flags)
+    if rc <= -2000:
+        raise RuntimeError(f"rank {g.rank}: flag copy {-rc - 2000} of an earlier call on slot {slot} never landed")
     if rc <= -1000:
         i = -rc - 1000
         raise RuntimeError(
             f"rank {g.rank}: piece {i // n} for peer {g.peers[i % n]} (SDMA engine {g.engines[i % n]}) of an "
-            f"earlier call on transport slot {slot} never landed"
+            f"earlier call on slot {slot} never landed"
         )
     _check(rc, "sag_arm")
+    return slot, _call
+
+
+def _release(lib, slot: int, k: int, stream: torch.cuda.Stream, trigger: str) -> None:
+    """Let slot's copies gated on trigger k start once `stream` reaches this point."""
+    if trigger == "gpu":
+        _check(lib.sag_release(slot, k, ctypes.c_void_p(stream.cuda_stream)), "sag_release")
+    else:
+        stream.synchronize()
+        _check(lib.sag_open(slot, k), "sag_open")
+
+
+def _wait(lib, stream: torch.cuda.Stream, flags: torch.Tensor, piece: int, call: int) -> None:
+    """Make `stream` wait (bounded) until every int32 in `flags` reads 1."""
+    _check(
+        lib.sag_wait_flags(
+            ctypes.c_void_p(stream.cuda_stream), flags.data_ptr(), flags.numel(), _wait_seconds(), piece, call
+        ),
+        "sag_wait_flags",
+    )
+
+
+def _inbox(group_name: str, rank: int, world: int, shape, dtype, chunks: int):
+    """This rank's symmetric inbox of `shape` and its (chunks, world) int32 flag words, plus every
+    rank's workspace base pointer and the flags' byte offset in it."""
+    elt = torch.empty((), dtype=dtype).element_size()
+    nbytes = elt
+    for d in shape:
+        nbytes *= d
+    flag_offset = -(-nbytes // 64) * 64
+    size = flag_offset + chunks * world * 4
+    ws = symm_mem.get_symm_mem_workspace(group_name, min_size=size)
+    inbox = ws.get_buffer(rank, tuple(shape), dtype)
+    flags = ws.get_buffer(rank, (chunks, world), torch.int32, storage_offset=flag_offset // 4)
+    bases = [ws.get_buffer(r, (size,), torch.uint8).data_ptr() for r in range(world)]
+    return ws, inbox, flags, bases, flag_offset
+
+
+def _barrier(ws) -> None:
+    # A peer may reach the barrier only after all of its own bounded waits gave up, one per piece.
+    ws.barrier(channel=0, timeout_ms=int(_wait_seconds() * (MAX_CHUNKS + 2) * 1000))
 
 
 def sdma_all_gather_linear(
@@ -168,7 +249,6 @@ def sdma_all_gather_linear(
     `x` is (1, rows, features) holding this rank's block-cyclic rows (see the
     module docstring); the output is (1, world * rows, out_features) in natural order.
     """
-    global _slot
     if torch.version.hip is None:
         raise RuntimeError("the SDMA all-gather needs ROCm")
     if trigger not in ("gpu", "host") or direction not in ("push", "pull"):
@@ -181,78 +261,55 @@ def sdma_all_gather_linear(
     lib = _load()
     g = _group(group_name, direction)
     world, rank, n_peers = g.world, g.rank, len(g.peers)
-    if direction == "push" and world > _FLAG_WORD:
-        raise NotImplementedError(f"the push direction flags up to {_FLAG_WORD} ranks per word; got {world}")
     x2d = x[0].contiguous()
     block = rows // chunks
-    elt = x2d.element_size()
-    piece_bytes = block * features * elt
-    gathered_shape = (chunks, world, block, features)  # [c, p] = piece c of rank p
-    gathered_bytes = chunks * world * piece_bytes
-    flag_offset = -(-gathered_bytes // 64) * 64
-
+    piece_bytes = block * features * x2d.element_size()
     stream = torch.cuda.current_stream()
-    handle = ctypes.c_void_p(stream.cuda_stream)
-    slot = _slot
-    _slot = (_slot + 1) % _SLOTS
     one = _one(x.device).data_ptr()
 
     if direction == "push":
-        # This rank's inbox and flag words live in the symmetric workspace, where peers write.
-        ws = symm_mem.get_symm_mem_workspace(group_name, min_size=flag_offset + chunks * _FLAG_WORD)
-        gathered = ws.get_buffer(rank, gathered_shape, x2d.dtype)
-        flag_words = ws.get_buffer(rank, (chunks, _FLAG_WORD), torch.uint8, storage_offset=flag_offset)
-        flag_words.zero_()
-        flag_words[:, rank] = 1
+        # gathered[c, p] = piece c of rank p = natural rows (c * world + p) * block onward.
+        ws, gathered, flags, bases, flag_offset = _inbox(
+            group_name, rank, world, (chunks, world, block, features), x2d.dtype, chunks
+        )
+        flags.zero_()
+        flags[:, rank] = 1
         gathered[:, rank] = x2d.view(chunks, block, features)
-        _arm(lib, g, slot, chunks, chunks * n_peers)
+        slot, call = _start(lib, g, chunks * n_peers, chunks * n_peers)
     else:
-        ws = symm_mem.get_symm_mem_workspace(group_name, min_size=x2d.numel() * elt)
+        ws = symm_mem.get_symm_mem_workspace(group_name, min_size=x2d.numel() * x2d.element_size())
         ws.get_buffer(rank, x2d.shape, x2d.dtype).copy_(x2d)
-        gathered = x2d.new_empty(gathered_shape)
-        flags = torch.zeros(chunks, dtype=torch.int32, device=x.device)
+        gathered = x2d.new_empty(chunks, world, block, features)
+        flags = torch.zeros(chunks, 1, dtype=torch.int32, device=x.device)
         gathered[:, rank] = x2d.view(chunks, block, features)
-        _arm(lib, g, slot, chunks, chunks)
+        slot, call = _start(lib, g, chunks * n_peers, chunks)
     out = x2d.new_empty(chunks, world * block, weight.shape[0])
 
     # Every rank's pieces and flags are in place, and its inbox is free, past this barrier.
-    ws.barrier(channel=0)
-    if trigger == "gpu":
-        _check(lib.sag_release(slot, handle), "sag_release")
-    else:
-        stream.synchronize()
-        _check(lib.sag_open(slot), "sag_open")
+    _barrier(ws)
+    _release(lib, slot, 0, stream, trigger)
 
-    if direction == "push":
-        peer_base = [ws.get_buffer(p, (flag_offset + chunks * _FLAG_WORD,), torch.uint8).data_ptr() for p in g.peers]
-        all_ranks = sum(1 << (8 * r) for r in range(world))
-        mask = (1 << (8 * world)) - 1
-    else:
+    if direction == "pull":
         src_base = [ws.get_buffer(p, x2d.shape, x2d.dtype).data_ptr() for p in g.peers]
     w_t = weight.t()
     for c in range(chunks):
         # Piece c for or from every peer, queued behind piece c - 1 on each peer's engine.
         if direction == "push":
-            own = x2d.data_ptr() + c * piece_bytes
-            dst = (ctypes.c_uint64 * n_peers)(*[b + (c * world + rank) * piece_bytes for b in peer_base])
-            src = (ctypes.c_uint64 * n_peers)(*[own] * n_peers)
-            flag_dst = (ctypes.c_uint64 * n_peers)(*[b + flag_offset + c * _FLAG_WORD + rank for b in peer_base])
+            dst = (ctypes.c_uint64 * n_peers)(*[bases[p] + (c * world + rank) * piece_bytes for p in g.peers])
+            src = (ctypes.c_uint64 * n_peers)(*[x2d.data_ptr() + c * piece_bytes] * n_peers)
+            flag_dst = (ctypes.c_uint64 * n_peers)(*[bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers])
             _check(
-                lib.sag_issue_push(slot, c, dst, src, piece_bytes, g.engine_arr, n_peers, flag_dst, one),
+                lib.sag_issue_push(slot, c, 0, dst, src, piece_bytes, g.engine_arr, n_peers, flag_dst, one),
                 "sag_issue_push",
-            )
-            _check(
-                lib.sag_stream_wait_value64(handle, flag_words[c].data_ptr(), all_ranks, mask),
-                "hipStreamWaitValue64",
             )
         else:
             dst = (ctypes.c_uint64 * n_peers)(*[gathered[c, p].data_ptr() for p in g.peers])
             src = (ctypes.c_uint64 * n_peers)(*[base + c * piece_bytes for base in src_base])
             _check(
-                lib.sag_issue(slot, c, dst, src, piece_bytes, g.engine_arr, n_peers, flags[c].data_ptr(), one),
+                lib.sag_issue(slot, c, 0, dst, src, piece_bytes, g.engine_arr, n_peers, flags[c].data_ptr(), one),
                 "sag_issue",
             )
-            _check(lib.sag_stream_wait_value32(handle, flags[c].data_ptr(), 1), "hipStreamWaitValue32")
+        _wait(lib, stream, flags[c], c, call)
         rows_c = gathered[c].view(world * block, features)
         if bias is None:
             torch.mm(rows_c, w_t, out=out[c])
@@ -260,7 +317,7 @@ def sdma_all_gather_linear(
             torch.addmm(bias, rows_c, w_t, out=out[c])
     # Every rank waited for every piece before its last GEMM, so past this barrier no copy reads
     # or writes this call's buffers (`x` included, which this rank's pushes read).
-    ws.barrier(channel=0)
+    _barrier(ws)
     return out.view(1, chunks * world * block, weight.shape[0])
 
 
