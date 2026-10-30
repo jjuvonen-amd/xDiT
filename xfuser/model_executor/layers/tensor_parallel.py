@@ -25,7 +25,9 @@ contiguous layout. They work over NVLink; on torch 2.13 / ROCm 7.16 they
 segfault beyond ~10 MB. With `fused="sdma"` (ROCm), each all-gather + GEMM
 gathers on SDMA copy engines, all peers at once, in `chunks` pieces on the
 block-cyclic layout, each piece's GEMM starting as it lands
-(layers/sdma_all_gather.py); reduce-scatters run as with `fused` unset.
+(layers/sdma_all_gather.py); reduce-scatters run as with `fused` unset, or with
+XDIT_TP_SDMA_REDUCE_SCATTER=on push their partial sums on SDMA engines and reduce
+them chunk by chunk.
 """
 
 from typing import List, Optional, Sequence
@@ -173,6 +175,21 @@ def tp_row_parallel(
             )
     elif chunks == 1:
         out = tp_reduce_scatter_seq(linear(x), site)
+    elif (
+        fused == "sdma"
+        and x.shape[0] == 1
+        and envs.environment_variables["XDIT_TP_SDMA_REDUCE_SCATTER"]().strip().lower() == "on"
+    ):
+        group = get_tp_group()
+        with record_function(f"tp_rs:{site}"):
+            out = torch.ops.xfuser.tp_sdma_linear_reduce_scatter(
+                x,
+                linear.weight,
+                group.device_group.group_name,
+                group.world_size,
+                chunks,
+                envs.environment_variables["XDIT_TP_SDMA_TRIGGER"]().strip().lower(),
+            )
     else:
         group = get_tp_group()
         with record_function(f"tp_rs:{site}"):

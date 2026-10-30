@@ -83,6 +83,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # For sdma: seconds a GPU-side wait for a piece (or a symmetric-memory barrier) may take before
     # it gives up; the op then raises on the next call instead of hanging.
     "XDIT_TP_SDMA_WAIT_S": lambda: os.environ.get("XDIT_TP_SDMA_WAIT_S", "30"),
+    # For sdma: on, the reduce-scatters too push their partial sums on SDMA engines and reduce
+    # them chunk by chunk; off, they run as with chunked.
+    "XDIT_TP_SDMA_REDUCE_SCATTER": lambda: os.environ.get("XDIT_TP_SDMA_REDUCE_SCATTER", "off"),
 }
 
 

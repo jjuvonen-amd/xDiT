@@ -65,8 +65,12 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         options["fused"],
     )
     import contextlib
+    import os
 
     import torch.distributed._symmetric_memory as symm_mem
+
+    if options.get("sdma_reduce_scatter"):
+        os.environ["XDIT_TP_SDMA_REDUCE_SCATTER"] = "on"
 
     from xfuser.config.args import xFuserArgs
     from xfuser.core.distributed import (
@@ -127,10 +131,10 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         destroy_distributed_environment()
 
 
-def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=None):
+def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=None, **extra):
     tp, ulysses, ring = MODES[mode] if mode else (1, 1, 1)
     output_path = directory / "output.pt"
-    options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch, fused=fused)
+    options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch, fused=fused, **extra)
     spawn_accelerator_ranks(
         _worker,
         directory,
@@ -241,15 +245,26 @@ def test_tensor_parallel_with_fused_comm_matches_one_gpu(tmp_path, one_gpu_outpu
 @pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
 @pytest.mark.parametrize("cross_attention", ["sharded", "replicated"])
 @pytest.mark.parametrize("mode, chunks", [("tp2", 1), ("tp2", 2), ("tp4", 2), ("tp2-ulysses2", 2)])
+@pytest.mark.parametrize("reduce_scatter", ["chunked", "sdma"])
 def test_tensor_parallel_with_sdma_all_gather_matches_one_gpu(
-    tmp_path, one_gpu_output, mode, chunks, cross_attention, latent_shape
+    tmp_path, one_gpu_output, reduce_scatter, mode, chunks, cross_attention, latent_shape
 ):
-    """All-gathers on SDMA copy engines in pieces, as XDIT_TP_COMM_OVERLAP=sdma runs them."""
+    """All-gathers on SDMA copy engines in pieces, as XDIT_TP_COMM_OVERLAP=sdma runs them; reduce-scatters
+    as chunked overlap or, with XDIT_TP_SDMA_REDUCE_SCATTER=on, with their partial sums pushed on SDMA engines."""
     if not torch.cuda.is_available() or torch.version.hip is None:
         pytest.skip("SDMA copy engines need ROCm")
     expected = one_gpu_output("wan", latent_shape)
 
-    actual = _run(tmp_path, mode, "wan", latent_shape, cross_attention=cross_attention, chunks=chunks, fused="sdma")
+    actual = _run(
+        tmp_path,
+        mode,
+        "wan",
+        latent_shape,
+        cross_attention=cross_attention,
+        chunks=chunks,
+        fused="sdma",
+        sdma_reduce_scatter=reduce_scatter == "sdma",
+    )
 
     error = _relative_error(actual, expected)
     assert error <= TOLERANCE, f"relative error {error:.3e}"

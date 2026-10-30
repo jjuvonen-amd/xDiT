@@ -34,6 +34,12 @@ the host for the barrier and then releases them, a fallback if ROCr cannot gate
 SDMA copies on a GPU-written signal. Engines: see sag_engine_plan in
 sdma_all_gather.hip.
 
+`sdma_linear_reduce_scatter` is the row-parallel counterpart: GEMM chunk c
+writes this rank's partial sums for every owner's block of chunk c; once it is
+done, the engines push each owner's block into that owner's inbox, and each
+rank sums the partials it received for chunk c (in fp32) one chunk behind, so
+the next GEMM chunk is never held up by a wait.
+
 Limits: ROCm only; batch 1. The transport is built with hipcc on first use
 (sdma_all_gather.hip).
 """
@@ -338,3 +344,84 @@ def _tp_sdma_all_gather_linear(
 def _(x, weight, bias, group_name, chunks, trigger, direction):
     tp_size = dist.distributed_c10d._resolve_process_group(group_name).size()
     return x.new_empty(x.shape[0], tp_size * x.shape[1], weight.shape[0])
+
+
+def sdma_linear_reduce_scatter(
+    x: torch.Tensor, weight: torch.Tensor, group_name: str, chunks: int = 4, trigger: str = "gpu"
+) -> torch.Tensor:
+    """reduce_scatter(x @ weight.T, dim 1) over the TP group, with the partial sums pushed on SDMA engines.
+
+    `x` is (1, rows, features) in natural order, the same rows on every rank with
+    this rank's slice of the features; the output is (1, rows / world, out_features)
+    holding this rank's block-cyclic rows (see the module docstring), as
+    xfuser::tp_chunked_linear_reduce_scatter returns them.
+    """
+    if torch.version.hip is None:
+        raise RuntimeError("the SDMA reduce-scatter needs ROCm")
+    if trigger not in ("gpu", "host"):
+        raise ValueError(f"trigger must be gpu or host; got {trigger}")
+    batch, rows, features = x.shape
+    lib = _load()
+    g = _group(group_name, "push")
+    world, rank, n_peers = g.world, g.rank, len(g.peers)
+    if batch != 1:
+        raise NotImplementedError("the SDMA reduce-scatter handles batch 1")
+    if not 1 <= chunks <= MAX_CHUNKS or rows % (world * chunks):
+        raise ValueError(f"world * chunks must divide the {rows} rows and chunks be at most {MAX_CHUNKS}")
+    x2d = x[0]
+    block = rows // (world * chunks)
+    span = world * block
+    out_features = weight.shape[0]
+    block_bytes = block * out_features * x2d.element_size()
+    stream = torch.cuda.current_stream()
+    one = _one(x.device).data_ptr()
+
+    # inbox[c, s] = sender s's partial sums for this rank's block of chunk c.
+    ws, inbox, flags, bases, flag_offset = _inbox(
+        group_name, rank, world, (chunks, world, block, out_features), x2d.dtype, chunks
+    )
+    partials = x2d.new_empty(chunks, world, block, out_features)
+    out = x2d.new_empty(chunks, block, out_features)
+    flags.zero_()
+    flags[:, rank] = 1
+    slot, call = _start(lib, g, chunks * n_peers, chunks * n_peers)
+    # Every rank's inbox is free and its flags cleared past this barrier.
+    _barrier(ws)
+
+    w_t = weight.t()
+
+    def reduce(c):
+        _wait(lib, stream, flags[c], c, call)
+        out[c].copy_(torch.sum(inbox[c], dim=0, dtype=torch.float32))
+
+    for c in range(chunks):
+        torch.mm(x2d[c * span : (c + 1) * span], w_t, out=partials[c].view(span, out_features))
+        inbox[c, rank].copy_(partials[c, rank])
+        # Chunk c's pushes start once its GEMM is done: trigger c.
+        _release(lib, slot, c, stream, trigger)
+        dst = (ctypes.c_uint64 * n_peers)(*[bases[p] + (c * world + rank) * block_bytes for p in g.peers])
+        src = (ctypes.c_uint64 * n_peers)(*[partials[c, p].data_ptr() for p in g.peers])
+        flag_dst = (ctypes.c_uint64 * n_peers)(*[bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers])
+        _check(
+            lib.sag_issue_push(slot, c, c, dst, src, block_bytes, g.engine_arr, n_peers, flag_dst, one),
+            "sag_issue_push",
+        )
+        if c > 0:
+            reduce(c - 1)
+    reduce(chunks - 1)
+    # Every rank waited for every chunk from every peer, so past this barrier no copy reads
+    # `partials` or writes an inbox.
+    _barrier(ws)
+    return out.view(1, chunks * block, out_features)
+
+
+@torch.library.custom_op("xfuser::tp_sdma_linear_reduce_scatter", mutates_args=())
+def _tp_sdma_linear_reduce_scatter(
+    x: torch.Tensor, weight: torch.Tensor, group_name: str, tp_size: int, chunks: int, trigger: str
+) -> torch.Tensor:
+    return sdma_linear_reduce_scatter(x, weight, group_name, chunks, trigger)
+
+
+@_tp_sdma_linear_reduce_scatter.register_fake
+def _(x, weight, group_name, tp_size, chunks, trigger):
+    return x.new_empty(x.shape[0], x.shape[1] // tp_size, weight.shape[0])
