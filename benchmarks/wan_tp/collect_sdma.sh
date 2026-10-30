@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Collect results for the SDMA all-gather + GEMM (XDIT_TP_COMM_OVERLAP=sdma) on one 8-GPU
-# ROCm node: op and Wan parity tests, SDMA engine-plan bandwidth, the per-site benchmark at
-# Wan2.2 widths, a sweep over wider GEMMs (where the GEMM can outlast the gather), and Wan2.2
-# TP8/TP4 profiles and 40-step timings next to no overlap and chunked overlap. Run inside the
-# xDiT container:
+# Collect results for the SDMA all-gather + GEMM and GEMM + reduce-scatter
+# (XDIT_TP_COMM_OVERLAP=sdma, XDIT_TP_SDMA_REDUCE_SCATTER=on|off) on one 8-GPU ROCm node: op and
+# Wan parity tests, transport stress probes, SDMA bandwidth by copy direction, the per-site
+# benchmark at Wan2.2 widths, a sweep over wider GEMMs, and Wan2.2 TP8/TP4 profiles and 40-step
+# timings next to no overlap and chunked overlap. Run inside the xDiT container:
 #
 #   bash benchmarks/wan_tp/collect_sdma.sh
 #
@@ -62,7 +62,7 @@ cat "$OUT/env.log"
 # 2. Tests. The op test covers both triggers; pick the one that works for the runs below.
 export XDIT_TP_SDMA_TRIGGER=gpu
 OP_TEST=tests/integration/accelerator/model_executor/layers/test_sdma_all_gather.py
-if ! step op_test_gpu_trigger python -m pytest -q -p no:cacheprovider "$OP_TEST" -k gpu; then
+if ! step op_test_gpu_trigger python -m pytest -q -p no:cacheprovider "$OP_TEST" -k "gpu or lost"; then
   if step op_test_host_trigger python -m pytest -q -p no:cacheprovider "$OP_TEST" -k host; then
     export XDIT_TP_SDMA_TRIGGER=host
     log "   the GPU-released trigger failed and the host one passed: using XDIT_TP_SDMA_TRIGGER=host"
@@ -71,8 +71,17 @@ if ! step op_test_gpu_trigger python -m pytest -q -p no:cacheprovider "$OP_TEST"
     exit 1
   fi
 fi
+step rs_op_test python -m pytest -q -p no:cacheprovider \
+  tests/integration/accelerator/model_executor/layers/test_sdma_reduce_scatter.py
 step parity_tests python -m pytest -q -p no:cacheprovider \
   tests/integration/accelerator/model_executor/test_wan_tensor_parallel.py -k sdma
+
+# 2b. Transport stress: lost flags, early or stale data, for the all-gather and reduce-scatter
+#     transports, alone and next to RCCL traffic on the same links.
+gpu_check stress
+step stress torchrun --nproc_per_node 8 benchmarks/wan_tp/sdma_flag_stress.py --output-dir "$OUT/stress"
+step stress_bg torchrun --nproc_per_node 8 benchmarks/wan_tp/sdma_flag_stress.py --background-rccl \
+  --output-dir "$OUT/stress"
 
 # 3. Raw 7-peer SDMA bandwidth on torch's buffers: reads (pull) vs writes (push), the latter on
 #    the read-preferred and on the write-preferred engines (what the op's push uses).
@@ -80,9 +89,9 @@ gpu_check copy_direction
 step copy_direction torchrun --nproc_per_node 8 benchmarks/wan_tp/symm_mem_copy_paths.py \
   --paths hsa_local_sdma_fixed,hsa_local_sdma_push,hsa_local_sdma_push_out --output-dir "$OUT/copy_direction"
 
-# 4. Per site at Wan2.2 TP8 widths, and 5. wider column-parallel GEMMs (AG sites), for 2, 4
-#    and 8 pieces next to chunked overlap with as many chunks; push (the default), and pull
-#    once for comparison.
+# 4. Per site at Wan2.2 TP8 widths (AG and RS sites), and 5. wider column-parallel GEMMs (AG
+#    sites), for 2, 4 and 8 pieces next to chunked overlap with as many chunks; push (the
+#    default), and pull once for comparison (pull applies to the AG sites).
 gpu_check fusion_bench_wan
 step fusion_bench_wan torchrun --nproc_per_node 8 benchmarks/tp_comm_gemm_overlap.py --sdma \
   --sdma-trigger "$XDIT_TP_SDMA_TRIGGER" --chunks 2 4 8 --output-dir "$OUT/fusion_bench_wan"
@@ -101,12 +110,16 @@ done
 gpu_check profiles
 step profiles env OUTPUT_DIR="$OUT/profiles" bash benchmarks/wan_tp/run_profiles.sh \
   tp8_xrepl tp8_xrepl_ov tp8_xrepl_sdma
+step profiles_rs env OUTPUT_DIR="$OUT/profiles_rs" XDIT_TP_SDMA_REDUCE_SCATTER=on \
+  bash benchmarks/wan_tp/run_profiles.sh tp8_xrepl_sdma
 step summary python benchmarks/wan_tp/summarize_traces.py --root "$OUT/profiles"
 
 # 7. Full 40-step timings, warmed up.
 gpu_check timed40
 step timed40 env OUTPUT_DIR="$OUT/timed40" PROFILE=0 STEPS=40 \
   bash benchmarks/wan_tp/run_profiles.sh tp8_xrepl tp8_xrepl_ov tp8_xrepl_sdma tp4_xrepl_ov tp4_xrepl_sdma
+step timed40_rs env OUTPUT_DIR="$OUT/timed40_rs" XDIT_TP_SDMA_REDUCE_SCATTER=on PROFILE=0 STEPS=40 \
+  bash benchmarks/wan_tp/run_profiles.sh tp8_xrepl_sdma tp4_xrepl_sdma
 
 log "== done (trigger: $XDIT_TP_SDMA_TRIGGER, chunks: $CHUNKS)"
 grep -hE "^=== .* exit=" "$OUT"/profiles*.log "$OUT"/timed40*.log 2>/dev/null | tee -a "$OUT/collect.log"

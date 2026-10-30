@@ -15,6 +15,10 @@ directly, without the GEMM, for many calls:
          landed (a flag ahead of its data), a stale cache line from an earlier
          call, or a piece copied before the release.
 
+  rs-order  the same check for the reduce-scatter's transport: each chunk's
+         partial sums are written right before that chunk's own release, and
+         checked one chunk behind, as sdma_linear_reduce_scatter runs them.
+
 --background-rccl keeps RCCL all-gathers running on a side stream, loading
 the same links. A watchdog bounds every call: if a wait does not finish, the
 rank prints the flag bytes it is missing and exits with status 3, instead of
@@ -40,7 +44,7 @@ os.environ.setdefault("XDIT_TP_SDMA_WAIT_S", "5")
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--modes", nargs="+", default=["flags", "order"], choices=["flags", "order"])
+    p.add_argument("--modes", nargs="+", default=["flags", "order", "rs-order"], choices=["flags", "order", "rs-order"])
     p.add_argument("--flag-calls", type=int, default=3000)
     p.add_argument("--order-kib", nargs="+", type=int, default=[64, 1024, 23680])
     p.add_argument("--order-calls", type=int, default=400, help="calls per piece size (scaled up for small pieces)")
@@ -89,6 +93,40 @@ class Transport:
                 after_wait(c, inbox)
         sag._barrier(ws)
         return inbox, flags
+
+    def rs_call(self, partials, chunks, block_bytes, fill, check):
+        """One push reduce-scatter's transport (sdma_linear_reduce_scatter): chunk c's partials, written by
+        `fill(c)` in place of the GEMM, are pushed once trigger c is released; `check(c, inbox)` runs right
+        after chunk c's wait, one chunk behind."""
+        lib, g = self.lib, self.g
+        world, rank, n = g.world, g.rank, len(g.peers)
+        ws, inbox, flags, bases, flag_offset = sag._inbox(
+            self.group_name, rank, world, (chunks, world, block_bytes), torch.uint8, chunks
+        )
+        flags.zero_()
+        flags[:, rank] = 1
+        slot, call = sag._start(lib, g, chunks * n, chunks * n)
+        sag._barrier(ws)
+
+        def reduce(c):
+            sag._wait(lib, self.stream, flags[c], c, call)
+            check(c, inbox)
+
+        for c in range(chunks):
+            fill(c)
+            inbox[c, rank].copy_(partials[c, rank])
+            sag._release(lib, slot, c, self.stream, "gpu")
+            dst = (ctypes.c_uint64 * n)(*[bases[p] + (c * world + rank) * block_bytes for p in g.peers])
+            srcs = (ctypes.c_uint64 * n)(*[partials[c, p].data_ptr() for p in g.peers])
+            flag_dst = (ctypes.c_uint64 * n)(*[bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers])
+            sag._check(
+                lib.sag_issue_push(slot, c, c, dst, srcs, block_bytes, g.engine_arr, n, flag_dst, self.one), "push"
+            )
+            if c > 0:
+                reduce(c - 1)
+        reduce(chunks - 1)
+        sag._barrier(ws)
+        return flags
 
     def take_gave_up(self):
         """Count waits that ran out of time (recorded on the GPU); they would have been hangs before."""
@@ -203,6 +241,41 @@ def main():
                     f"order {kib} KiB: {calls} calls, {int(total.item())} mismatched elements, {ms:.3f} ms/call",
                     flush=True,
                 )
+
+    if "rs-order" in args.modes:
+        chunks = args.chunks
+        for kib in args.order_kib:
+            elems = kib * 1024 // 2  # bf16 elements per owner block
+            block = elems * 2
+            calls = max(args.order_calls, args.order_calls * 1024 // max(kib, 1) // 4)
+            partials = torch.empty(chunks, world, block, dtype=torch.uint8, device="cuda")
+            bad = torch.zeros((), dtype=torch.int64, device="cuda")
+            ranks = torch.arange(world, device="cuda")
+            t0 = time.perf_counter()
+            for call in range(calls):
+                # Exact in bf16: integers below 256, unique per (call, sender, chunk) modulo 251.
+
+                def fill(c, call=call):
+                    partials[c].view(torch.bfloat16).fill_(float((call * world * chunks + rank * chunks + c) % 251))
+
+                def check(c, inbox, call=call):
+                    want = ((call * world * chunks + ranks * chunks + c) % 251).to(torch.bfloat16)[:, None]
+                    bad.add_((inbox[c].view(world, block).view(torch.bfloat16) != want).sum())
+
+                if background is not None and call % 8 == 0:
+                    background()
+                flags = t.rs_call(partials, chunks, block, fill, check)
+                done = torch.cuda.Event()
+                done.record()
+                watch(done, f"rs-order {kib} KiB call {call}", flags, rank, world)
+                t.take_gave_up()
+            total = torch.tensor([int(bad.item())], device="cuda")
+            dist.all_reduce(total)
+            ms = (time.perf_counter() - t0) * 1e3 / calls
+            rows.append(("rs-order", f"{kib} KiB", chunks, calls, int(total.item()), all_ranks(t.gave_up), ms))
+            t.gave_up = 0
+            if rank == 0:
+                print(f"rs-order {kib} KiB: {calls} calls, {int(total.item())} mismatched elements", flush=True)
 
     torch.cuda.synchronize()
     if rank == 0:

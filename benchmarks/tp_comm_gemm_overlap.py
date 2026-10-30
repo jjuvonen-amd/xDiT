@@ -17,7 +17,8 @@ model does today and with the collective pipelined against the GEMM:
   sdma_kN     ROCm, opt-in (--sdma): xfuser's all-gather + GEMM with the gather on SDMA
               copy engines, all peers at once, in N pieces on the block-cyclic rows; each
               piece's GEMM starts as it lands (xfuser/model_executor/layers/sdma_all_gather.py).
-              AG sites only: an RS site reports chunked_kN, as XDIT_TP_COMM_OVERLAP=sdma runs it.
+              At RS sites, the GEMM in N chunks with each chunk's partial sums pushed to their
+              owners on SDMA engines and reduced chunk by chunk (sdma_linear_reduce_scatter).
 
 `comm_only` and `gemm_only` time each half alone; `ideal` is their max. Each
 variant is checked against baseline. Times are the slowest rank's median.
@@ -145,6 +146,11 @@ class Bench:
         partial.record_stream(self.comm)
         return out_buf
 
+    def rs_sdma(self, a_full, weight, k):
+        from xfuser.model_executor.layers.sdma_all_gather import sdma_linear_reduce_scatter
+
+        return sdma_linear_reduce_scatter(a_full[None], weight, self.group_name, k, self.args.sdma_trigger)[0]
+
     def rs_symm_mem(self, a_full, weight, out_buf):
         return torch.ops.symm_mem.fused_matmul_reduce_scatter(a_full, weight.t(), "sum", 0, self.group_name)
 
@@ -221,7 +227,8 @@ class Bench:
                 results["symm_mem"] = self.time(lambda: self.rs_symm_mem(a_full, weight, out))
             if self.args.sdma:
                 for k in self.args.chunks:
-                    results[f"sdma_k{k}"] = results[f"chunked_k{k}"]
+                    self.check(f"sdma_k{k}", self.rs_sdma(a_full, weight, k), self.cyclic_rows(expected_full, k))
+                    results[f"sdma_k{k}"] = self.time(lambda: self.rs_sdma(a_full, weight, k))
         results["ideal"] = max(results["comm_only"], results["gemm_only"])
         return results
 
