@@ -86,7 +86,7 @@ class Transport:
             srcs = (ctypes.c_uint64 * n)(*[src.data_ptr() + c * piece_bytes] * n)
             flag_dst = (ctypes.c_uint64 * n)(*[bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers])
             sag._check(
-                lib.sag_issue_push(slot, c, 0, dst, srcs, piece_bytes, g.engine_arr, n, flag_dst, self.one), "push"
+                lib.sag_issue_push(slot, c, 0, dst, srcs, piece_bytes, g.engine_arr, n, 1, flag_dst, self.one), "push"
             )
             sag._wait(lib, self.stream, flags[c], c, call)
             if after_wait is not None:
@@ -120,7 +120,7 @@ class Transport:
             srcs = (ctypes.c_uint64 * n)(*[partials[c, p].data_ptr() for p in g.peers])
             flag_dst = (ctypes.c_uint64 * n)(*[bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers])
             sag._check(
-                lib.sag_issue_push(slot, c, c, dst, srcs, block_bytes, g.engine_arr, n, flag_dst, self.one), "push"
+                lib.sag_issue_push(slot, c, c, dst, srcs, block_bytes, g.engine_arr, n, 1, flag_dst, self.one), "push"
             )
             if c > 0:
                 reduce(c - 1)
