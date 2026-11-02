@@ -1,0 +1,49 @@
+# xDiT with the SDMA tensor-parallel ops on ROCm, plus torch patched so that its
+# symm_mem fused AsyncTP ops run on SDMA engines too (patches/pytorch). Build from
+# the root of an xDiT checkout:
+#
+#   docker build -f docker/Dockerfile.rocm-sdma -t xdit-wan-sdma:dev .
+#
+# BASE_IMAGE needs ROCm with the ROCr fix symm_mem relies on (ROCm 10.2 nightly
+# 20260927-36281205442 or later) and a torch build with ROCm symmetric memory
+# (ROCm/pytorch release/2.14). The default is built from
+# https://github.com/AMD-AGI/diffusion-models-inference at 8c634c3 with
+# docker/diffusion-models-inference-rocm10.2.patch applied:
+#
+#   git -C diffusion-models-inference apply /path/to/xDiT/docker/diffusion-models-inference-rocm10.2.patch
+#   docker build -f docker/Dockerfile.ci -t pytorch-xdit:torch2.14-rocm10.2 diffusion-models-inference
+#
+# Nothing is switched on by default: see patches/pytorch/README.md for
+# TORCH_SYMM_MEM_ENABLE_ROCM_SDMA and xfuser/envs.py for XDIT_TP_COMM_OVERLAP.
+
+ARG BASE_IMAGE="pytorch-xdit:torch2.14-rocm10.2"
+FROM ${BASE_IMAGE}
+
+# The ROCm 10.2 nightlies ship amd-smi only. rocm-smi comes from the ROCm 7.2.1
+# release, unpacked without its maintainer scripts so /opt/rocm keeps pointing
+# at the nightly.
+ARG ROCM_SMI_DEB="https://repo.radeon.com/rocm/apt/7.2.1/pool/main/r/rocm-smi-lib/rocm-smi-lib_7.8.0.70201-81~24.04_amd64.deb"
+RUN curl -fsSL -o /tmp/rocm-smi-lib.deb "${ROCM_SMI_DEB}" && \
+    dpkg -x /tmp/rocm-smi-lib.deb / && \
+    rm /tmp/rocm-smi-lib.deb && \
+    ln -sf /opt/rocm-7.2.1/bin/rocm-smi /usr/local/bin/rocm-smi && \
+    rocm-smi --version
+
+# This checkout replaces the base image's xDiT.
+WORKDIR /app
+RUN rm -rf /app/xDiT
+COPY . /app/xDiT
+WORKDIR /app/xDiT
+# The SDMA transport is built for both architectures here, without a GPU.
+RUN pip freeze | grep numpy > /tmp/constraints.txt && \
+    pip install --no-cache-dir -c /tmp/constraints.txt -e . && \
+    rm /tmp/constraints.txt && \
+    python xfuser/model_executor/layers/sdma_build.py \
+        --out xfuser/model_executor/layers --offload-arch gfx942,gfx950
+
+# torch's symm_mem SDMA path: Python plus a HIP source that torch.utils.cpp_extension
+# builds on first use (hipcc is in the base). expecttest runs PyTorch's own tests.
+RUN bash patches/pytorch/apply_to_installed_torch.sh && \
+    pip install --no-cache-dir expecttest
+
+WORKDIR /app

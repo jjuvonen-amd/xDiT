@@ -1,0 +1,77 @@
+--- a/docker/Dockerfile.ci
++++ b/docker/Dockerfile.ci
+@@ -4,7 +4,7 @@
+ # Build example image with
+ #
+ # docker build -f docker/Dockerfile.ci \
+-#              -t amdsiloai/pytorch-xdit:latest .
++#              -t pytorch-xdit:torch2.14-rocm10.2 .
+ #
+ # when running from repository root.
+ #
+@@ -13,9 +13,12 @@
+ ARG BASE_IMAGE="ubuntu:24.04"
+ ARG PYTHON_VERSION="default"
+ ARG THEROCK_COMMIT="ab56f1f7c5b54746bf9f7948fff3f306b2bef8b2"
+-ARG ROCM_PACKAGE_REPOSITORY="legacy"
+-ARG ROCM_RELEASE_ID="20260817-31980779979"
+-ARG ROCM_DEB_SERIES="10.1"
++# ROCm 10.2 nightly 20260927: the build ROCm/pytorch#3840 (AsyncTP) was validated
++# on, MI355X included; it carries the ROCr fix AsyncTP needs. Nightlies after
++# 20260822 are only on the native repository, which resolves the series itself.
++ARG ROCM_PACKAGE_REPOSITORY="native"
++ARG ROCM_RELEASE_ID="20260927-36281205442"
++ARG ROCM_DEB_SERIES="10.2"
+ # ROCM_GFX_TARGETS selects architecture-specific nightly deb package shards.
+ # PYTORCH_ROCM_ARCH defaults to the package targets but can be overridden.
+ # Values are ";" separated; supported LLVM targets are documented at
+@@ -26,9 +29,17 @@
+ # product stages without those archives or tools.
+ ARG ROCM_PARENT=rocm_devel
+ ARG PYTORCH_ROCM_ARCH="${ROCM_GFX_TARGETS}"
+-ARG TRITON_COMMIT="669b31acc1dd1b3fd93286afd5db67f65d9f7557"
+-ARG PYTORCH_COMMIT="3369fa23f831832166651a0b8e151dc2877f3c77"
+-ARG PYTORCH_VISION_COMMIT="53881ee74892a7c22f2b16a84b15a00f64a8bf68"
++# PyTorch 2.14 from ROCm/pytorch release/2.14, whose head is the merge of
++# https://github.com/ROCm/pytorch/pull/3840: native AsyncTP (CK-tile GEMM) for
++# symm_mem.fused_all_gather_matmul on gfx942/gfx950. Opt in at runtime with
++# TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP=1. It fires only for gather_dim 0,
++# contiguous A, one B, 2048 < local_M * world <= 4096 and local_M % 256 == 0;
++# other shapes take the decomposed symm_mem path. Needs USE_ROCM_CK_SDPA (set
++# below) and ROCm >= 10.1 on MI350. TRITON_COMMIT is that PyTorch commit's
++# .ci/docker/ci_commit_pins/triton.txt; vision is ROCm/vision release/0.29.
++ARG TRITON_COMMIT="a3c5afb73ecd9e70046a983a8dd18fd676a30438"
++ARG PYTORCH_COMMIT="cb5188625c2da92165616db2868382302432a21d"
++ARG PYTORCH_VISION_COMMIT="b7d540b22fab0df4673898fb0aec2fc6954cddac"
+ ARG PYTORCH_AUDIO_COMMIT="b3ec2afa3ae504ca600d5e08956eb13d6e2aee31"
+ ARG PYTORCH_CODEC_COMMIT="dc0f10da1fa2c807dedb7ed97de7b36d762b968b"
+ # deps image arguments
+@@ -328,7 +339,8 @@
+     CXXFLAGS="-I${ROCM_HOME}/include/roctracer -I${ROCM_HOME}/lib/rocm_sysdeps/include" \
+     LDFLAGS="-L${ROCM_HOME}/lib/rocm_sysdeps/lib" \
+     PKG_CONFIG_PATH="${ROCM_HOME}/lib/rocm_sysdeps/lib/pkgconfig" \
+-    python setup.py bdist_wheel && \
++    # PyTorch 2.14 builds with scikit-build-core (pyproject.toml); setup.py bdist_wheel fails.
++    python -m build --wheel --no-isolation && \
+     pip install dist/*.whl && \
+     mv dist/*.whl /install && \
+     rm -rf build dist
+diff --git a/docker/install_rocm_debs.sh b/docker/install_rocm_debs.sh
+index 0c77bad..f2cf60a 100755
+--- a/docker/install_rocm_debs.sh
++++ b/docker/install_rocm_debs.sh
+@@ -60,10 +60,12 @@ case "${layer}" in
+         # Host libraries the AITER JIT link line names, plus the runtimes
+         # libtorch_hip loads. Per-arch shards hold device code. solver/sparse
+         # gfx packages are empty edges pulled in by the BLAS shard.
+-        # rocSHMEM, hipFile, rocJPEG, rocDecode, and RPP stay out: this
+-        # libtorch does not link them, and amdrocm-core would pull them in.
++        # rocSHMEM, rocJPEG, rocDecode, and RPP stay out: this libtorch does
++        # not link them, and amdrocm-core would pull them in. PyTorch 2.14
++        # requires hipFile at configure time on HIP >= 7.14 (LoadHIP.cmake).
+         packages+=(
+             "amdrocm-runtime-dev${deb_series}"
++            "amdrocm-hipfile-dev${deb_series}"
+             "amdrocm-ccl-dev${deb_series}"
+             "amdrocm-blas-dev${deb_series}"
+             "amdrocm-blas-host${deb_series}"
