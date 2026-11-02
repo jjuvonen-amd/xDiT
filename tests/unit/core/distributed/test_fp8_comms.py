@@ -15,6 +15,9 @@ from xfuser.core.distributed.fp8_comms import (
     register_fp8_comms_eligible_modules,
     validate_fp8_comms_config,
 )
+from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
+    minimax_h3_attn_modules,
+)
 from xfuser.model_executor.models.transformers.transformer_sd3 import (
     sd3_attn_modules,
 )
@@ -161,6 +164,17 @@ def test_z_image_registration_includes_refiners():
     )
 
     assert z_image_attn_modules(transformer) == [noise, context, main]
+
+
+def test_minimax_h3_registration_skips_the_token_refiner():
+    """The token refiner attends over the text on every rank, without a Ulysses collective."""
+    first, second, refiner = nn.Module(), nn.Module(), nn.Module()
+    transformer = SimpleNamespace(
+        token_refiner=SimpleNamespace(refiner_blocks=[SimpleNamespace(attn=refiner)]),
+        transformer_blocks=[SimpleNamespace(attn=first), SimpleNamespace(attn=second)],
+    )
+
+    assert minimax_h3_attn_modules(transformer) == [first, second]
 
 
 def _outlier_qk(head_dim: int = 128, seq: int = 64, dtype=torch.bfloat16, device=_HB_DEVICE):

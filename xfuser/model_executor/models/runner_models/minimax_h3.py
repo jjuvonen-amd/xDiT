@@ -523,6 +523,7 @@ class xFuserMiniMaxH3Model(xFuserModel):
         use_fp8_gemms=True,
         use_fp4_gemms=True,
         use_hybrid_attn_schedule=True,
+        use_fp8_comms=True,
         enable_slicing=False,
         enable_tiling=False,
     )
@@ -1105,6 +1106,8 @@ class xFuserVDNMiniMaxH3Model(xFuserMiniMaxH3Model):
         use_fp8_gemms=True,
         use_fp4_gemms=False,
         use_hybrid_attn_schedule=False,
+        # The VDN processors exchange heads themselves rather than through USP.
+        use_fp8_comms=False,
     )
 
     supported_attn_backends = _VDN_SUPPORTED_ATTN_BACKENDS
@@ -1227,6 +1230,9 @@ class xFuserMiniMaxH3Ref2VAModel(xFuserMiniMaxH3Model):
     )
 
     _transformer_component_name = "transformer_ref"
+    # FP8 comms registers and calibrates the pipeline's transformer and
+    # transformer_2 only, so transformer_ref would run without it unnoticed.
+    capabilities = dataclasses.replace(xFuserMiniMaxH3Model.capabilities, use_fp8_comms=False)
     settings = ModelSettings(
         model_name="MiniMaxAI/MiniMax-H3",
         output_name="minimax_h3_ref2va",
