@@ -1,0 +1,1527 @@
+From c9747824e3dce7e563c6174c40354d71e0473066 Mon Sep 17 00:00:00 2001
+From: jjuvonen-amd <joni.juvonen@amd.com>
+Date: Mon, 2 Nov 2026 12:54:29 +0000
+Subject: [PATCH] [ROCm] symm_mem: fused all-gather + matmul and matmul +
+ reduce-scatter on SDMA engines (prototype)
+
+For large inputs, fused_all_gather_matmul and fused_matmul_reduce_scatter copy
+shards out of peers' symmetric-memory buffers with tensor copies. On ROCm, HIP
+runs concurrent copies from those buffers one at a time, so the all-gather
+moves at about one link's rate, and the copies compete with the matmuls for
+compute units.
+
+This adds an opt-in ROCm path (TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1). Every rank
+pushes its data into each peer's symmetric-memory inbox with ROCr's
+hsa_amd_memory_async_copy_on_engine: one SDMA engine per peer (the engine ROCr
+prefers for writing to that peer), all peers at once, in pieces, each piece's
+matmul starting as soon as it has landed. A spare engine writes a per-sender
+flag once a peer's piece has landed; a one-thread kernel waits for the flags,
+bounded by a timeout, and another releases the copies after the
+symmetric-memory barrier. Rows land in natural order, so results, return_A and
+output strides match the default path.
+
+Captured calls issue their copies from a host-function node on every replay.
+Unsupported cases (last-dim gather/scatter, the fp8 scaled ops, unvalidated
+architectures unless TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED=1) take the
+default path.
+
+The transport (_rocm_sdma.hip) is built with torch.utils.cpp_extension on
+first use and called through ctypes; a C++ port under
+torch/csrc/distributed/c10d/symm_mem is the follow-up for review.
+
+Test plan:
+python test/distributed/test_symmetric_memory.py -k "AsyncTPTest or AsyncTPRocmSdmaTest"
+TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 python test/distributed/test_symmetric_memory.py -k AsyncTPTest
+---
+ test/distributed/test_symmetric_memory.py     | 255 ++++++++
+ .../distributed/_symmetric_memory/__init__.py |  30 +
+ .../_symmetric_memory/_rocm_sdma.hip          | 542 ++++++++++++++++
+ .../_symmetric_memory/_rocm_sdma.py           | 604 ++++++++++++++++++
+ 4 files changed, 1431 insertions(+)
+ create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.hip
+ create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.py
+
+diff --git a/test/distributed/test_symmetric_memory.py b/test/distributed/test_symmetric_memory.py
+index 2ded449..aeb037a 100644
+--- a/test/distributed/test_symmetric_memory.py
++++ b/test/distributed/test_symmetric_memory.py
+@@ -2000,6 +2000,261 @@ class AsyncTPTest(MultiProcContinuousTest):
+         self.assertTrue(torch.allclose(x, t))
+ 
+ 
++# The SDMA path on any ROCm GPU, validated or not (see _rocm_sdma.py).
++_ROCM_SDMA_ENV = {
++    "TORCH_SYMM_MEM_ENABLE_ROCM_SDMA": "1",
++    "TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED": "1",
++}
++
++
++@skipIf(not TEST_WITH_ROCM, "the SDMA path of the fused ops is ROCm only")
++@skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch")
++@instantiate_parametrized_tests
++@requires_accelerator_p2p_access()
++class AsyncTPRocmSdmaTest(MultiProcContinuousTest):
++    """The fused ops with TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 match their fallbacks,
++    and the cases the SDMA path supports take it."""
++
++    @property
++    def device(self) -> torch.device:
++        return torch.device(device_type, self.rank)
++
++    def _init_process(self):
++        device_module.set_device(self.device)
++        torch.manual_seed(42 + self.rank)
++
++    @staticmethod
++    def _sdma_calls(op: str) -> int:
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        return _rocm_sdma.num_calls[op]
++
++    def _assert_close_to_fp32(self, actual, expected) -> None:
++        # bf16 results against an fp32 reference of the same bf16 inputs: the
++        # fallback's own bf16 reduce-scatter rounds each partial sum it adds,
++        # so it is no closer to the exact result than this path.
++        scale = expected.abs().max().item()
++        torch.testing.assert_close(
++            actual.float(), expected, rtol=2e-2, atol=1e-2 * scale
++        )
++
++    @skip_if_lt_x_gpu(2)
++    @parametrize("gather_dim", [0, 1, 2])
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_fused_all_gather_matmul(self, gather_dim: int) -> None:
++        self._init_process()
++        BATCH, M, N, K = 8, 64, 16, 32
++        group_name = dist.group.WORLD.group_name
++        A_shard_shape = [BATCH, M, K]
++        A_shard_shape[gather_dim] //= self.world_size
++        A_shard = torch.rand(A_shard_shape, device=device_type)
++        Bs = [torch.rand(K, N, device=device_type) for _ in range(3)]
++
++        calls = self._sdma_calls("fused_all_gather_matmul")
++        ag_0, mm_0 = _fused_all_gather_matmul_fallback(
++            A_shard, Bs, gather_dim=gather_dim, group_name=group_name
++        )
++        ag_1, mm_1 = torch.ops.symm_mem.fused_all_gather_matmul(
++            A_shard, Bs, gather_dim=gather_dim, group_name=group_name
++        )
++
++        # Gathering the last dim is left to the default path.
++        self.assertEqual(
++            self._sdma_calls("fused_all_gather_matmul") - calls,
++            0 if gather_dim == 2 else 1,
++        )
++        torch.testing.assert_close(ag_1, ag_0, rtol=0, atol=0)
++        self.assertEqual(ag_1.stride(), ag_0.stride())
++        for out_1, out_0 in zip(mm_1, mm_0):
++            torch.testing.assert_close(out_1, out_0)
++            self.assertEqual(out_1.stride(), out_0.stride())
++
++    @skip_if_lt_x_gpu(2)
++    @parametrize("scatter_dim", [0, 1, 2])
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_fused_matmul_reduce_scatter(self, scatter_dim: int) -> None:
++        self._init_process()
++        BATCH, M, N, K = 8, 64, 16, 1024
++        group_name = dist.group.WORLD.group_name
++        A = torch.rand(BATCH, M, K, device=device_type)
++        B = torch.rand(K, N, device=device_type)
++
++        calls = self._sdma_calls("fused_matmul_reduce_scatter")
++        output_0 = _fused_matmul_reduce_scatter_fallback(
++            A, B, "avg", scatter_dim=scatter_dim, group_name=group_name
++        )
++        output_1 = torch.ops.symm_mem.fused_matmul_reduce_scatter(
++            A, B, "avg", scatter_dim=scatter_dim, group_name=group_name
++        )
++
++        # Scattering the last dim is left to the default path.
++        self.assertEqual(
++            self._sdma_calls("fused_matmul_reduce_scatter") - calls,
++            0 if scatter_dim == 2 else 1,
++        )
++        torch.testing.assert_close(output_1, output_0, rtol=1e-5, atol=1e-5)
++        self.assertEqual(output_1.stride(), output_0.stride())
++
++    @skip_if_lt_x_gpu(2)
++    @parametrize("chunks", [1, 3, 4])
++    def test_bfloat16_batch_and_chunks(self, chunks: int) -> None:
++        """Several pieces per rank in flight at once, a batch of two, two Bs."""
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        A_shard = torch.randn(2, 384, 512, device=device_type, dtype=torch.bfloat16)
++        Bs = [
++            torch.randn(640, 512, device=device_type, dtype=torch.bfloat16).t(),
++            torch.randn(512, 256, device=device_type, dtype=torch.bfloat16),
++        ]
++        A = torch.randn(
++            2, 384 * self.world_size, 512, device=device_type, dtype=torch.bfloat16
++        )
++
++        env = {**_ROCM_SDMA_ENV, "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": str(chunks)}
++        with mock.patch.dict(os.environ, env):
++            ag_1, mm_1 = torch.ops.symm_mem.fused_all_gather_matmul(
++                A_shard, Bs, gather_dim=1, group_name=group_name, return_A=False
++            )
++            rs_1 = torch.ops.symm_mem.fused_matmul_reduce_scatter(
++                A, Bs[1], "sum", scatter_dim=1, group_name=group_name
++            )
++        _, mm_0 = _fused_all_gather_matmul_fallback(
++            A_shard.float(),
++            [B.float() for B in Bs],
++            gather_dim=1,
++            group_name=group_name,
++        )
++        rs_0 = _fused_matmul_reduce_scatter_fallback(
++            A.float(), Bs[1].float(), "sum", scatter_dim=1, group_name=group_name
++        )
++
++        self.assertIsNone(ag_1)
++        for out_1, out_0 in zip(mm_1, mm_0):
++            self._assert_close_to_fp32(out_1, out_0)
++        self._assert_close_to_fp32(rs_1, rs_0)
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_fused_matmul_reduce_scatter_bfloat16_custom_reduce(self) -> None:
++        self._init_process()
++        M, N, K = 64, 32, 1024
++        group_name = dist.group.WORLD.group_name
++        A = torch.rand(M, K, device=device_type, dtype=torch.bfloat16)
++        B = torch.rand(K, N, device=device_type, dtype=torch.bfloat16)
++
++        output_0 = _fused_matmul_reduce_scatter_fallback(
++            A, B, "avg", scatter_dim=0, group_name=group_name
++        )
++        output_1 = torch.ops.symm_mem.fused_matmul_reduce_scatter(
++            A, B, "avg", scatter_dim=0, group_name=group_name
++        )
++        torch.testing.assert_close(output_0, output_1, rtol=1e-2, atol=1e-2)
++        self.assertEqual(output_0.stride(), output_1.stride())
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_graph_capture(self) -> None:
++        """Captured calls issue their copies from a host-function node on every
++        replay."""
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        A_shard = torch.randn(1, 256, 128, device=device_type, dtype=torch.bfloat16)
++        A = torch.randn(
++            1, 256 * self.world_size, 128, device=device_type, dtype=torch.bfloat16
++        )
++        B = torch.randn(128, 96, device=device_type, dtype=torch.bfloat16)
++
++        # Eager calls with the same shapes size the workspace, which cannot grow
++        # during capture.
++        torch.ops.symm_mem.fused_all_gather_matmul(A_shard, [B], 1, group_name)
++        torch.ops.symm_mem.fused_matmul_reduce_scatter(A, B, "sum", 1, group_name)
++        calls = self._sdma_calls("fused_all_gather_matmul")
++        graph = graph_cls()
++        with device_module.graph(graph):
++            ag_1, (mm_1,) = torch.ops.symm_mem.fused_all_gather_matmul(
++                A_shard, [B], 1, group_name
++            )
++            rs_1 = torch.ops.symm_mem.fused_matmul_reduce_scatter(
++                A, B, "sum", 1, group_name
++            )
++        self.assertEqual(self._sdma_calls("fused_all_gather_matmul") - calls, 1)
++
++        for _ in range(5):
++            A_shard.copy_(torch.randn_like(A_shard))
++            A.copy_(torch.randn_like(A))
++            graph.replay()
++            ag_0, (mm_0,) = _fused_all_gather_matmul_fallback(
++                A_shard.float(), [B.float()], gather_dim=1, group_name=group_name
++            )
++            rs_0 = _fused_matmul_reduce_scatter_fallback(
++                A.float(), B.float(), "sum", scatter_dim=1, group_name=group_name
++            )
++            torch.testing.assert_close(ag_1.float(), ag_0, rtol=0, atol=0)
++            self._assert_close_to_fp32(mm_1, mm_0)
++            self._assert_close_to_fp32(rs_1, rs_0)
++
++    @skip_if_lt_x_gpu(4)
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_two_process_groups(self) -> None:
++        """Calls alternate between the whole group and halves of it."""
++        self._init_process()
++        half = self.world_size // 2
++        halves = [
++            dist.new_group(list(range(i * half, (i + 1) * half))) for i in range(2)
++        ]
++        mine = halves[self.rank // half]
++        for group in [dist.group.WORLD, mine, dist.group.WORLD, mine]:
++            A_shard = torch.randn(1, 128, 256, device=device_type, dtype=torch.bfloat16)
++            B = torch.randn(256, 64, device=device_type, dtype=torch.bfloat16)
++            ag_1, (mm_1,) = torch.ops.symm_mem.fused_all_gather_matmul(
++                A_shard, [B], 1, group.group_name
++            )
++            ag_0, (mm_0,) = _fused_all_gather_matmul_fallback(
++                A_shard.float(), [B.float()], gather_dim=1, group_name=group.group_name
++            )
++            torch.testing.assert_close(ag_1.float(), ag_0, rtol=0, atol=0)
++            self._assert_close_to_fp32(mm_1, mm_0)
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(
++        os.environ,
++        {
++            **_ROCM_SDMA_ENV,
++            "TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT": "raise",
++            "TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S": "2",
++            "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": "2",
++        },
++    )
++    def test_lost_flag_is_reported(self) -> None:
++        """A flag that never lands ends its wait after the timeout and is reported."""
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        A_shard = torch.randn(256, 128, device=device_type, dtype=torch.bfloat16)
++        B = torch.randn(128, 64, device=device_type, dtype=torch.bfloat16)
++        torch.ops.symm_mem.fused_all_gather_matmul(
++            A_shard, [B], 0, group_name, return_A=False
++        )
++        device_module.synchronize()
++        if self.rank == 0:
++            # Piece 1 of rank 0's next call loses its flag write to its first
++            # peer, rank 1.
++            _rocm_sdma.debug_drop_flag(1, 0)
++        torch.ops.symm_mem.fused_all_gather_matmul(
++            A_shard, [B], 0, group_name, return_A=False
++        )
++        device_module.synchronize()
++        dist.barrier()
++        if self.rank == 1:
++            with self.assertRaisesRegex(
++                RuntimeError, r"piece 1: flag words \[0\] never set"
++            ):
++                _rocm_sdma.raise_if_failed()
++        else:
++            _rocm_sdma.raise_if_failed()
++
++
+ # [READ ME FIRST]
+ # The `SymmMemEmptySetDeviceTest` suite parameterizes whether user sets the
+ # device before calling symm_mem.empty.  Either way should work.
+diff --git a/torch/distributed/_symmetric_memory/__init__.py b/torch/distributed/_symmetric_memory/__init__.py
+index c163062..fc4089e 100644
+--- a/torch/distributed/_symmetric_memory/__init__.py
++++ b/torch/distributed/_symmetric_memory/__init__.py
+@@ -981,6 +981,15 @@ def _fused_all_gather_matmul(
+         )
+         return A.view(*leading_dims, -1), [out.view(*leading_dims, -1)]
+ 
++    if _should_use_rocm_sdma():
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        if _rocm_sdma.should_use_all_gather_matmul(A_shard, Bs, gather_dim, group_name):
++            with torch.profiler.record_function("fused_all_gather_matmul"):
++                return _rocm_sdma.fused_all_gather_matmul(
++                    A_shard, Bs, gather_dim, group_name, return_A=return_A
++                )
++
+     if _should_use_multimem_all_gather_matmul(
+         A_shard, gather_dim, group_name, return_A
+     ):
+@@ -1000,6 +1009,16 @@ def _fused_all_gather_matmul(
+         )
+ 
+ 
++def _should_use_rocm_sdma() -> bool:
++    # Opt-in: on ROCm, the fused all-gather + matmul and matmul + reduce-scatter
++    # move data on SDMA copy engines (see _rocm_sdma.py), for the cases
++    # _rocm_sdma.should_use_* accept.
++    return (
++        torch.version.hip is not None
++        and os.environ.get("TORCH_SYMM_MEM_ENABLE_ROCM_SDMA") == "1"
++    )
++
++
+ # Each 256-row M tile of the ROCm _async_input_mm waits on one chunk's signal,
+ # so each rank's chunk must be a whole number of tiles.
+ _ROCM_ASYNC_MM_TILE_M = 256
+@@ -1413,6 +1432,17 @@ def _fused_matmul_reduce_scatter(
+             A, B, reduce_op, scatter_dim, group_name
+         )
+ 
++    if _should_use_rocm_sdma():
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        if _rocm_sdma.should_use_matmul_reduce_scatter(
++            A, B, reduce_op, scatter_dim, group_name
++        ):
++            with torch.profiler.record_function("fused_matmul_reduce_scatter"):
++                return _rocm_sdma.fused_matmul_reduce_scatter(
++                    A, B, reduce_op, scatter_dim, group_name
++                )
++
+     with torch.profiler.record_function("fused_matmul_reduce_scatter"):
+         return _fused_matmul_reduce_scatter_impl(
+             mm_out_op=torch.ops.aten.mm.out,
+diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.hip b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
+new file mode 100644
+index 0000000..86e3559
+--- /dev/null
++++ b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
+@@ -0,0 +1,542 @@
++// SDMA transport for the ROCm path of
++// torch.ops.symm_mem.fused_all_gather_matmul and fused_matmul_reduce_scatter
++// (see _rocm_sdma.py). Built on first use with torch.utils.cpp_extension and
++// called through ctypes.
++//
++// Every copy is issued by the sending rank on its own SDMA engines and names
++// the local GPU on both sides: peers' symmetric-memory buffers are mapped in
++// this process for the local GPU. A call's pieces are pushed into every peer's
++// symmetric-memory inbox, one engine per peer, all peers at once, queued in
++// order on each engine. Once a peer's copies of a piece land, a 4-byte write on
++// a spare engine sets this rank's own flag word for that piece at the peer (one
++// word per sender, so no two engines write the same word); on the data engines,
++// a flag write that waits for its piece would stall the next piece behind it.
++// Every data copy also waits for a trigger signal that a one-thread kernel
++// releases on the compute stream, so no copy starts before the stream reaches
++// that point.
++//
++// The host side of a call, arming its slot of signals and issuing its copies,
++// is a plan. An eager call runs its plan at once. A call captured into a graph
++// enqueues its plan as a host-function node, so every replay arms and issues
++// the copies when the stream reaches the call; the node only makes ROCr calls,
++// no HIP ones.
++//
++// The compute stream waits for a piece's flags with a one-thread kernel whose
++// wait is bounded: flags that never land are recorded in host-mapped memory
++// (rsdma_peek_error / rsdma_take_error), and the stream either moves on or
++// stays held for the host to abort the process. A plan that fails inside a
++// host-function node is recorded the same way.
++//
++// Functions return 0 on success and a negative code otherwise.
++#include <hip/hip_runtime.h>
++#include <hsa/hsa.h>
++#include <hsa/hsa_ext_amd.h>
++
++#include <chrono>
++#include <cstdint>
++#include <vector>
++
++// A bounded flag wait that ran out of time, or a captured plan that failed,
++// written into host-visible memory.
++struct RsdmaError {
++  unsigned long long count; // failures since the last rsdma_take_error
++  // First one, a wait: bit i set if flag word i never read 1.
++  unsigned long long missing;
++  int piece; // first one: piece (-1 for a plan) and call id
++  int call;
++  int status; // first one: 0 for a wait, else the failed plan's return code
++};
++
++namespace {
++
++struct Gpu {
++  hsa_agent_t agent;
++  uint32_t bus;
++};
++
++constexpr int kTriggers = 16; // per slot: one per piece at most
++
++struct Slot {
++  hsa_signal_t trigger[kTriggers];
++  volatile hsa_signal_value_t* trigger_value[kTriggers];
++  std::vector<hsa_signal_t> data; // one per data copy of a call
++  std::vector<hsa_signal_t> flag; // one per flag write of a call
++  int armed_data = 0; // what the last call on this slot used
++  int armed_flags = 0;
++};
++
++// Copy j to peer i is dst[i * m + j] <- src[i * m + j], `bytes` each, on
++// engines[i] once trigger k is released; then, once peer i's m copies have
++// landed, the 4 bytes at `one` go to flag_dst[i] on the spare engine
++// engines[n].
++struct Push {
++  int k, n, m;
++  uint64_t bytes, one;
++  std::vector<uint64_t> dst, src, flag_dst;
++  std::vector<int> engines;
++};
++
++struct Plan {
++  int slot, n_data, n_flags, call;
++  std::vector<Push> pushes; // push p is piece p of the call
++};
++
++std::vector<Gpu> g_gpus;
++std::vector<Slot> g_slots; // sized once by rsdma_init; never reallocated
++hsa_agent_t g_local;
++RsdmaError* g_error = nullptr; // host-mapped
++int* g_scratch = nullptr; // device word that a dropped flag write goes to
++int g_drop_piece = -1, g_drop_index = -1;
++unsigned long long g_ticks_per_s = 0;
++
++hsa_status_t collect(hsa_agent_t agent, void*) {
++  hsa_device_type_t type;
++  hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &type);
++  if (type == HSA_DEVICE_TYPE_GPU) {
++    uint32_t bdf = 0;
++    hsa_agent_get_info(agent, (hsa_agent_info_t)HSA_AMD_AGENT_INFO_BDFID, &bdf);
++    g_gpus.push_back({agent, (bdf >> 8) & 0xff});
++  }
++  return HSA_STATUS_SUCCESS;
++}
++
++int agent_of(int hip_dev, hsa_agent_t* out) {
++  hipDeviceProp_t prop;
++  if (hipGetDeviceProperties(&prop, hip_dev) != hipSuccess)
++    return -1;
++  for (const Gpu& g : g_gpus)
++    if (g.bus == (uint32_t)prop.pciBusID) {
++      *out = g.agent;
++      return 0;
++    }
++  return -2;
++}
++
++// Waits until `s` drops below 1 (its copy finished); false after kWaitSeconds,
++// so a copy that never runs fails the call instead of hanging it.
++constexpr double kWaitSeconds = 60.0;
++
++bool wait_done(hsa_signal_t s) {
++  auto deadline = std::chrono::steady_clock::now() +
++      std::chrono::duration<double>(kWaitSeconds);
++  while (hsa_signal_load_scacquire(s) >= 1) {
++    if (std::chrono::steady_clock::now() > deadline)
++      return false;
++    hsa_signal_wait_scacquire(
++        s, HSA_SIGNAL_CONDITION_LT, 1, 1000000, HSA_WAIT_STATE_ACTIVE);
++  }
++  return true;
++}
++
++int lowest(uint32_t mask) {
++  for (int e = 0; e < 32; ++e)
++    if (mask >> e & 1)
++      return e;
++  return -1;
++}
++
++__global__ void release_trigger(hsa_signal_value_t* value) {
++  __hip_atomic_store(
++      value,
++      (hsa_signal_value_t)0,
++      __ATOMIC_RELEASE,
++      __HIP_MEMORY_SCOPE_SYSTEM);
++}
++
++// Waits until all `count` words at `words` read 1 (acquire, system scope). Once
++// `budget` wall-clock ticks have passed it records which words were missing;
++// then it returns, or with `block` keeps waiting, holding the stream so no work
++// after it runs on data that never came (the host's watchdog aborts the
++// process).
++__global__ void wait_flags(
++    const int* words,
++    int count,
++    unsigned long long budget,
++    RsdmaError* err,
++    int piece,
++    int call,
++    int block) {
++  unsigned long long start = wall_clock64();
++  bool recorded = false;
++  while (true) {
++    unsigned long long missing = 0;
++    for (int i = 0; i < count; ++i)
++      if (__hip_atomic_load(
++              words + i, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1)
++        missing |= 1ull << i;
++    if (!missing)
++      return;
++    if (!recorded && wall_clock64() - start > budget) {
++      if (__hip_atomic_fetch_add(
++              &err->count, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) ==
++          0) {
++        err->missing = missing;
++        err->piece = piece;
++        err->call = call;
++        err->status = 0;
++      }
++      __threadfence_system();
++      if (!block)
++        return;
++      recorded = true;
++    }
++    __builtin_amdgcn_s_sleep(2);
++  }
++}
++
++// Launched once at init: fails to launch if the library has no code object for
++// this GPU.
++__global__ void probe(int* word) {
++  *word = 0;
++}
++
++// Grows `v` to `n` signals, all at value 0; false if ROCr cannot create one.
++bool grow(std::vector<hsa_signal_t>& v, int n) {
++  while ((int)v.size() < n) {
++    hsa_signal_t s;
++    if (hsa_signal_create(0, 0, nullptr, &s) != HSA_STATUS_SUCCESS)
++      return false;
++    v.push_back(s);
++  }
++  return true;
++}
++
++// Waits for the copies of `slot`'s previous use to finish, then sets its
++// triggers and the signals the next call uses to 1.
++int arm(int slot, int n_data, int n_flags) {
++  Slot& s = g_slots[slot];
++  for (int i = 0; i < s.armed_data; ++i)
++    if (!wait_done(s.data[i]))
++      return -1000 - i; // data copy i never landed
++  for (int i = 0; i < s.armed_flags; ++i)
++    if (!wait_done(s.flag[i]))
++      return -2000 - i; // flag write i never landed
++  // The slot is idle now, so it can grow for a call larger than any before.
++  if (!grow(s.data, n_data) || !grow(s.flag, n_flags))
++    return -1;
++  for (int k = 0; k < kTriggers; ++k)
++    hsa_signal_store_relaxed(s.trigger[k], 1);
++  for (int i = 0; i < n_data; ++i)
++    hsa_signal_store_relaxed(s.data[i], 1);
++  for (int i = 0; i < n_flags; ++i)
++    hsa_signal_store_relaxed(s.flag[i], 1);
++  s.armed_data = n_data;
++  s.armed_flags = n_flags;
++  return 0;
++}
++
++// Issues piece `piece` of a call on `slot`, using its data signals piece * n *
++// m onward and its flag signals piece * n onward.
++int issue(int slot, int piece, const Push& p) {
++  Slot& s = g_slots[slot];
++  int first = piece * p.n * p.m;
++  // Every piece waits for its trigger itself, rather than relying on queueing
++  // behind piece 0.
++  for (int c = 0; c < p.n * p.m; ++c) {
++    hsa_amd_sdma_engine_id_t engine =
++        (hsa_amd_sdma_engine_id_t)(1u << p.engines[c / p.m]);
++    hsa_status_t st = hsa_amd_memory_async_copy_on_engine(
++        (void*)p.dst[c],
++        g_local,
++        (const void*)p.src[c],
++        g_local,
++        p.bytes,
++        1,
++        &s.trigger[p.k],
++        s.data[first + c],
++        engine,
++        true);
++    if (st != HSA_STATUS_SUCCESS)
++      return -100 - (int)st;
++  }
++  hsa_amd_sdma_engine_id_t spare =
++      (hsa_amd_sdma_engine_id_t)(1u << p.engines[p.n]);
++  for (int i = 0; i < p.n; ++i) {
++    void* flag = (void*)p.flag_dst[i];
++    if (piece == g_drop_piece &&
++        i == g_drop_index) { // test hook: this flag goes nowhere
++      flag = g_scratch;
++      g_drop_piece = g_drop_index = -1;
++    }
++    hsa_status_t st = hsa_amd_memory_async_copy_on_engine(
++        flag,
++        g_local,
++        (const void*)p.one,
++        g_local,
++        4,
++        p.m,
++        &s.data[first + i * p.m],
++        s.flag[piece * p.n + i],
++        spare,
++        true);
++    if (st != HSA_STATUS_SUCCESS)
++      return -200 - (int)st;
++  }
++  return 0;
++}
++
++int run(const Plan& plan) {
++  int rc = arm(plan.slot, plan.n_data, plan.n_flags);
++  for (int i = 0; rc == 0 && i < (int)plan.pushes.size(); ++i)
++    rc = issue(plan.slot, i, plan.pushes[i]);
++  return rc;
++}
++
++// Host-function node of a captured call: runs its plan on every replay; a
++// failure is recorded for the watchdog (or the next eager call) to report, and
++// the call's flag waits time out.
++void run_node(void* data) {
++  const Plan* plan = static_cast<const Plan*>(data);
++  int rc = run(*plan);
++  if (rc != 0 &&
++      __atomic_fetch_add(&g_error->count, 1ull, __ATOMIC_RELAXED) == 0) {
++    g_error->missing = 0;
++    g_error->piece = -1;
++    g_error->call = plan->call;
++    g_error->status = rc;
++  }
++}
++
++} // namespace
++
++extern "C" {
++
++// `slots` calls may be in flight at once; a slot is reused only after its
++// copies finished.
++int rsdma_init(int local_dev, int slots) {
++  if (!g_slots.empty())
++    return 0;
++  if (hsa_init() != HSA_STATUS_SUCCESS)
++    return -1;
++  if (hsa_iterate_agents(collect, nullptr) != HSA_STATUS_SUCCESS)
++    return -2;
++  if (agent_of(local_dev, &g_local))
++    return -3;
++  if (hipHostMalloc(
++          (void**)&g_error,
++          sizeof(RsdmaError),
++          hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess)
++    return -8;
++  *g_error = RsdmaError{};
++  if (hipMalloc((void**)&g_scratch, 64) != hipSuccess)
++    return -9;
++  hipLaunchKernelGGL(probe, dim3(1), dim3(1), 0, 0, g_scratch);
++  if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess)
++    return -11; // no code for this GPU
++  int khz = 0;
++  if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, local_dev) !=
++          hipSuccess ||
++      khz <= 0)
++    return -10;
++  g_ticks_per_s = (unsigned long long)khz * 1000ull;
++  g_slots.resize(slots);
++  for (Slot& s : g_slots) {
++    // Triggers are written by a kernel, so their values must be addressable:
++    // GPU-only signals.
++    for (int k = 0; k < kTriggers; ++k) {
++      if (hsa_amd_signal_create(
++              0, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &s.trigger[k]) !=
++          HSA_STATUS_SUCCESS)
++        return -4;
++      if (hsa_amd_signal_value_pointer(s.trigger[k], &s.trigger_value[k]) !=
++          HSA_STATUS_SUCCESS)
++        return -5;
++    }
++  }
++  return 0;
++}
++
++// One SDMA engine (bit index) per peer, in engines[0..n-1]: ROCr's preferred
++// engine for writing from `local_dev` to that peer; a peer whose preferred
++// engine is taken gets the lowest available engine no peer prefers (then any
++// free one). engines[n] is a spare engine, used by no peer, for the flag
++// writes.
++int rsdma_engine_plan(
++    int local_dev,
++    const int* peer_devs,
++    int n,
++    int* engines) {
++  hsa_agent_t local, peer;
++  if (agent_of(local_dev, &local))
++    return -1;
++  std::vector<uint32_t> avail(n), preferred(n, 0);
++  for (int i = 0; i < n; ++i) {
++    if (agent_of(peer_devs[i], &peer))
++      return -2;
++    if (hsa_amd_memory_copy_engine_status(peer, local, &avail[i]) !=
++        HSA_STATUS_SUCCESS)
++      return -3;
++    uint32_t mask = 0;
++    if (hsa_amd_memory_get_preferred_copy_engine(peer, local, &mask) ==
++        HSA_STATUS_SUCCESS)
++      preferred[i] = mask;
++  }
++  uint32_t used = 0, wanted = 0, everywhere = ~0u;
++  for (int i = 0; i < n; ++i) {
++    engines[i] = lowest(preferred[i] & avail[i]);
++    if (engines[i] >= 0)
++      wanted |= 1u << engines[i];
++    everywhere &= avail[i];
++  }
++  for (int i = 0; i < n; ++i) {
++    uint32_t bit = engines[i] >= 0 ? 1u << engines[i] : 0;
++    if (bit && !(used & bit)) {
++      used |= bit;
++      continue;
++    }
++    engines[i] = -1;
++  }
++  for (int i = 0; i < n; ++i) {
++    if (engines[i] >= 0)
++      continue;
++    int e = lowest(avail[i] & ~used & ~wanted);
++    if (e < 0)
++      e = lowest(avail[i] & ~used);
++    if (e < 0)
++      return -4;
++    engines[i] = e;
++    used |= 1u << e;
++  }
++  // The flag writes name the local GPU on both sides, like the data copies; any
++  // engine that every link offers will do, preferably one no peer uses.
++  engines[n] = lowest(everywhere & ~used);
++  if (engines[n] < 0)
++    engines[n] = lowest(everywhere);
++  return engines[n] < 0 ? -5 : 0;
++}
++
++// A plan for a call on `slot` of up to `n_data` data copies and `n_flags` flag
++// writes; null if the slot does not exist.
++void* rsdma_plan_new(int slot, int n_data, int n_flags, int call) {
++  if (slot < 0 || slot >= (int)g_slots.size())
++    return nullptr;
++  return new Plan{slot, n_data, n_flags, call, {}};
++}
++
++// Adds the call's next piece (see Push).
++int rsdma_plan_push(
++    void* handle,
++    int k,
++    const uint64_t* dst,
++    const uint64_t* src,
++    uint64_t bytes,
++    const int* engines,
++    int n,
++    int m,
++    const uint64_t* flag_dst,
++    uint64_t one) {
++  Plan& plan = *static_cast<Plan*>(handle);
++  int piece = (int)plan.pushes.size();
++  if ((piece + 1) * n * m > plan.n_data || (piece + 1) * n > plan.n_flags ||
++      k < 0 || k >= kTriggers)
++    return -1;
++  plan.pushes.push_back(
++      Push{
++          k,
++          n,
++          m,
++          bytes,
++          one,
++          std::vector<uint64_t>(dst, dst + n * m),
++          std::vector<uint64_t>(src, src + n * m),
++          std::vector<uint64_t>(flag_dst, flag_dst + n),
++          std::vector<int>(engines, engines + n + 1)});
++  return 0;
++}
++
++// Arms the plan's slot and issues its copies now; frees the plan.
++int rsdma_plan_run(void* handle) {
++  Plan* plan = static_cast<Plan*>(handle);
++  int rc = run(*plan);
++  delete plan;
++  return rc;
++}
++
++// Enqueues the plan on `stream` as a host function (during graph capture, a
++// host-function node): it runs when the stream reaches it, on every replay. The
++// plan is kept for as long as the process runs, as the graph may be replayed at
++// any time.
++int rsdma_plan_enqueue(void* handle, hipStream_t stream) {
++  return hipLaunchHostFunc(stream, run_node, handle) == hipSuccess ? 0 : -1;
++}
++
++// Enqueues the release of `slot`'s trigger `k` on `stream`: copies gated on it
++// start once the stream reaches this point.
++int rsdma_release(int slot, int k, hipStream_t stream) {
++  if (slot < 0 || slot >= (int)g_slots.size() || k < 0 || k >= kTriggers)
++    return -2;
++  hipLaunchKernelGGL(
++      release_trigger,
++      dim3(1),
++      dim3(1),
++      0,
++      stream,
++      const_cast<hsa_signal_value_t*>(g_slots[slot].trigger_value[k]));
++  return hipGetLastError() == hipSuccess ? 0 : -1;
++}
++
++// Enqueues on `stream` a wait until the `count` 32-bit flags at `words` all
++// read 1. After `seconds` a wait that is still missing flags is recorded
++// (rsdma_peek_error, rsdma_take_error); then the stream moves on, or with
++// `block` stays held (for the host to abort the process).
++int rsdma_wait_flags(
++    hipStream_t stream,
++    uint64_t words,
++    int count,
++    double seconds,
++    int piece,
++    int call,
++    int block) {
++  if (count > 64)
++    return -1;
++  unsigned long long budget =
++      (unsigned long long)(seconds * (double)g_ticks_per_s);
++  hipLaunchKernelGGL(
++      wait_flags,
++      dim3(1),
++      dim3(1),
++      0,
++      stream,
++      (const int*)words,
++      count,
++      budget,
++      g_error,
++      piece,
++      call,
++      block);
++  return hipGetLastError() == hipSuccess ? 0 : -2;
++}
++
++// How many failures were recorded (0 if none) and the first one's piece, call
++// id, status and missing-flag mask, without clearing the record: for a watchdog
++// that polls it.
++int rsdma_peek_error(int* piece, int* call, int* status, uint64_t* missing) {
++  volatile RsdmaError* e = g_error;
++  if (e == nullptr)
++    return 0;
++  unsigned long long count = e->count;
++  if (count == 0)
++    return 0;
++  *piece = e->piece;
++  *call = e->call;
++  *status = e->status;
++  *missing = e->missing;
++  return (int)(count > 0x7fffffff ? 0x7fffffff : count);
++}
++
++// As rsdma_peek_error, and clears the record.
++int rsdma_take_error(int* piece, int* call, int* status, uint64_t* missing) {
++  int count = rsdma_peek_error(piece, call, status, missing);
++  if (count)
++    g_error->count = 0;
++  return count;
++}
++
++// Test hook: the next issue of piece `piece` diverts its flag write for peer
++// index `index` to a scratch word, as if it were lost.
++int rsdma_debug_drop_flag(int piece, int index) {
++  g_drop_piece = piece;
++  g_drop_index = index;
++  return 0;
++}
++}
+diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.py b/torch/distributed/_symmetric_memory/_rocm_sdma.py
+new file mode 100644
+index 0000000..8129556
+--- /dev/null
++++ b/torch/distributed/_symmetric_memory/_rocm_sdma.py
+@@ -0,0 +1,604 @@
++"""SDMA copy engines for symm_mem's fused all-gather + matmul and matmul + reduce-scatter on ROCm.
++
++The default implementations move shards with tensor copies from peers'
++symmetric-memory buffers (_pipelined_all_gather_and_consume,
++_pipelined_produce_and_all2all). On ROCm, HIP runs concurrent copies out of those
++buffers one at a time, so the all-gather moves at about one link's rate, and the
++copies compete with the matmuls for compute units. Here every rank pushes its
++data into each peer's symmetric-memory inbox with ROCr's
++hsa_amd_memory_async_copy_on_engine, one SDMA engine per peer (the engine ROCr
++prefers for writing to that peer), all peers at once. The copies use no compute
++units.
++
++All-gather + matmul: each rank's rows are cut into `chunks` pieces. Piece c of
++rank r lands in rows r * M + c * block of every peer's inbox, so the inbox holds
++the gathered A in natural order. The compute stream waits for piece c of every
++rank and runs its matmul, one batched GEMM over the (world, block, K) rows, while
++later pieces are in flight.
++
++Matmul + reduce-scatter: matmul c computes this rank's partial sums for piece c of
++every rank's output rows; once it is done, the engines push each owner's piece
++into that owner's inbox, and each rank sums the partials it received for piece c
++(in fp32) one piece behind, so the next matmul is never held up by a wait.
++
++Each call zeroes its flags and puts this rank's own data in place on the compute
++stream, then passes a symmetric-memory barrier; a one-thread kernel then releases
++the copies, which wait for it on the SDMA engines. Flag waits are bounded: after
++TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S seconds (default 30) a wait records which
++flags never landed. With TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT=abort (default) the
++wait keeps the stream held, so nothing runs on data that never came, and a
++watchdog thread logs what was missing and aborts the process. With =raise the
++stream moves on (that call's output is wrong) and the next eager call raises.
++
++CUDA graphs: a call captured into a graph enqueues its host side (arming its
++signals and issuing its copies) as a host-function node, so every replay issues
++the copies when the stream reaches the call. Captured calls take their signals
++from slots apart from eager calls', so an eager call never waits on a graph's
++copies or the reverse. As for the other symm_mem ops, the symmetric-memory
++workspace cannot be allocated during capture: run each op once, eagerly, with
++the shapes it will be captured with (the first call per process group also sets
++up this module).
++
++Opt-in with TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1. The transport (_rocm_sdma.hip) is
++built with torch.utils.cpp_extension on first use, for the GPU's architecture
++(needs hipcc). It runs on the architectures in VALIDATED_ARCHS; on others the
++default path runs unless TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED=1. Pieces per
++rank: TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS (default 4), or the largest smaller count
++that divides the rows.
++"""
++
++import ctypes
++import logging
++import os
++import sys
++import threading
++import time
++from pathlib import Path
++
++import torch
++import torch.distributed as dist
++import torch.distributed._symmetric_memory as symm_mem
++import torch.distributed.distributed_c10d as c10d
++
++
++logger = logging.getLogger(__name__)
++
++# GPU architectures the path is validated on.
++VALIDATED_ARCHS = ("gfx950",)
++MAX_CHUNKS = 16  # triggers per slot in the transport
++MAX_WORLD = 64  # flag words one wait kernel checks
++_EAGER_SLOTS = 4
++_CAPTURE_SLOTS = 8
++
++_lib = None
++_groups: dict[str, "_Group"] = {}
++_next_eager_slot = 0
++_next_capture_slot = 0
++_last_call = 0
++_ones: dict[torch.device, torch.Tensor] = {}
++_watchdog = None
++_warned_archs: set[str] = set()
++
++# Calls that took this path, per op (for tests).
++num_calls = {"fused_all_gather_matmul": 0, "fused_matmul_reduce_scatter": 0}
++
++
++def _env(name: str, default: str) -> str:
++    return os.environ.get(f"TORCH_SYMM_MEM_{name}", default).strip()
++
++
++def _timeout_s() -> float:
++    return float(_env("ROCM_SDMA_TIMEOUT_S", "30"))
++
++
++def _on_timeout() -> str:
++    mode = _env("ROCM_SDMA_ON_TIMEOUT", "abort").lower()
++    if mode not in ("abort", "raise"):
++        raise ValueError(
++            f"TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT must be abort or raise; got {mode!r}"
++        )
++    return mode
++
++
++def _arch(device: torch.device) -> str:
++    return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
++
++
++def _check(rc: int, what: str) -> None:
++    if rc != 0:
++        raise RuntimeError(f"{what} failed with {rc}")
++
++
++def enabled() -> bool:
++    return torch.version.hip is not None and _env("ENABLE_ROCM_SDMA", "0") == "1"
++
++
++def _supported(t: torch.Tensor, row_dim: int, group_name: str) -> bool:
++    if (
++        not enabled()
++        or t.device.type != "cuda"
++        or t.dim() < 2
++        or not 0 <= row_dim < t.dim() - 1
++    ):
++        return False
++    if not 2 <= c10d._resolve_process_group(group_name).size() <= MAX_WORLD:
++        return False
++    arch = _arch(t.device)
++    if arch in VALIDATED_ARCHS or _env("ROCM_SDMA_ALLOW_UNTESTED", "0") == "1":
++        return True
++    if arch not in _warned_archs:
++        _warned_archs.add(arch)
++        logger.warning(
++            "symm_mem's SDMA path is validated on %s, not %s; using the default path. Set "
++            "TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED=1 to use it anyway.",
++            ", ".join(VALIDATED_ARCHS),
++            arch,
++        )
++    return False
++
++
++def should_use_all_gather_matmul(
++    A_shard: torch.Tensor, Bs: list[torch.Tensor], gather_dim: int, group_name: str
++) -> bool:
++    """Whether fused_all_gather_matmul takes this path (other cases run the default one)."""
++    return all(B.dim() == 2 for B in Bs) and _supported(A_shard, gather_dim, group_name)
++
++
++def should_use_matmul_reduce_scatter(
++    A: torch.Tensor, B: torch.Tensor, reduce_op: str, scatter_dim: int, group_name: str
++) -> bool:
++    """Whether fused_matmul_reduce_scatter takes this path (other cases run the default one)."""
++    if (
++        B.dim() != 2
++        or reduce_op not in ("sum", "avg")
++        or not _supported(A, scatter_dim, group_name)
++    ):
++        return False
++    return A.shape[scatter_dim] % c10d._resolve_process_group(group_name).size() == 0
++
++
++def _load():
++    """Build (once, cached by torch.utils.cpp_extension) and load the transport."""
++    global _lib
++    if _lib is not None:
++        return _lib
++    from torch.utils import cpp_extension
++
++    path = cpp_extension.load(
++        name="torch_symm_mem_rocm_sdma",
++        sources=[str(Path(__file__).with_name("_rocm_sdma.hip"))],
++        # In extra_cflags, where cpp_extension sees an explicit arch (else it builds for every visible GPU's).
++        extra_cflags=[
++            "-O2",
++            f"--offload-arch={_arch(torch.device('cuda', torch.cuda.current_device()))}",
++        ],
++        extra_ldflags=["-lhsa-runtime64"],
++        is_python_module=False,
++    )
++    lib = ctypes.CDLL(path)
++    i, u64, vp, dbl = ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_double
++    ip, u64p = ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint64)
++    for name, argtypes, restype in [
++        ("rsdma_init", [i, i], i),
++        ("rsdma_engine_plan", [i, ip, i, ip], i),
++        ("rsdma_plan_new", [i, i, i, i], vp),
++        ("rsdma_plan_push", [vp, i, u64p, u64p, u64, ip, i, i, u64p, u64], i),
++        ("rsdma_plan_run", [vp], i),
++        ("rsdma_plan_enqueue", [vp, vp], i),
++        ("rsdma_release", [i, i, vp], i),
++        ("rsdma_wait_flags", [vp, u64, i, dbl, i, i, i], i),
++        ("rsdma_peek_error", [ip, ip, ip, u64p], i),
++        ("rsdma_take_error", [ip, ip, ip, u64p], i),
++        ("rsdma_debug_drop_flag", [i, i], i),
++    ]:
++        getattr(lib, name).argtypes = argtypes
++        getattr(lib, name).restype = restype
++    _lib = lib
++    return lib
++
++
++class _Group:
++    """Per process group: this rank's peers in step order, one SDMA engine per peer and a spare one."""
++
++    def __init__(self, group_name: str):
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "symm_mem's SDMA path sets up a process group on its first call, which cannot be "
++                "captured: run the op once eagerly before capturing it"
++            )
++        lib = _load()
++        group = c10d._resolve_process_group(group_name)
++        self.rank, self.world = group.rank(), group.size()
++        device = torch.cuda.current_device()
++        devices = [None] * self.world
++        dist.all_gather_object(devices, device, group=group)
++        rc = lib.rsdma_init(device, _EAGER_SLOTS + _CAPTURE_SLOTS)
++        if rc == -11:
++            raise RuntimeError(
++                f"the SDMA transport has no GPU code for {_arch(torch.device('cuda', device))}"
++            )
++        _check(rc, "rsdma_init")
++        self.peers = [(self.rank + step) % self.world for step in range(1, self.world)]
++        n = len(self.peers)
++        peer_devs = (ctypes.c_int * n)(*[devices[p] for p in self.peers])
++        self.engine_arr = (ctypes.c_int * (n + 1))()
++        _check(
++            lib.rsdma_engine_plan(device, peer_devs, n, self.engine_arr),
++            "rsdma_engine_plan",
++        )
++        self.engines = list(self.engine_arr[:n])
++        _start_watchdog(lib)
++
++
++def _group(group_name: str) -> _Group:
++    if group_name not in _groups:
++        _groups[group_name] = _Group(group_name)
++    return _groups[group_name]
++
++
++def engine_plan(group_name: str) -> dict:
++    """This rank's SDMA engines: {peer rank: engine}."""
++    g = _group(group_name)
++    return dict(zip(g.peers, g.engines))
++
++
++def debug_drop_flag(piece: int, peer_index: int) -> None:
++    """Test hook: the next issue of `piece` loses its flag write to peer index `peer_index`."""
++    _load().rsdma_debug_drop_flag(piece, peer_index)
++
++
++def _one(device: torch.device) -> torch.Tensor:
++    """A device int32 1, the value every flag write copies."""
++    if device not in _ones:
++        _ones[device] = torch.ones(1, dtype=torch.int32, device=device)
++    return _ones[device]
++
++
++def _failure_message(
++    count: int, piece: int, call: int, status: int, missing: int
++) -> str:
++    rank = dist.get_rank() if dist.is_initialized() else "?"
++    plans = {name: dict(zip(g.peers, g.engines)) for name, g in _groups.items()}
++    if status:
++        first = f"the host-function node of captured call {call} failed with {status}"
++    else:
++        words = [i for i in range(MAX_WORLD) if missing >> i & 1]
++        first = (
++            f"call {call}, piece {piece}: flag words {words} never set (word r is group rank r's) "
++            f"after {_timeout_s():g} s"
++        )
++    return f"rank {rank}: {count} symm_mem SDMA failure(s). First: {first}. SDMA engine per peer rank: {plans}"
++
++
++def _start_watchdog(lib) -> None:
++    """A thread that, in abort mode (read when it sees a failure), aborts the process once a flag
++    wait or a captured plan failed. In raise mode it leaves the failure to the next eager call."""
++    global _watchdog
++    if _watchdog is not None:
++        return
++
++    def watch():
++        piece, call, status, missing = (
++            ctypes.c_int(),
++            ctypes.c_int(),
++            ctypes.c_int(),
++            ctypes.c_uint64(),
++        )
++        while True:
++            count = lib.rsdma_peek_error(
++                ctypes.byref(piece),
++                ctypes.byref(call),
++                ctypes.byref(status),
++                ctypes.byref(missing),
++            )
++            if count and _on_timeout() == "abort":
++                message = _failure_message(
++                    count, piece.value, call.value, status.value, missing.value
++                )
++                logger.error("%s; aborting", message)
++                print(f"{message}; aborting", file=sys.stderr, flush=True)
++                os.abort()
++            time.sleep(0.1)
++
++    _watchdog = threading.Thread(
++        target=watch, name="symm-mem-rocm-sdma-watchdog", daemon=True
++    )
++    _watchdog.start()
++
++
++def raise_if_failed() -> None:
++    """Raise if a flag wait or captured plan of an earlier call failed (raise mode checks this every eager call)."""
++    piece, call, status, missing = (
++        ctypes.c_int(),
++        ctypes.c_int(),
++        ctypes.c_int(),
++        ctypes.c_uint64(),
++    )
++    count = _load().rsdma_take_error(
++        ctypes.byref(piece),
++        ctypes.byref(call),
++        ctypes.byref(status),
++        ctypes.byref(missing),
++    )
++    if count:
++        raise RuntimeError(
++            _failure_message(
++                count, piece.value, call.value, status.value, missing.value
++            )
++        )
++
++
++class _Plan:
++    """The host side of one call: its slot, call id and the pieces its SDMA engines push."""
++
++    def __init__(self, lib, g: _Group, pieces: int, copies_per_peer: int):
++        global _next_eager_slot, _next_capture_slot, _last_call
++        self.lib, self.g = lib, g
++        self.capturing = torch.cuda.is_current_stream_capturing()
++        if self.capturing:
++            self.slot = _EAGER_SLOTS + _next_capture_slot
++            _next_capture_slot = (_next_capture_slot + 1) % _CAPTURE_SLOTS
++        else:
++            if _on_timeout() == "raise":
++                raise_if_failed()
++            self.slot = _next_eager_slot
++            _next_eager_slot = (_next_eager_slot + 1) % _EAGER_SLOTS
++        _last_call += 1
++        self.call = _last_call
++        n = len(g.peers)
++        self.handle = lib.rsdma_plan_new(
++            self.slot, pieces * n * copies_per_peer, pieces * n, self.call
++        )
++        if not self.handle:
++            raise RuntimeError("rsdma_plan_new failed")
++
++    def push(
++        self,
++        k: int,
++        dst: list[int],
++        src: list[int],
++        nbytes: int,
++        flag_dst: list[int],
++        one: int,
++    ) -> None:
++        """Add the next piece: dst[i] <- src[i] for peer i (in g.peers order), released by trigger k."""
++        n = len(self.g.peers)
++        u64 = ctypes.c_uint64
++        rc = self.lib.rsdma_plan_push(
++            self.handle,
++            k,
++            (u64 * n)(*dst),
++            (u64 * n)(*src),
++            nbytes,
++            self.g.engine_arr,
++            n,
++            1,
++            (u64 * n)(*flag_dst),
++            one,
++        )
++        _check(rc, "rsdma_plan_push")
++
++    def start(self, stream: torch.cuda.Stream) -> None:
++        """Issue the copies now, or when `stream` reaches this point on every replay if capturing."""
++        if self.capturing:
++            _check(
++                self.lib.rsdma_plan_enqueue(
++                    self.handle, ctypes.c_void_p(stream.cuda_stream)
++                ),
++                "rsdma_plan_enqueue",
++            )
++            return
++        rc = self.lib.rsdma_plan_run(self.handle)
++        n = len(self.g.peers)
++        if rc <= -2000:
++            raise RuntimeError(
++                f"flag write {-rc - 2000} of an earlier call on slot {self.slot} never landed"
++            )
++        if rc <= -1000:
++            i = -rc - 1000
++            raise RuntimeError(
++                f"a copy to peer rank {self.g.peers[i % n]} (SDMA engine {self.g.engines[i % n]}) of an earlier "
++                f"call on slot {self.slot} never landed"
++            )
++        _check(rc, "rsdma_plan_run")
++
++    def release(self, k: int, stream: torch.cuda.Stream) -> None:
++        """Let the pieces gated on trigger k start once `stream` reaches this point."""
++        _check(
++            self.lib.rsdma_release(self.slot, k, ctypes.c_void_p(stream.cuda_stream)),
++            "rsdma_release",
++        )
++
++    def wait(self, stream: torch.cuda.Stream, flags: torch.Tensor, piece: int) -> None:
++        """Make `stream` wait (bounded) until every int32 in `flags` reads 1."""
++        # In raise mode the stream moves on after the timeout; a captured wait keeps the mode
++        # it was captured in.
++        rc = self.lib.rsdma_wait_flags(
++            ctypes.c_void_p(stream.cuda_stream),
++            flags.data_ptr(),
++            flags.numel(),
++            _timeout_s(),
++            piece,
++            self.call,
++            int(_on_timeout() == "abort"),
++        )
++        _check(rc, "rsdma_wait_flags")
++
++
++def _inbox(
++    group_name: str, rank: int, world: int, shape, dtype: torch.dtype, chunks: int
++):
++    """This rank's symmetric inbox of `shape` and its (chunks, world) int32 flag words, plus every
++    rank's workspace base address and the flags' byte offset in it."""
++    nbytes = torch.empty((), dtype=dtype).element_size()
++    for d in shape:
++        nbytes *= d
++    flag_offset = -(-nbytes // 64) * 64
++    size = flag_offset + chunks * world * 4
++    ws = symm_mem.get_symm_mem_workspace(group_name, min_size=size)
++    inbox = ws.get_buffer(rank, tuple(shape), dtype)
++    flags = ws.get_buffer(
++        rank, (chunks, world), torch.int32, storage_offset=flag_offset // 4
++    )
++    bases = [ws.get_buffer(r, (size,), torch.uint8).data_ptr() for r in range(world)]
++    return ws, inbox, flags, bases, flag_offset
++
++
++def _barrier(ws) -> None:
++    # A peer may reach the barrier only after all of its own bounded waits gave up, one per piece.
++    ws.barrier(channel=0, timeout_ms=int(_timeout_s() * (MAX_CHUNKS + 2) * 1000))
++
++
++def _chunks(rows: int) -> int:
++    """Pieces per rank: TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS, or the largest smaller count dividing `rows`."""
++    want = int(_env("ROCM_SDMA_CHUNKS", "4"))
++    if not 1 <= want <= MAX_CHUNKS:
++        raise ValueError(
++            f"TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS must be 1 to {MAX_CHUNKS}; got {want}"
++        )
++    return max(c for c in range(1, want + 1) if rows % c == 0)
++
++
++def fused_all_gather_matmul(
++    A_shard: torch.Tensor,
++    Bs: list[torch.Tensor],
++    gather_dim: int,
++    group_name: str,
++    return_A: bool = True,
++) -> tuple[torch.Tensor | None, list[torch.Tensor]]:
++    """all_gather(A_shard, gather_dim) @ B for every B in Bs, as symm_mem.fused_all_gather_matmul."""
++    lib = _load()
++    g = _group(group_name)
++    world, rank, n = g.world, g.rank, len(g.peers)
++    # As _fused_all_gather_matmul_impl: gather_dim first, flattened to rows.
++    A_shard_flat = A_shard.movedim(gather_dim, 0)
++    leading_dims = [world] + list(A_shard_flat.shape[:-1])
++    x = A_shard_flat.flatten(0, -2)
++    rows, features = x.shape
++    chunks = _chunks(rows)
++    block = rows // chunks
++    elt = x.element_size()
++    piece_bytes = block * features * elt
++    stream = torch.cuda.current_stream()
++
++    # The inbox is the gathered A: rank r's rows at r * rows.
++    ws, inbox, flags, bases, flag_offset = _inbox(
++        group_name, rank, world, (world, rows, features), x.dtype, chunks
++    )
++    plan = _Plan(lib, g, chunks, 1)
++    own = (
++        bases[rank] + rank * rows * features * elt
++    )  # this rank's rows in its own inbox: the copies' source
++    one = _one(x.device).data_ptr()
++    for c in range(chunks):
++        offset = (rank * rows + c * block) * features * elt
++        plan.push(
++            0,
++            [bases[p] + offset for p in g.peers],
++            [own + c * piece_bytes] * n,
++            piece_bytes,
++            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
++            one,
++        )
++    flags.zero_()
++    flags[:, rank] = 1
++    inbox[rank].copy_(x)
++    outputs = [x.new_empty(world * rows, B.shape[1], dtype=B.dtype) for B in Bs]
++
++    # Every rank's own rows and cleared flags are in place, and its inbox is free, past this barrier.
++    _barrier(ws)
++    # Issued after the kernels above are enqueued, so the GPU runs them meanwhile; the copies
++    # wait for the release.
++    plan.start(stream)
++    plan.release(0, stream)
++    pieces = inbox.view(world, chunks, block, features)
++    for c in range(chunks):
++        plan.wait(stream, flags[c], c)
++        for B, out in zip(Bs, outputs):
++            torch.bmm(
++                pieces[:, c],
++                B.expand(world, *B.shape),
++                out=out.view(world, chunks, block, -1)[:, c],
++            )
++    A = inbox.reshape(world * rows, features).clone() if return_A else None
++    # Every rank waited for every piece before its last matmul, so past this barrier no copy reads
++    # or writes this call's inboxes.
++    _barrier(ws)
++    num_calls["fused_all_gather_matmul"] += 1
++
++    def unflatten(t: torch.Tensor) -> torch.Tensor:
++        return t.view(*leading_dims, -1).flatten(0, 1).movedim(0, gather_dim)
++
++    return (unflatten(A) if A is not None else None), [
++        unflatten(out) for out in outputs
++    ]
++
++
++def fused_matmul_reduce_scatter(
++    A: torch.Tensor, B: torch.Tensor, reduce_op: str, scatter_dim: int, group_name: str
++) -> torch.Tensor:
++    """reduce_scatter(A @ B, reduce_op, scatter_dim), as symm_mem.fused_matmul_reduce_scatter."""
++    lib = _load()
++    g = _group(group_name)
++    world, rank = g.world, g.rank
++    # As _fused_matmul_reduce_scatter_impl: scatter_dim first, flattened to rows; owner r gets
++    # rows r * rows .. (r + 1) * rows of the result.
++    x = A.movedim(scatter_dim, 0)
++    owner_dims = list(x.shape[:-1])
++    owner_dims[0] //= world
++    x = x.flatten(0, -2).contiguous()
++    rows = x.shape[0] // world
++    chunks = _chunks(rows)
++    block = rows // chunks
++    out_features = B.shape[1]
++    elt = x.element_size()
++    block_bytes = block * out_features * elt
++    stream = torch.cuda.current_stream()
++
++    # inbox[c, s] = sender s's partial sums for piece c of this rank's rows.
++    shape = (chunks, world, block, out_features)
++    ws, inbox, flags, bases, flag_offset = _inbox(
++        group_name, rank, world, shape, x.dtype, chunks
++    )
++    # partials[c, r] = this rank's partial sums for piece c of owner r's rows.
++    partials = x.new_empty(shape)
++    plan = _Plan(lib, g, chunks, 1)
++    one = _one(x.device).data_ptr()
++    for c in range(chunks):
++        # Piece c is pushed once its matmul is done: trigger c.
++        plan.push(
++            c,
++            [bases[p] + (c * world + rank) * block_bytes for p in g.peers],
++            [partials[c, p].data_ptr() for p in g.peers],
++            block_bytes,
++            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
++            one,
++        )
++    flags.zero_()
++    flags[:, rank] = 1
++    out = x.new_empty(rows, out_features)
++    # Every rank's inbox is free and its flags cleared past this barrier.
++    _barrier(ws)
++    # As for the all-gather: issued while the GPU runs the kernels above; each piece waits for its release.
++    plan.start(stream)
++
++    def reduce(c: int) -> None:
++        plan.wait(stream, flags[c], c)
++        total = torch.sum(inbox[c], dim=0, dtype=torch.float32)
++        if reduce_op == "avg":
++            total /= world
++        out[c * block : (c + 1) * block] = total
++
++    owners = x.view(world, chunks, block, -1)
++    for c in range(chunks):
++        torch.bmm(owners[:, c], B.expand(world, *B.shape), out=partials[c])
++        inbox[c, rank].copy_(partials[c, rank])
++        plan.release(c, stream)
++        if c > 0:
++            reduce(c - 1)
++    reduce(chunks - 1)
++    # Every rank waited for every piece from every peer, so past this barrier no copy reads
++    # `partials` or writes an inbox.
++    _barrier(ws)
++    num_calls["fused_matmul_reduce_scatter"] += 1
++    return out.view(*owner_dims, out_features).movedim(0, scatter_dim).contiguous()
+
+base-commit: 1d09b5ff92cf50820425fe85058bc6f6a8c2c745
+-- 
+2.43.0
+
