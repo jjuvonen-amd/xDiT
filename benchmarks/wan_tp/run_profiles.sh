@@ -10,7 +10,8 @@
 # where <cross> is "sharded" (cross-attention split too: 3 all-gathers + 3 reduce-scatters
 # per block) or "repl" (cross-attention whole on each rank's rows: 2 + 2). "_ov" pipelines
 # each collective against its GEMM in chunks (XDIT_TP_COMM_OVERLAP=chunked); "_fused" uses
-# torch's symm_mem fused AG+GEMM / GEMM+RS ops (XDIT_TP_COMM_OVERLAP=symm_mem; NVLink only);
+# torch's symm_mem fused AG+GEMM / GEMM+RS ops (XDIT_TP_COMM_OVERLAP=symm_mem; NVLink, or ROCm
+# with torch patched by patches/pytorch and TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1);
 # "_sdma" gathers each all-gather + GEMM on SDMA copy engines (XDIT_TP_COMM_OVERLAP=sdma; ROCm).
 #
 # Environment:

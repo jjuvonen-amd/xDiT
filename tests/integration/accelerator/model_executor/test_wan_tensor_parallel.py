@@ -4,8 +4,9 @@ TP shards the heads and the FFN, splits the residual rows across the TP group
 and normalizes Q/K over heads held by different ranks. Cross-attention is
 either sharded the same way or kept whole on every rank's own rows. The
 collectives run next to their GEMMs, pipelined against them in chunks (which
-holds the rows block-cyclically), inside torch's fused symm_mem ops, or (ROCm) with the all-gathers
-on SDMA copy engines in pieces. The model pads the sequence to a multiple of SP x TP x chunks, so
+holds the rows block-cyclically), inside torch's fused symm_mem ops (on ROCm, their fallback or,
+on a torch patched with patches/pytorch, their SDMA path), or (ROCm) with the all-gathers on SDMA
+copy engines in pieces. The model pads the sequence to a multiple of SP x TP x chunks, so
 a short sequence also checks the pad.
 Tiny random weights in fp32 on SDPA_EFFICIENT, so only reduction order
 differs from one GPU; nothing is downloaded.
@@ -74,6 +75,13 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
 
     if options.get("sdma_reduce_scatter"):
         os.environ["XDIT_TP_SDMA_REDUCE_SCATTER"] = "on"
+    torch_sdma = options.get("torch_sdma", False)
+    if torch_sdma:
+        os.environ.update(
+            TORCH_SYMM_MEM_ENABLE_ROCM_SDMA="1",
+            TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED="1",
+            TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS="2",
+        )
 
     from xfuser.config.args import xFuserArgs
     from xfuser.core.distributed import (
@@ -124,9 +132,14 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         }
         # torch's symm_mem kernels segfault on ROCm; its test mode runs their collective + GEMM
         # fallback through the same op calls, so the wiring is still checked there.
-        fused_kernels = symm_mem._test_mode() if fused == "symm_mem" and torch.version.hip else contextlib.nullcontext()
+        fallback = fused == "symm_mem" and torch.version.hip and not torch_sdma
+        fused_kernels = symm_mem._test_mode() if fallback else contextlib.nullcontext()
         with torch.no_grad(), fused_kernels:
             output = model(**inputs, return_dict=False)[0]
+        if torch_sdma:
+            from torch.distributed._symmetric_memory import _rocm_sdma
+
+            assert min(_rocm_sdma.num_calls.values()) > 0, f"the SDMA path did not run: {_rocm_sdma.num_calls}"
         if rank == 0:
             torch.save(output.cpu(), output_path)
     finally:
@@ -292,6 +305,30 @@ def test_tensor_parallel_with_sdma_on_several_groups_and_batches(tmp_path, one_g
         fused="sdma",
         sdma_reduce_scatter=reduce_scatter == "sdma",
     )
+
+    error = _relative_error(actual, expected)
+    assert error <= TOLERANCE, f"relative error {error:.3e}"
+
+
+def _torch_has_sdma_patch():
+    import importlib.util
+
+    return importlib.util.find_spec("torch.distributed._symmetric_memory._rocm_sdma") is not None
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+@pytest.mark.parametrize("mode, batch", [("tp2", 1), ("tp4", 1), ("tp2-ulysses2", 1), ("tp4-ring2", 1), ("tp2", 2)])
+def test_tensor_parallel_with_patched_torch_symm_mem_matches_one_gpu(
+    tmp_path, one_gpu_output, mode, batch, latent_shape
+):
+    """torch's symm_mem fused ops on their SDMA path (a torch patched with patches/pytorch, run with
+    TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1), as XDIT_TP_COMM_OVERLAP=symm_mem runs them."""
+    if not torch.cuda.is_available() or torch.version.hip is None or not _torch_has_sdma_patch():
+        pytest.skip("needs ROCm and a torch patched with patches/pytorch")
+    expected = one_gpu_output("wan", latent_shape, batch=batch)
+
+    actual = _run(tmp_path, mode, "wan", latent_shape, batch=batch, fused="symm_mem", torch_sdma=True)
 
     error = _relative_error(actual, expected)
     assert error <= TOLERANCE, f"relative error {error:.3e}"

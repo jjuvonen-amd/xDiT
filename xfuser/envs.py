@@ -69,7 +69,8 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     #   chunked - pipelined in XDIT_TP_OVERLAP_CHUNKS chunks, RCCL on a side stream
     #             (benchmarks/tp_comm_gemm_overlap.py measures the gain per site).
     #   symm_mem - torch's symm_mem fused AG+GEMM / GEMM+RS ops (NVLink; they
-    #             segfault on torch 2.13 / ROCm 7.16).
+    #             segfault on torch 2.13 / ROCm 7.16). On ROCm, a torch patched with
+    #             patches/pytorch runs them on SDMA engines with TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1.
     #   sdma    - ROCm: each all-gather + GEMM with the gather on SDMA copy engines, all peers at
     #             once, in XDIT_TP_OVERLAP_CHUNKS pieces whose GEMMs start as they land
     #             (layers/sdma_all_gather.py); reduce-scatters as with chunked.

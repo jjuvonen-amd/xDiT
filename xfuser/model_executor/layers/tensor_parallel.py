@@ -22,9 +22,11 @@ With `fused="symm_mem"`, torch's symmetric-memory ops run each pair instead
 (`symm_mem.fused_all_gather_matmul` / `fused_matmul_reduce_scatter`). They
 pipeline peer-to-peer copies against per-shard GEMMs themselves, on the
 contiguous layout. They work over NVLink; on torch 2.13 / ROCm 7.16 they
-segfault beyond ~10 MB. With `fused="sdma"` (ROCm), each all-gather + GEMM
-gathers on SDMA copy engines, all peers at once, in `chunks` pieces on the
-block-cyclic layout, each piece's GEMM starting as it lands
+segfault beyond ~10 MB. A torch patched with patches/pytorch runs them on
+ROCm's SDMA engines (TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1). With `fused="sdma"`
+(ROCm), each all-gather + GEMM gathers on SDMA copy engines, all peers at
+once, in `chunks` pieces on the block-cyclic layout, each piece's GEMM starting
+as it lands
 (layers/sdma_all_gather.py); reduce-scatters run as with `fused` unset, or with
 XDIT_TP_SDMA_REDUCE_SCATTER=on push their partial sums on SDMA engines and reduce
 them chunk by chunk.

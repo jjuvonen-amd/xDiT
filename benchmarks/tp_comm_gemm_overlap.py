@@ -14,11 +14,18 @@ model does today and with the collective pipelined against the GEMM:
   symm_mem    torch.ops.symm_mem.fused_all_gather_matmul / fused_matmul_reduce_scatter.
               Opt-in: peer access through torch symmetric memory segfaulted
               beyond ~10 MB on torch 2.13 / ROCm 7.16.
+  symm_mem_sdma_kN  ROCm, opt-in (--symm-mem-sdma): the same torch ops on a torch patched with
+              patches/pytorch (TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 for these calls only), N pieces
+              per rank. Natural row order, so the same inputs as symm_mem. With --graph also
+              symm_mem_sdma_graph_kN: the same call captured once in a CUDA graph and replayed (each
+              replay issues the copies from a host-function node).
   sdma_kN     ROCm, opt-in (--sdma): xfuser's all-gather + GEMM with the gather on SDMA
               copy engines, all peers at once, in N pieces on the block-cyclic rows; each
               piece's GEMM starts as it lands (xfuser/model_executor/layers/sdma_all_gather.py).
               At RS sites, the GEMM in N chunks with each chunk's partial sums pushed to their
               owners on SDMA engines and reduced chunk by chunk (sdma_linear_reduce_scatter).
+
+The all-gathers are called with return_A=False, as inference calls them.
 
 `comm_only` and `gemm_only` time each half alone; `ideal` is their max. Each
 variant is checked against baseline. Times are the slowest rank's median.
@@ -28,6 +35,7 @@ variant is checked against baseline. Times are the slowest rank's median.
 """
 
 import argparse
+import contextlib
 import importlib
 import math
 import os
@@ -46,6 +54,7 @@ _SITES = {
     "attn_out": ("rs", lambda h, f, p: h, lambda h, f, p: h // p),
     "ffn_down": ("rs", lambda h, f, p: h, lambda h, f, p: f // p),
 }
+_TORCH_SDMA_ENV = ("TORCH_SYMM_MEM_ENABLE_ROCM_SDMA", "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS")
 # How often each site runs per block, with cross-attention sharded or replicated.
 _PER_BLOCK = {
     "sharded": {"qkv": 1, "attn2_q": 1, "ffn_up": 1, "attn_out": 2, "ffn_down": 1},
@@ -62,6 +71,10 @@ def _parse_args():
     parser.add_argument("--chunks", nargs="+", type=int, default=[2, 4, 8])
     parser.add_argument("--symm-mem", action="store_true", help="also time torch's fused symm_mem ops")
     parser.add_argument("--sdma", action="store_true", help="also time the SDMA all-gather + GEMM (ROCm)")
+    parser.add_argument(
+        "--symm-mem-sdma", action="store_true", help="also time torch's symm_mem ops on their patched SDMA path (ROCm)"
+    )
+    parser.add_argument("--graph", action="store_true", help="with --symm-mem-sdma, also time it replayed from a graph")
     parser.add_argument("--sdma-trigger", default="gpu", choices=["gpu", "host"])
     parser.add_argument("--sdma-direction", default="push", choices=["push", "pull"])
     parser.add_argument("--warmup", type=int, default=5)
@@ -113,7 +126,9 @@ class Bench:
         return out_buf
 
     def ag_symm_mem(self, a_local, weight, out_buf):
-        _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(a_local, [weight.t()], 0, self.group_name)
+        _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(
+            a_local, [weight.t()], 0, self.group_name, return_A=False
+        )
         return out
 
     def ag_sdma(self, a_cyclic, weight, k):
@@ -153,6 +168,47 @@ class Bench:
 
     def rs_symm_mem(self, a_full, weight, out_buf):
         return torch.ops.symm_mem.fused_matmul_reduce_scatter(a_full, weight.t(), "sum", 0, self.group_name)
+
+    @contextlib.contextmanager
+    def torch_sdma(self, k, op):
+        """Calls inside run torch's symm_mem ops on their SDMA path in k pieces per rank (patched torch)."""
+        from torch.distributed._symmetric_memory import _rocm_sdma
+
+        saved = {name: os.environ.get(name) for name in _TORCH_SDMA_ENV}
+        os.environ.update({"TORCH_SYMM_MEM_ENABLE_ROCM_SDMA": "1", "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": str(k)})
+        calls = _rocm_sdma.num_calls[op]
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        if _rocm_sdma.num_calls[op] == calls:
+            raise RuntimeError(
+                f"torch's {op} did not take its SDMA path (unvalidated GPU? set "
+                "TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED=1)"
+            )
+
+    @staticmethod
+    def graphed(fn):
+        """fn captured once into a CUDA graph (eager calls first sized the workspace): (replay, its output)."""
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = fn()
+        return graph.replay, out
+
+    def time_torch_sdma(self, results, k, op, fn, expected):
+        """symm_mem_sdma_k{k} for `fn` (a stock symm_mem call), and replayed from a graph with --graph."""
+        with self.torch_sdma(k, op):
+            self.check(f"symm_mem_sdma_k{k}", fn(), expected)
+            results[f"symm_mem_sdma_k{k}"] = self.time(fn)
+            if self.args.graph:
+                replay, out = self.graphed(fn)
+                replay()
+                self.check(f"symm_mem_sdma_graph_k{k}", out, expected)
+                results[f"symm_mem_sdma_graph_k{k}"] = self.time(replay)
 
     # ---- timing --------------------------------------------------------------------------------
     def time(self, fn):
@@ -202,6 +258,10 @@ class Bench:
             if self.args.symm_mem:
                 self.check("symm_mem", self.ag_symm_mem(a_local, weight, out), expected)
                 results["symm_mem"] = self.time(lambda: self.ag_symm_mem(a_local, weight, out))
+            if self.args.symm_mem_sdma:
+                for k in self.args.chunks:
+                    fn = lambda: self.ag_symm_mem(a_local, weight, out)  # noqa: E731
+                    self.time_torch_sdma(results, k, "fused_all_gather_matmul", fn, expected)
             if self.args.sdma:
                 for k in self.args.chunks:
                     a_cyclic = self.cyclic_rows(x_full, k).contiguous()
@@ -225,6 +285,10 @@ class Bench:
             if self.args.symm_mem:
                 self.check("symm_mem", self.rs_symm_mem(a_full, weight, out), expected_local)
                 results["symm_mem"] = self.time(lambda: self.rs_symm_mem(a_full, weight, out))
+            if self.args.symm_mem_sdma:
+                for k in self.args.chunks:
+                    fn = lambda: self.rs_symm_mem(a_full, weight, out)  # noqa: E731
+                    self.time_torch_sdma(results, k, "fused_matmul_reduce_scatter", fn, expected_local)
             if self.args.sdma:
                 for k in self.args.chunks:
                     self.check(f"sdma_k{k}", self.rs_sdma(a_full, weight, k), self.cyclic_rows(expected_full, k))
@@ -239,6 +303,8 @@ def _report(bench, table):
         ["baseline"]
         + [f"chunked_k{k}" for k in args.chunks]
         + (["symm_mem"] if args.symm_mem else [])
+        + ([f"symm_mem_sdma_k{k}" for k in args.chunks] if args.symm_mem_sdma else [])
+        + ([f"symm_mem_sdma_graph_k{k}" for k in args.chunks] if args.symm_mem_sdma and args.graph else [])
         + ([f"sdma_k{k}" for k in args.chunks] if args.sdma else [])
     )
     columns = ["comm_only", "gemm_only", "ideal", *variants]
@@ -278,7 +344,7 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
-    if args.symm_mem:
+    if args.symm_mem or args.symm_mem_sdma:
         importlib.import_module("torch.distributed._symmetric_memory")  # registers torch.ops.symm_mem
     bench = Bench(args)
     table = {}
