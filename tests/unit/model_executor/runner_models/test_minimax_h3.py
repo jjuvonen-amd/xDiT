@@ -1222,6 +1222,46 @@ def test_minimax_h3_parallel_vae_caches_dtype_broadcast(monkeypatch):
     assert group.object_broadcasts == 1
 
 
+def test_minimax_h3_accepts_fp8_comms(monkeypatch):
+    """FP8 Ulysses communication is available with a pre-quantizing attention backend."""
+    import sys
+
+    # The runner checks that AITER ships its varlen FP8 kernel; stand in for it off-device.
+    monkeypatch.setitem(sys.modules, "aiter", SimpleNamespace(flash_attn_varlen_fp8_pertensor_func=object()))
+    from xfuser.config import xFuserArgs
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        xFuserMiniMaxH3Model,
+    )
+
+    xFuserMiniMaxH3Model(
+        xFuserArgs(
+            model="MiniMax-H3",
+            task="t2va",
+            ulysses_degree=2,
+            attention_backend="AITER_FP8",
+            use_fp8_comms=True,
+        )
+    )
+
+
+def test_minimax_h3_ref2va_rejects_fp8_comms():
+    """FP8 comms would not register transformer_ref, so it would silently stay off."""
+    from xfuser.config import xFuserArgs
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        xFuserMiniMaxH3Ref2VAModel,
+    )
+
+    config = xFuserArgs(
+        model="MiniMax-H3-Ref2VA",
+        ulysses_degree=2,
+        attention_backend="AITER_FP8",
+        use_fp8_comms=True,
+    )
+
+    with pytest.raises(ValueError, match="does not support use_fp8_comms"):
+        xFuserMiniMaxH3Ref2VAModel(config)
+
+
 @pytest.mark.parametrize(
     "offload_flag",
     [
