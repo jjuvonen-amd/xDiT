@@ -52,19 +52,16 @@ Any batch size: every batch item's piece c moves with the others, and each
 
 The transport (sdma_all_gather.hip) is a small library loaded with ctypes,
 from the first of: XDIT_SDMA_LIB; a library built into this package's directory
-from the current source (`python -m xfuser.model_executor.layers.sdma_all_gather
-build --out <this directory>`, for image builds, no GPU needed); a library
-built with hipcc for this GPU on first use and cached. The ops run on the GPU architectures in VALIDATED_ARCHS; others
+from the current source (`python xfuser/model_executor/layers/sdma_build.py
+--out <this directory>`, for image builds: no GPU and no xfuser import needed);
+a library built with hipcc for this GPU on first use and cached. The ops run on the GPU architectures in VALIDATED_ARCHS; others
 need XDIT_TP_SDMA_ALLOW_UNTESTED=1. ROCm only.
 """
 
-import argparse
 import ctypes
 import fcntl
 import hashlib
 import os
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -77,15 +74,12 @@ import torch.distributed._symmetric_memory as symm_mem
 
 import xfuser.envs as envs
 from xfuser.logger import init_logger
+from xfuser.model_executor.layers.sdma_build import LIB_NAME, SOURCE, build, source_hash
 
 logger = init_logger(__name__)
 
-_SOURCE = Path(__file__).with_name("sdma_all_gather.hip")
-LIB_NAME = "libsdma_all_gather.so"
 # GPU architectures the ops are validated on; others need XDIT_TP_SDMA_ALLOW_UNTESTED=1.
 VALIDATED_ARCHS = ("gfx950",)
-# What `build` compiles for by default.
-BUILD_ARCHS = ("gfx942", "gfx950")
 _SLOTS = 4
 MAX_CHUNKS = 16
 _INITIAL_COPIES = 128  # signals per slot to start with; a slot grows when a call needs more
@@ -123,30 +117,6 @@ def _arch() -> str:
     return torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
 
 
-def build(out_dir, archs) -> Path:
-    """Compile the transport for `archs` (e.g. ["gfx942", "gfx950"]) into out_dir/LIB_NAME; needs hipcc, not a GPU."""
-    hipcc = shutil.which("hipcc") or str(Path(os.environ.get("ROCM_PATH", "/opt/rocm")) / "bin" / "hipcc")
-    if not Path(hipcc).exists():
-        raise RuntimeError(
-            "the SDMA transport needs hipcc to build. Build it where hipcc is available with `python -m "
-            "xfuser.model_executor.layers.sdma_all_gather build --out DIR` and set XDIT_SDMA_LIB=DIR/" + LIB_NAME
-        )
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    so = out / LIB_NAME
-    tmp = so.with_suffix(f".{os.getpid()}.tmp")
-    arch_flags = [f"--offload-arch={a}" for a in archs]
-    cmd = [hipcc, "-O2", "-shared", "-fPIC", *arch_flags, "-o", str(tmp), str(_SOURCE), "-lhsa-runtime64"]
-    subprocess.run(cmd, check=True)
-    tmp.rename(so)
-    (out / (LIB_NAME + ".source-sha1")).write_text(_source_hash() + "\n")
-    return so
-
-
-def _source_hash() -> str:
-    return hashlib.sha1(_SOURCE.read_bytes()).hexdigest()
-
-
 def _library_path() -> Path:
     """XDIT_SDMA_LIB if set; else a library built for this GPU, cached by source, arch and HIP version."""
     prebuilt = _env("XDIT_SDMA_LIB")
@@ -154,12 +124,12 @@ def _library_path() -> Path:
         if not Path(prebuilt).is_file():
             raise RuntimeError(f"XDIT_SDMA_LIB={prebuilt} is not a file")
         return Path(prebuilt)
-    packaged = _SOURCE.with_name(LIB_NAME)
-    stamp = _SOURCE.with_name(LIB_NAME + ".source-sha1")
-    if packaged.is_file() and stamp.is_file() and stamp.read_text().strip() == _source_hash():
+    packaged = SOURCE.with_name(LIB_NAME)
+    stamp = SOURCE.with_name(LIB_NAME + ".source-sha1")
+    if packaged.is_file() and stamp.is_file() and stamp.read_text().strip() == source_hash():
         return packaged
     arch = _arch()
-    key = hashlib.sha1(_SOURCE.read_bytes() + f" {arch} {torch.version.hip}".encode()).hexdigest()[:12]
+    key = hashlib.sha1(SOURCE.read_bytes() + f" {arch} {torch.version.hip}".encode()).hexdigest()[:12]
     cache = Path(os.environ.get("XDIT_CACHE_DIR", Path.home() / ".cache" / "xfuser")) / f"sdma_all_gather_{key}"
     so = cache / LIB_NAME
     if not so.exists():
@@ -565,13 +535,16 @@ def _(x, weight, group_name, tp_size, chunks, trigger):
 
 
 def _main(argv=None) -> None:
-    parser = argparse.ArgumentParser(prog="python -m xfuser.model_executor.layers.sdma_all_gather")
-    commands = parser.add_subparsers(dest="command", required=True)
-    build_cmd = commands.add_parser("build", help=f"compile the transport into DIR/{LIB_NAME} (for XDIT_SDMA_LIB)")
-    build_cmd.add_argument("--out", required=True, metavar="DIR")
-    build_cmd.add_argument("--offload-arch", default=",".join(BUILD_ARCHS), help="comma-separated GPU architectures")
-    args = parser.parse_args(argv)
-    print(build(args.out, [a for a in args.offload_arch.split(",") if a]))
+    """`python -m xfuser.model_executor.layers.sdma_all_gather build ...`: as sdma_build.py, for hosts where
+    importing xfuser is fine."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] != "build":
+        raise SystemExit(
+            "usage: python -m xfuser.model_executor.layers.sdma_all_gather build --out DIR [--offload-arch ARCHS]"
+        )
+    from xfuser.model_executor.layers.sdma_build import main
+
+    main(argv[1:], prog="python -m xfuser.model_executor.layers.sdma_all_gather build")
 
 
 if __name__ == "__main__":
