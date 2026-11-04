@@ -29,6 +29,7 @@ from xfuser.core.utils.runner_utils import (
     rgetattr,
 )
 from xfuser.model_executor.models.runner_models.image_postprocess import enable_fast_pil_postprocess
+from xfuser.model_executor.layers import usp_sdma
 from xfuser.model_executor.pipelines.base_pipeline import xFuserPipelineBaseWrapper
 from xfuser.model_executor.models.runner_models.vae_manager import (
     VAEManager,
@@ -46,6 +47,7 @@ from xfuser.core.distributed import (
     get_classifier_free_guidance_rank,
     get_pipeline_parallel_world_size,
     get_pp_group,
+    get_ulysses_parallel_world_size,
     is_pipeline_first_stage,
     initialize_runtime_state,
     get_runtime_state,
@@ -912,6 +914,16 @@ class xFuserModel(abc.ABC):
         # CUDA graphs are slow on RDNA4.
         return "default"  # TODO: Configurable
 
+    def _compile_mode(self) -> str:
+        """The runner's compile mode, without CUDA graphs when Ulysses attention runs its
+        all-to-alls on SDMA engines (XDIT_ULYSSES_A2A=sdma): those copies are issued from the
+        host, so a captured graph would replay RCCL instead."""
+        requested = self._get_compile_mode()
+        if requested in self.CUDAGRAPH_COMPILE_MODES and usp_sdma.selected() and get_ulysses_parallel_world_size() > 1:
+            warn_once(logger, f"XDIT_ULYSSES_A2A=sdma: compiling with mode 'default' instead of {requested!r}.")
+            return "default"
+        return requested
+
     def _get_compile_dynamic(self, input_args=None) -> Optional[bool]:
         return None  # torch default (auto)
 
@@ -1031,7 +1043,7 @@ class xFuserModel(abc.ABC):
         """
         self._enable_compute_comm_overlap()
 
-        mode = self._get_compile_mode()
+        mode = self._compile_mode()
         pp_degree = getattr(self.config, "pipefusion_parallel_degree", 1)
         dynamic = self._get_compile_dynamic(input_args) if pp_degree > 1 else self._get_compile_dynamic()
         component_names = self._get_compiled_pipe_components()
@@ -1324,7 +1336,7 @@ class xFuserModel(abc.ABC):
             return False
         if self.config.warmup_calls:
             return False
-        if self._get_compile_mode() not in self.CUDAGRAPH_COMPILE_MODES:
+        if self._compile_mode() not in self.CUDAGRAPH_COMPILE_MODES:
             return False
 
         capture_args = copy.deepcopy(input_args)
@@ -1476,7 +1488,7 @@ class xFuserModel(abc.ABC):
         """Run compilation warmup, optionally profiling the CUDA graph recording phase."""
         enable_capture = (
             self.config.profile_capture_phase
-            and self._get_compile_mode() == "reduce-overhead"
+            and self._compile_mode() == "reduce-overhead"
             and not self.pipe.scheduler.config.shift_terminal
         )
         if not enable_capture:

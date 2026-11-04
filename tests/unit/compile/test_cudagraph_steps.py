@@ -92,3 +92,20 @@ def test_marking_a_component_twice_leaves_one_marker():
     model._mark_cudagraph_steps(transformer)
 
     assert len(transformer._forward_pre_hooks) == 1
+
+
+@pytest.mark.parametrize("ulysses_degree,expected", [(8, "default"), (1, "reduce-overhead")])
+def test_sdma_ulysses_compiles_without_cuda_graphs(monkeypatch, ulysses_degree, expected):
+    """SDMA copies are issued from the host, so a captured graph would replay RCCL instead."""
+    from xfuser.model_executor.layers import usp_sdma
+    from xfuser.model_executor.models.runner_models import base_model
+
+    monkeypatch.setattr(base_model, "get_ulysses_parallel_world_size", lambda: ulysses_degree)
+    previous = usp_sdma.configure("sdma", 2)
+    try:
+        model, transformer = _model("reduce-overhead", fully_shard_degree=8)
+        assert model._compile_mode() == expected
+        model._compile_model({"num_inference_steps": 4})
+        assert getattr(transformer, "_xfuser_marks_cudagraph_steps", False) == (expected == "reduce-overhead")
+    finally:
+        usp_sdma.configure(*previous)
