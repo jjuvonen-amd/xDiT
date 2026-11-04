@@ -41,6 +41,7 @@ from xfuser.core.sparge_attention.head_balance import (
     apply_head_balance,
     revert_head_balance,
 )
+from xfuser.model_executor.layers import usp_sdma
 
 # Sparge backends whose kernel cost can be load-balanced across Ulysses ranks.
 # These all build a block mask via _build_sparge_block_mask and write the
@@ -660,6 +661,37 @@ def USP(
         }
 
     extra_inputs = _ulysses_extra_inputs(attention_kwargs, query)
+
+    if usp_sdma.selected() and get_ulysses_parallel_world_size() > 1:
+        reason = usp_sdma.unsupported_reason(
+            query,
+            key,
+            value,
+            backend=hb_backend,
+            ring_world_size=get_ring_parallel_world_size(),
+            joint_strategy=joint_strategy,
+            fp8_comms=fp8_comms,
+            extra_inputs=extra_inputs,
+            kv_head_repeat=kv_head_repeat,
+            has_kv_cache=_has_kv_cache(attn_layer),
+            head_balanced=hb_applied,
+            attention_kwargs=attention_kwargs,
+        )
+        if reason is None:
+            out = usp_sdma.attention(
+                query,
+                key,
+                value,
+                backend=hb_backend,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                attention_kwargs=attention_kwargs,
+                group=PROCESS_GROUP.ULYSSES_PG,
+            )
+            if fp8_module is not None:
+                fp8_observe_output(get_runtime_state().fp8_comms, fp8_module, out, False)
+            return out
+        usp_sdma.warn_fallback(reason)
 
     qkv_amaxes = None
     if get_ulysses_parallel_world_size() > 1:
