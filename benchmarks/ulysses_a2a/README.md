@@ -33,6 +33,11 @@ ops run the same layout over RCCL; runners compile without CUDA graphs when the 
 is selected. `--ulysses_a2a rccl_packed` runs the SDMA path's layout over RCCL everywhere,
 to tell the transport's share of a difference from the layout's.
 
+The gain is the part of the exchange RCCL leaves exposed. Where RCCL already hides nearly all
+of it behind compute, as for Wan2.2, the SDMA path does not help: under `torch.compile`
+Inductor moves independent work (such as cross-attention projections) next to RCCL's output
+all-to-all, while the SDMA output wait sits inside a custom op it cannot reorder around.
+
 Other settings: `XDIT_SDMA_LIB` (a prebuilt transport library, see
 `python xfuser/core/distributed/sdma/build.py --help`), `XDIT_SDMA_WAIT_S` and
 `XDIT_SDMA_ON_TIMEOUT` (how long a flag wait may take and what happens when it does not
@@ -46,7 +51,6 @@ All run on 8 GPUs of one node.
 | Script | What it measures |
 |---|---|
 | `sdma_ipc_probe.py` | Raw all-to-all on the transport vs RCCL `all_to_all_single`, per buffer size; `--groups 2x4` for two concurrent groups of 4 (CFG x Ulysses 4). Checks every byte. |
-| `sdma_coherence_probe.py` | Whether kernels read stale cache lines of an inbox a peer's SDMA engine rewrote, per memory kind (2 GPUs). |
 | `block_bench.py` | A few real transformer blocks (Wan2.2-T2V, MiniMax-H3, FLUX.3 klein base) at their benchmark shapes, per transport: `rccl`, `nocomm` (exchange replaced by a local copy), `sdma` and `sdmac` (group streams) per head-group count, `packed` (the layout over RCCL) and `sdmaq`/`sdmaqc` (grouped Q/K/V projection, without and with group streams). Reports the share of time spent waiting for the exchange and checks outputs against RCCL. |
 | `sdma_stress.py` | New data every call, every call checked exactly: the exchange alone over plain, joint and grouped-query shapes, or USP against RCCL. |
 

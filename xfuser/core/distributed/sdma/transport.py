@@ -245,8 +245,8 @@ class SharedBuffer:
 
 
 class PeerGroup:
-    """Per process group: the peers in push order, one SDMA engine per peer and a spare one, and
-    named shared buffers that grow on demand."""
+    """Per process group: the peers in push order, one SDMA engine per peer, and named shared
+    buffers that grow on demand."""
 
     def __init__(self, process_group: dist.ProcessGroup):
         lib = load()
