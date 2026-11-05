@@ -359,6 +359,8 @@ class xFuserModel(abc.ABC):
     # torch.compile modes that run the graph under CUDA Graphs, whose outputs live in a fixed
     # buffer pool and are therefore only valid until the next replay.
     CUDAGRAPH_COMPILE_MODES = frozenset({"reduce-overhead", "max-autotune"})
+    # The same compilation without CUDA graphs.
+    _WITHOUT_CUDAGRAPHS = {"reduce-overhead": "default", "max-autotune": "max-autotune-no-cudagraphs"}
 
     # Head dimensions this model's attention runs at, checked against what a backend serves.
     # Left empty where the value is only known from the loaded checkpoint; empty means no claim.
@@ -537,14 +539,8 @@ class xFuserModel(abc.ABC):
                 group.pipeline_recv(idx=0, name="_xfuser_compile_prime")
                 group.pipeline_send(token, name="_xfuser_compile_prime", segment_idx=0)
 
-        # Grouped Q/K/V projection (--ulysses_overlap_qkv) needs each attention module's weight rows
-        # per head group, made before compilation sees the modules.
-        if usp_sdma.overlap_qkv() and get_ulysses_parallel_world_size() > 1:
-            for name in self._get_compiled_pipe_components():
-                component = getattr(self.pipe, name, None)
-                if isinstance(component, torch.nn.Module):
-                    prepared = usp_sdma.prepare_grouped_qkv(component, get_ulysses_parallel_world_size())
-                    log(f"{name}: {prepared} attention modules project Q/K/V one head group at a time.")
+        # Before compilation sees the modules.
+        self._prepare_grouped_qkv()
 
         # Compile and warm the original blocks before cache adapters replace or
         # patch them, keeping stateful cross-step cache logic out of traced graphs.
@@ -923,14 +919,34 @@ class xFuserModel(abc.ABC):
         # CUDA graphs are slow on RDNA4.
         return "default"  # TODO: Configurable
 
+    def _prepare_grouped_qkv(self) -> None:
+        """Copy each attention module's Q/K/V weight rows per head group for --ulysses_overlap_qkv.
+
+        Not with CPU offload: the offload hooks, already set up, would not move the copies, and
+        offloading is for the memory the copies would spend. Q/K/V are then projected for all
+        heads at once, as without the option."""
+        ulysses = get_ulysses_parallel_world_size()
+        if not usp_sdma.overlap_qkv() or ulysses <= 1:
+            return
+        config = self.config
+        if config.enable_group_cpu_offload or config.enable_sequential_cpu_offload or config.enable_model_cpu_offload:
+            log("--ulysses_overlap_qkv is ignored with CPU offload: Q/K/V are projected for all heads at once.")
+            return
+        for name in self._get_compiled_pipe_components():
+            component = getattr(self.pipe, name, None)
+            if isinstance(component, torch.nn.Module):
+                prepared = usp_sdma.prepare_grouped_qkv(component, ulysses)
+                log(f"{name}: {prepared} attention modules project Q/K/V one head group at a time.")
+
     def _compile_mode(self) -> str:
         """The runner's compile mode, without CUDA graphs when Ulysses attention runs its
-        all-to-alls on SDMA engines (XDIT_ULYSSES_A2A=sdma): those copies are issued from the
+        all-to-alls on SDMA engines (--ulysses_a2a sdma): those copies are issued from the
         host, so a captured graph would replay RCCL instead."""
         requested = self._get_compile_mode()
         if requested in self.CUDAGRAPH_COMPILE_MODES and usp_sdma.uses_sdma() and get_ulysses_parallel_world_size() > 1:
-            warn_once(logger, f"XDIT_ULYSSES_A2A=sdma: compiling with mode 'default' instead of {requested!r}.")
-            return "default"
+            mode = self._WITHOUT_CUDAGRAPHS[requested]
+            warn_once(logger, f"--ulysses_a2a sdma: compiling with mode {mode!r} instead of {requested!r}.")
+            return mode
         return requested
 
     def _get_compile_dynamic(self, input_args=None) -> Optional[bool]:
