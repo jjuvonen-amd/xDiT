@@ -66,6 +66,15 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_SDMA_WAIT_S": lambda: os.environ.get("XDIT_SDMA_WAIT_S", "30"),
     "XDIT_SDMA_ON_TIMEOUT": lambda: os.environ.get("XDIT_SDMA_ON_TIMEOUT", "abort"),
     "XDIT_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_SDMA_ALLOW_UNTESTED", "0"),
+    # Ulysses attention's all-to-alls: rccl, or sdma for the copy engines
+    # (xfuser/model_executor/layers/usp_sdma.py), with each rank's heads in this many groups
+    # whose exchanges overlap the other groups' attention.
+    "XDIT_ULYSSES_A2A": lambda: os.environ.get("XDIT_ULYSSES_A2A", "rccl"),
+    "XDIT_ULYSSES_HEAD_GROUPS": lambda: os.environ.get("XDIT_ULYSSES_HEAD_GROUPS", "2"),
+    "XDIT_ULYSSES_GROUP_STREAMS": lambda: os.environ.get("XDIT_ULYSSES_GROUP_STREAMS", "0"),
+    # With the SDMA Ulysses path, models that support it project Q/K/V one head group at a time,
+    # so each group's exchange overlaps the projection of the next.
+    "XDIT_ULYSSES_OVERLAP_QKV": lambda: os.environ.get("XDIT_ULYSSES_OVERLAP_QKV", "0"),
 }
 
 

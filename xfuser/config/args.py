@@ -285,6 +285,12 @@ class xFuserArgs:
     fp8_comms_safety_factor: float = DEFAULT_FP8_COMMS_SAFETY_FACTOR
     attention_a2a: str = "none"
     attention_a2a_hadamard: str = "auto"
+    # Ulysses all-to-all transport (xfuser/model_executor/layers/usp_sdma.py); None keeps the
+    # XDIT_ULYSSES_* environment variables.
+    ulysses_a2a: Optional[str] = None
+    ulysses_head_groups: Optional[int] = None
+    ulysses_group_streams: Optional[bool] = None
+    ulysses_overlap_qkv: Optional[bool] = None
     gemm_high_precision_targets: str = "model"
     gemm_high_precision_module_patterns: Optional[str] = None
     gemm_high_precision_prefix_patterns: Optional[str] = None
@@ -459,6 +465,8 @@ class xFuserArgs:
             config.resolve_for_backend(self.attention_backend)
         if self.use_fp8_comms:
             raise ValueError("--attention_a2a and --use_fp8_comms are mutually exclusive")
+        if self.ulysses_a2a not in (None, "rccl"):
+            raise ValueError(f"--attention_a2a and --ulysses_a2a {self.ulysses_a2a} are mutually exclusive")
         if self.ulysses_degree not in (2, 4, 8):
             raise ValueError("--attention_a2a requires --ulysses_degree 2, 4, or 8")
         effective_batch = (
@@ -863,6 +871,33 @@ class xFuserArgs:
             help="Quantize the transformer linear layers (selected models only).",
         )
         runtime_group.add_argument(
+            "--ulysses_a2a",
+            choices=["rccl", "sdma", "rccl_packed"],
+            default=None,
+            help="Ulysses all-to-all transport: rccl, sdma (SDMA copy engines, ROCm), or rccl_packed (the "
+            "SDMA path's layout over RCCL). Default: XDIT_ULYSSES_A2A, else rccl.",
+        )
+        runtime_group.add_argument(
+            "--ulysses_head_groups",
+            type=int,
+            default=None,
+            help="With --ulysses_a2a sdma, split each rank's heads into this many groups whose exchanges "
+            "overlap the other groups' attention. Default: XDIT_ULYSSES_HEAD_GROUPS, else 2.",
+        )
+        runtime_group.add_argument(
+            "--ulysses_group_streams",
+            action="store_true",
+            default=None,
+            help="With --ulysses_a2a sdma, attend each head group on a stream of its own.",
+        )
+        runtime_group.add_argument(
+            "--ulysses_overlap_qkv",
+            action="store_true",
+            default=None,
+            help="With --ulysses_a2a sdma, project Q/K/V one head group at a time (models that support it) "
+            "so each group's exchange overlaps the next group's projection.",
+        )
+        runtime_group.add_argument(
             "--use_fp8_comms",
             action="store_true",
             help="Quantize Ulysses all-to-all communication to FP8.",
@@ -1230,6 +1265,33 @@ class xFuserArgs:
             type=nullable_str,
             default=None,
             help="Comma-delimited FQN suffix patterns to keep in FP8 during FP4 GEMMs.",
+        )
+        parser.add_argument(
+            "--ulysses_a2a",
+            choices=["rccl", "sdma", "rccl_packed"],
+            default=None,
+            help="Ulysses all-to-all transport: rccl, sdma (SDMA copy engines, ROCm), or rccl_packed (the "
+            "SDMA path's layout over RCCL). Default: XDIT_ULYSSES_A2A, else rccl.",
+        )
+        parser.add_argument(
+            "--ulysses_head_groups",
+            type=int,
+            default=None,
+            help="With --ulysses_a2a sdma, split each rank's heads into this many groups whose exchanges "
+            "overlap the other groups' attention. Default: XDIT_ULYSSES_HEAD_GROUPS, else 2.",
+        )
+        parser.add_argument(
+            "--ulysses_group_streams",
+            action="store_true",
+            default=None,
+            help="With --ulysses_a2a sdma, attend each head group on a stream of its own.",
+        )
+        parser.add_argument(
+            "--ulysses_overlap_qkv",
+            action="store_true",
+            default=None,
+            help="With --ulysses_a2a sdma, project Q/K/V one head group at a time (models that support it) "
+            "so each group's exchange overlaps the next group's projection.",
         )
         parser.add_argument(
             "--use_fp8_comms",
@@ -1728,6 +1790,10 @@ class xFuserArgs:
                 profile=self.attention_a2a,
                 hadamard=self.attention_a2a_hadamard,
             ),
+            ulysses_a2a=self.ulysses_a2a,
+            ulysses_head_groups=self.ulysses_head_groups,
+            ulysses_group_streams=self.ulysses_group_streams,
+            ulysses_overlap_qkv=self.ulysses_overlap_qkv,
         )
 
         parallel_config = ParallelConfig(

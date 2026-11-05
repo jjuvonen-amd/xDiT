@@ -154,6 +154,10 @@ For startup adapter fusion on FLUX.1-dev and MiniMax-H3 Turbo, see [LoRA support
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--ulysses_degree` | Ulysses sequence parallel degree | 1 |
+| `--ulysses_a2a` | Ulysses all-to-all transport: `rccl`, `sdma` (the GPUs' SDMA copy engines, ROCm; see [benchmarks/ulysses_a2a](../../benchmarks/ulysses_a2a/README.md)), or `rccl_packed` (the SDMA layout over RCCL) | `XDIT_ULYSSES_A2A`, else `rccl` |
+| `--ulysses_head_groups` | With `sdma`: head groups per rank whose exchanges overlap the other groups' attention | `XDIT_ULYSSES_HEAD_GROUPS`, else 2 |
+| `--ulysses_group_streams` | With `sdma`: attend each head group on a stream of its own | False |
+| `--ulysses_overlap_qkv` | With `sdma`: project Q/K/V one head group at a time (MiniMax-H3, FLUX.3), overlapping each group's exchange with the next projection; keeps a second copy of the Q/K/V weights | False |
 | `--ring_degree` | Ring sequence parallel degree | 1 |
 | `--pipefusion_parallel_degree` | PipeFusion pipeline stages | 1 |
 | `--tensor_parallel_degree` | Tensor parallel degree | 1 |
