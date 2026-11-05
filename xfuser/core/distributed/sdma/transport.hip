@@ -5,11 +5,15 @@
 // local GPU only, so every copy names the local GPU on both sides.
 //
 // Copies are pushes: this rank's SDMA engines write its data into peers' buffers, one engine
-// per peer, all peers at once. Once a peer's copies have landed, a 4-byte write on a spare
-// engine sets this rank's flag word at that peer (one word per sender, so no two engines
-// write the same word); on the data engines, a flag write that waits for its data would stall
-// the copies queued behind it. Every copy first waits for a trigger signal that a one-thread
-// kernel releases on the compute stream, so no copy reads data the stream has not written.
+// per peer, all peers at once. Behind a peer's copies, a 4-byte copy on the same engine sets
+// this rank's flag word at that peer (one word per sender, so no two engines write the same
+// word): an engine runs its copies in order, and the flag lands after the data. Every copy
+// first waits for a trigger signal that a one-thread kernel releases on the compute stream,
+// so no copy reads data the stream has not written.
+//
+// A call's copies are described once, as a plan: for each peer, a list of (source offset,
+// destination address, bytes) and the flag word to set after them. A plan is issued with the
+// source base of that call, so the per-call host work is one loop in C.
 //
 // The compute stream waits for flags with sx_wait_flags, a one-thread kernel whose wait is
 // bounded: a flag that never lands is recorded (sx_peek_error / sx_take_error), and the stream
@@ -57,7 +61,8 @@ std::vector<Slot> g_slots;
 hsa_agent_t g_local;
 SxError* g_error = nullptr;  // host-mapped
 int* g_scratch = nullptr;    // device word that a dropped flag write goes to
-int g_drop_call = -1, g_drop_index = -1, g_calls = 0;
+int g_drop_call = -1, g_drop_issue = -1, g_drop_index = -1;
+int g_calls = 0, g_issues = 0;  // calls armed so far; pushes and plans issued in the current call
 unsigned long long g_ticks_per_s = 0;
 
 hsa_status_t collect(hsa_agent_t agent, void*) {
@@ -189,8 +194,7 @@ int sx_init(int local_dev, int max_copies, int slots) {
 // One SDMA engine (bit index) per peer, in engines[0..n-1]: ROCr's preferred engine for the
 // link the data crosses (from `local_dev` to the peer when pushing, into `local_dev` from the
 // peer when pulling); a peer whose preferred engine is taken gets the lowest available engine
-// no peer prefers (then any free one). engines[n] is a spare engine, used by no peer, for the
-// flag writes. Peers are named by PCI bus (sx_bus_of).
+// no peer prefers (then any free one). Peers are named by PCI bus (sx_bus_of).
 int sx_engine_plan(int local_dev, const int* peer_bus, int n, int push, int* engines) {
   hsa_agent_t local, peer;
   if (agent_of(local_dev, &local)) return -1;
@@ -202,11 +206,10 @@ int sx_engine_plan(int local_dev, const int* peer_bus, int n, int push, int* eng
     uint32_t mask = 0;
     if (hsa_amd_memory_get_preferred_copy_engine(dst, src, &mask) == HSA_STATUS_SUCCESS) preferred[i] = mask;
   }
-  uint32_t used = 0, wanted = 0, everywhere = ~0u;
+  uint32_t used = 0, wanted = 0;
   for (int i = 0; i < n; ++i) {
     engines[i] = lowest(preferred[i] & avail[i]);
     if (engines[i] >= 0) wanted |= 1u << engines[i];
-    everywhere &= avail[i];
   }
   for (int i = 0; i < n; ++i) {
     uint32_t bit = engines[i] >= 0 ? 1u << engines[i] : 0;
@@ -224,11 +227,7 @@ int sx_engine_plan(int local_dev, const int* peer_bus, int n, int push, int* eng
     engines[i] = e;
     used |= 1u << e;
   }
-  // The flag copies name the local GPU on both sides, like the data copies; any engine that
-  // every link offers will do, preferably one no peer uses.
-  engines[n] = lowest(everywhere & ~used);
-  if (engines[n] < 0) engines[n] = lowest(everywhere);
-  return engines[n] < 0 ? -5 : 0;
+  return 0;
 }
 
 int sx_bus_of(int hip_dev) {
@@ -308,6 +307,7 @@ int sx_arm(int slot, int n_data, int n_flags) {
   s.armed_data = n_data;
   s.armed_flags = n_flags;
   ++g_calls;
+  g_issues = 0;
   return 0;
 }
 
@@ -328,46 +328,130 @@ int sx_open(int slot, int k) {
   return 0;
 }
 
+}  // extern "C"
+
+namespace {
+
+// The flag write of issue `issue` of the current call to peer index `i`, unless the test hook
+// diverts it to a scratch word, as if it were lost.
+void* flag_target(uint64_t flag, int issue, int i) {
+  if (g_calls - 1 == g_drop_call && issue == g_drop_issue && i == g_drop_index) {
+    g_drop_call = g_drop_issue = g_drop_index = -1;
+    return g_scratch;
+  }
+  return (void*)flag;
+}
+
+// Queues `bytes` from `src` to `dst` on `engine` once trigger k of `s` is released.
+hsa_status_t copy_after_trigger(Slot& s, int k, void* dst, const void* src, uint64_t bytes, hsa_signal_t done,
+                                int engine) {
+  return hsa_amd_memory_async_copy_on_engine(dst, g_local, src, g_local, bytes, 1, &s.trigger[k], done,
+                                             (hsa_amd_sdma_engine_id_t)(1u << engine), true);
+}
+
+struct PlanCopy {
+  uint64_t src_offset, dst, bytes;
+};
+
+struct Plan {
+  bool live = false;
+  std::vector<int> engines;                  // per peer
+  std::vector<std::vector<PlanCopy>> peers;  // per peer, in issue order
+  std::vector<uint64_t> flags;               // per peer: the flag word set behind its copies
+  int copies = 0;
+};
+
+std::vector<Plan> g_plans;
+
+}  // namespace
+
+extern "C" {
+
 // Push `items` copies of `bytes` to each of `n` peers on `slot`, once trigger `k` is released.
 // Copy j to peer i reads
 //     src_base + peer_ranks[i] * src_peer_stride + j * src_item_stride
 // and writes
 //     dst_bases[i] + dst_offset + j * dst_item_stride
-// on SDMA engine engines[i], using the slot's data signals first_data + i * items + j. Then
-// the 4 bytes at `flag_src` go to flag_bases[i] + flag_offset, using flag signal first_flag + i:
-// with `flag_on_data_engine` 0, on the spare engine engines[n] once peer i's copies have
-// landed; with 1, on peer i's own engine right behind its copies, which run in order.
+// on SDMA engine engines[i], using the slot's data signals first_data + i * items + j. Behind
+// them, on the same engine, the 4 bytes at `flag_src` go to flag_bases[i] + flag_offset, using
+// flag signal first_flag + i.
 int sx_push(int slot, int k, int first_data, int first_flag, int n, const int* peer_ranks, uint64_t src_base,
             uint64_t src_peer_stride, uint64_t src_item_stride, const uint64_t* dst_bases, uint64_t dst_offset,
             uint64_t dst_item_stride, uint64_t bytes, int items, const int* engines, const uint64_t* flag_bases,
-            uint64_t flag_offset, uint64_t flag_src, int flag_on_data_engine) {
+            uint64_t flag_offset, uint64_t flag_src) {
   Slot& s = g_slots[slot];
   if (first_data + n * items > s.armed_data || first_flag + n > s.armed_flags || k < 0 || k >= kTriggers) return -1;
+  int issue = g_issues++;
   for (int i = 0; i < n; ++i) {
-    hsa_amd_sdma_engine_id_t engine = (hsa_amd_sdma_engine_id_t)(1u << engines[i]);
     for (int j = 0; j < items; ++j) {
       void* dst = (void*)(dst_bases[i] + dst_offset + (uint64_t)j * dst_item_stride);
       const void* src = (const void*)(src_base + (uint64_t)peer_ranks[i] * src_peer_stride + (uint64_t)j * src_item_stride);
-      hsa_status_t st = hsa_amd_memory_async_copy_on_engine(dst, g_local, src, g_local, bytes, 1, &s.trigger[k],
-                                                            s.data[first_data + i * items + j], engine, true);
+      hsa_status_t st = copy_after_trigger(s, k, dst, src, bytes, s.data[first_data + i * items + j], engines[i]);
       if (st != HSA_STATUS_SUCCESS) return -100 - (int)st;
     }
+    hsa_status_t st = copy_after_trigger(s, k, flag_target(flag_bases[i] + flag_offset, issue, i), (const void*)flag_src,
+                                         4, s.flag[first_flag + i], engines[i]);
+    if (st != HSA_STATUS_SUCCESS) return -200 - (int)st;
   }
-  hsa_amd_sdma_engine_id_t spare = (hsa_amd_sdma_engine_id_t)(1u << engines[n]);
+  return 0;
+}
+
+// Registers a plan for `n` peers: peer i's copies are the next counts[i] entries of
+// src_offsets / dsts / bytes, on SDMA engine engines[i], followed on that engine by a 4-byte
+// flag write to flag_dsts[i]. Returns the plan id (>= 0), or a negative code.
+int sx_plan_create(int n, const int* engines, const int* counts, const uint64_t* src_offsets, const uint64_t* dsts,
+                   const uint64_t* bytes, const uint64_t* flag_dsts) {
+  Plan plan;
+  plan.live = true;
+  int c = 0;
   for (int i = 0; i < n; ++i) {
-    void* flag = (void*)(flag_bases[i] + flag_offset);
-    if (g_calls - 1 == g_drop_call && i == g_drop_index) {  // test hook: this flag goes nowhere
-      flag = g_scratch;
-      g_drop_call = g_drop_index = -1;
+    if (counts[i] < 0) return -1;
+    plan.engines.push_back(engines[i]);
+    plan.flags.push_back(flag_dsts[i]);
+    std::vector<PlanCopy> copies;
+    for (int j = 0; j < counts[i]; ++j, ++c) copies.push_back({src_offsets[c], dsts[c], bytes[c]});
+    plan.peers.push_back(std::move(copies));
+  }
+  plan.copies = c;
+  for (size_t id = 0; id < g_plans.size(); ++id)
+    if (!g_plans[id].live) {
+      g_plans[id] = std::move(plan);
+      return (int)id;
     }
-    hsa_status_t st =
-        flag_on_data_engine
-            ? hsa_amd_memory_async_copy_on_engine(flag, g_local, (const void*)flag_src, g_local, 4, 1, &s.trigger[k],
-                                                  s.flag[first_flag + i],
-                                                  (hsa_amd_sdma_engine_id_t)(1u << engines[i]), true)
-            : hsa_amd_memory_async_copy_on_engine(flag, g_local, (const void*)flag_src, g_local, 4, items,
-                                                  &s.data[first_data + i * items], s.flag[first_flag + i], spare,
-                                                  true);
+  g_plans.push_back(std::move(plan));
+  return (int)g_plans.size() - 1;
+}
+
+// How many data copies (and so data signals) plan `id` issues; negative if there is no such plan.
+int sx_plan_copies(int id) {
+  if (id < 0 || id >= (int)g_plans.size() || !g_plans[id].live) return -1;
+  return g_plans[id].copies;
+}
+
+int sx_plan_free(int id) {
+  if (id < 0 || id >= (int)g_plans.size()) return -1;
+  g_plans[id] = Plan{};
+  return 0;
+}
+
+// Issues plan `id` on `slot`, its sources at src_base + their offsets, once trigger `k` is
+// released: data copies use the slot's data signals from first_data on, in plan order, and
+// peer i's flag write (the 4 bytes at `flag_src`) flag signal first_flag + i.
+int sx_plan_issue(int slot, int k, int first_data, int first_flag, int id, uint64_t src_base, uint64_t flag_src) {
+  if (id < 0 || id >= (int)g_plans.size() || !g_plans[id].live) return -2;
+  const Plan& plan = g_plans[id];
+  Slot& s = g_slots[slot];
+  int n = (int)plan.peers.size();
+  if (first_data + plan.copies > s.armed_data || first_flag + n > s.armed_flags || k < 0 || k >= kTriggers) return -1;
+  int issue = g_issues++, c = first_data;
+  for (int i = 0; i < n; ++i) {
+    for (const PlanCopy& copy : plan.peers[i]) {
+      hsa_status_t st = copy_after_trigger(s, k, (void*)copy.dst, (const void*)(src_base + copy.src_offset), copy.bytes,
+                                           s.data[c++], plan.engines[i]);
+      if (st != HSA_STATUS_SUCCESS) return -100 - (int)st;
+    }
+    hsa_status_t st = copy_after_trigger(s, k, flag_target(plan.flags[i], issue, i), (const void*)flag_src, 4,
+                                         s.flag[first_flag + i], plan.engines[i]);
     if (st != HSA_STATUS_SUCCESS) return -200 - (int)st;
   }
   return 0;
@@ -410,10 +494,12 @@ int sx_take_error(int* tag, int* call, uint64_t* missing) {
   return (int)(count > 0x7fffffff ? 0x7fffffff : count);
 }
 
-// Test hook: in the `ahead`-th call armed from now (1 = the next), the push to peer index
-// `index` diverts its flag write to a scratch word, as if it were lost.
-int sx_debug_drop_flag(int ahead, int index) {
+// Test hook: in the `ahead`-th call armed from now (1 = the next), issue `issue` of that call
+// (pushes and plans count in the order they are issued) loses its flag write to peer index
+// `index`: it goes to a scratch word instead.
+int sx_debug_drop_flag(int ahead, int issue, int index) {
   g_drop_call = g_calls + ahead - 1;
+  g_drop_issue = issue;
   g_drop_index = index;
   return 0;
 }

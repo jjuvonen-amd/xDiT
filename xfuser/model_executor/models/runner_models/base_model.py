@@ -537,6 +537,15 @@ class xFuserModel(abc.ABC):
                 group.pipeline_recv(idx=0, name="_xfuser_compile_prime")
                 group.pipeline_send(token, name="_xfuser_compile_prime", segment_idx=0)
 
+        # Grouped Q/K/V projection (--ulysses_overlap_qkv) needs each attention module's weight rows
+        # per head group, made before compilation sees the modules.
+        if usp_sdma.overlap_qkv() and get_ulysses_parallel_world_size() > 1:
+            for name in self._get_compiled_pipe_components():
+                component = getattr(self.pipe, name, None)
+                if isinstance(component, torch.nn.Module):
+                    prepared = usp_sdma.prepare_grouped_qkv(component, get_ulysses_parallel_world_size())
+                    log(f"{name}: {prepared} attention modules project Q/K/V one head group at a time.")
+
         # Compile and warm the original blocks before cache adapters replace or
         # patch them, keeping stateful cross-step cache logic out of traced graphs.
         # Adapters use declared forward patterns because compiled block signatures
@@ -919,7 +928,7 @@ class xFuserModel(abc.ABC):
         all-to-alls on SDMA engines (XDIT_ULYSSES_A2A=sdma): those copies are issued from the
         host, so a captured graph would replay RCCL instead."""
         requested = self._get_compile_mode()
-        if requested in self.CUDAGRAPH_COMPILE_MODES and usp_sdma.selected() and get_ulysses_parallel_world_size() > 1:
+        if requested in self.CUDAGRAPH_COMPILE_MODES and usp_sdma.uses_sdma() and get_ulysses_parallel_world_size() > 1:
             warn_once(logger, f"XDIT_ULYSSES_A2A=sdma: compiling with mode 'default' instead of {requested!r}.")
             return "default"
         return requested

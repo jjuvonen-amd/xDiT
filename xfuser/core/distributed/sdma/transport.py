@@ -6,6 +6,10 @@ data waits for all of it. This transport moves it with ROCr's
 buffers on one SDMA engine per peer, all peers at once, and uses no compute
 units, so compute that does not need the data runs alongside.
 
+A call's copies are described once as a `Plan` (per peer: source offsets,
+destinations, sizes and the flag to set after them) and issued per call with
+that call's source address, so the per-call host work is one loop in C.
+
 Buffers that peers write into (`SharedBuffer`) are allocated by the library
 with hipMalloc, or as fine-grained memory, and mapped into every peer with HIP
 IPC handles, exchanged over the group's device process group. Flag words are
@@ -15,11 +19,9 @@ sx_engine_plan in transport.hip.
 Ordering:
 - A copy waits for a trigger that the compute stream releases (`release`), so
   it never reads data the stream has not written yet.
-- Behind a peer's copies of a push, a 4-byte write on the same engine sets this
-  rank's flag word at that peer; the engine runs them in order, and the flag
-  lands after the data (benchmarks/ulysses_a2a/sdma_stress.py checks this).
-  XDIT_SDMA_FLAGS=spare instead writes it on a spare engine once the copies
-  have signalled completion, which costs a dependency wait per flag.
+- Behind a peer's copies, a 4-byte write on the same engine sets this rank's
+  flag word at that peer; the engine runs them in order, and the flag lands
+  after the data (benchmarks/ulysses_a2a/sdma_stress.py checks this).
 - The receiving stream waits for its flag words with a one-thread kernel
   (`wait`), which resets them for their next use.
 
@@ -73,6 +75,7 @@ _slot = 0
 _call = 0
 _watchdog = None
 _init_lock = threading.Lock()
+_generation = 0
 
 
 def _check(rc: int, what: str) -> None:
@@ -82,13 +85,6 @@ def _check(rc: int, what: str) -> None:
 
 def _env(name: str) -> str:
     return envs.environment_variables[name]().strip()
-
-
-def flags_on_data_engines() -> bool:
-    mode = _env("XDIT_SDMA_FLAGS").lower()
-    if mode not in ("spare", "data"):
-        raise ValueError(f"XDIT_SDMA_FLAGS must be spare or data; got {mode!r}")
-    return mode == "data"
 
 
 def wait_seconds() -> float:
@@ -159,11 +155,15 @@ def load():
         "sx_arm": [i, i, i],
         "sx_release": [i, i, vp],
         "sx_open": [i, i],
-        "sx_push": [i, i, i, i, i, ip, u64, u64, u64, u64p, u64, u64, u64, i, ip, u64p, u64, u64, i],
+        "sx_push": [i, i, i, i, i, ip, u64, u64, u64, u64p, u64, u64, u64, i, ip, u64p, u64, u64],
+        "sx_plan_create": [i, ip, ip, u64p, u64p, u64p, u64p],
+        "sx_plan_copies": [i],
+        "sx_plan_free": [i],
+        "sx_plan_issue": [i, i, i, i, i, u64, u64],
         "sx_wait_flags": [vp, u64, i, dbl, i, i, i],
         "sx_take_error": [ip, ip, u64p],
         "sx_peek_error": [ip, ip, u64p],
-        "sx_debug_drop_flag": [i, i],
+        "sx_debug_drop_flag": [i, i, i],
     }.items():
         getattr(lib, name).argtypes = argtypes
         getattr(lib, name).restype = i
@@ -208,6 +208,10 @@ class SharedBuffer:
         self.memory = memory
         ptr = ctypes.c_uint64()
         _check(lib.sx_malloc(nbytes, MEMORY_KINDS[memory], ctypes.byref(ptr)), f"sx_malloc({nbytes}, {memory})")
+        # Tells plans made for an earlier buffer of the same name from ones made for this one.
+        global _generation
+        _generation += 1
+        self.generation = _generation
         self.ptr = ptr.value
         _check(lib.sx_memset(self.ptr, 0, nbytes), "sx_memset")
         size = lib.sx_ipc_handle_size()
@@ -270,10 +274,9 @@ class PeerGroup:
         n = len(self.peers)
         self.peer_ranks = (ctypes.c_int * n)(*self.peers)
         peer_bus = (ctypes.c_int * n)(*[self.buses[p] for p in self.peers])
-        self.engine_arr = (ctypes.c_int * (n + 1))()
+        self.engine_arr = (ctypes.c_int * n)()
         _check(lib.sx_engine_plan(self.device.index, peer_bus, n, 1, self.engine_arr), "sx_engine_plan")
-        self.engines = list(self.engine_arr[:n])
-        self.flag_engine = self.engine_arr[n]
+        self.engines = list(self.engine_arr)
         self.one = torch.ones(1, dtype=torch.int32, device=self.device)
         self._buffers: Dict[str, SharedBuffer] = {}
         _start_watchdog(lib)
@@ -282,8 +285,8 @@ class PeerGroup:
         )
 
     def engine_plan(self) -> dict:
-        """This rank's SDMA engines: {peer rank: engine, "flags": engine}."""
-        return {**dict(zip(self.peers, self.engines)), "flags": self.flag_engine}
+        """This rank's SDMA engines: {peer rank: engine}."""
+        return dict(zip(self.peers, self.engines))
 
     def barrier(self) -> None:
         """Every rank's device work, and so every copy it waited for, is done past this point."""
@@ -410,13 +413,9 @@ def push(
     items: int,
     flags: SharedBuffer,
     flag_offset: int,
-    flag_on_data_engine: Optional[bool] = None,
 ) -> None:
     """Push `items` copies of `nbytes` to every peer (see sx_push in transport.hip), then set this
-    rank's flag word at `flag_offset` in each peer's `flags` buffer, on the peer's own engine behind
-    its copies or (XDIT_SDMA_FLAGS=spare) on a spare engine once they have landed."""
-    if flag_on_data_engine is None:
-        flag_on_data_engine = flags_on_data_engines()
+    rank's flag word at `flag_offset` in each peer's `flags` buffer, behind the copies."""
     _check(
         load().sx_push(
             slot,
@@ -437,7 +436,6 @@ def push(
             flags.peer_bases,
             flag_offset,
             g.one.data_ptr(),
-            int(flag_on_data_engine),
         ),
         "sx_push",
     )
@@ -462,9 +460,49 @@ def wait(stream: torch.cuda.Stream, words: int, count: int, tag: int, call: int)
     )
 
 
-def debug_drop_flag(ahead: int, peer_index: int) -> None:
-    """Test hook: in the `ahead`-th call started from now, the push to peers[peer_index] loses its flag."""
-    load().sx_debug_drop_flag(ahead, peer_index)
+class Plan:
+    """The copies of one push, registered once and issued per call with that call's source.
+
+    `copies[i]` lists peer `g.peers[i]`'s copies as (source offset, destination address,
+    bytes); `flags[i]` is the address of the flag word set behind them.
+    """
+
+    def __init__(self, g: PeerGroup, copies, flags):
+        lib = load()
+        n = len(g.peers)
+        if len(copies) != n or len(flags) != n:
+            raise ValueError(f"a plan needs copies and a flag for each of the {n} peers")
+        flat = [c for peer in copies for c in peer]
+        u64 = ctypes.c_uint64 * max(1, len(flat))
+        self.id = lib.sx_plan_create(
+            n,
+            g.engine_arr,
+            (ctypes.c_int * n)(*[len(peer) for peer in copies]),
+            u64(*[c[0] for c in flat]),
+            u64(*[c[1] for c in flat]),
+            u64(*[c[2] for c in flat]),
+            (ctypes.c_uint64 * n)(*flags),
+        )
+        if self.id < 0:
+            raise RuntimeError(f"sx_plan_create failed with {self.id}")
+        self.copies = len(flat)
+        self.flags = n
+        self._one = g.one.data_ptr()
+
+    def issue(self, slot: int, k: int, first_data: int, first_flag: int, src_base: int) -> None:
+        """Queue the copies of this call (sources at `src_base`), gated on `slot`'s trigger `k`."""
+        _check(load().sx_plan_issue(slot, k, first_data, first_flag, self.id, src_base, self._one), "sx_plan_issue")
+
+    def free(self) -> None:
+        if self.id >= 0:
+            load().sx_plan_free(self.id)
+            self.id = -1
+
+
+def debug_drop_flag(ahead: int, issue: int, peer_index: int) -> None:
+    """Test hook: in the `ahead`-th call started from now, the `issue`-th push or plan issued (from 0)
+    loses its flag write to peers[peer_index]."""
+    load().sx_debug_drop_flag(ahead, issue, peer_index)
 
 
 def pointer_type(ptr: int) -> Optional[int]:

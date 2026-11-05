@@ -87,6 +87,11 @@ class RuntimeConfig:
     use_fp8_comms: bool = False
     fp8_comms_scale: Optional[float] = None
     fp8_comms_safety_factor: float = DEFAULT_FP8_COMMS_SAFETY_FACTOR
+    # None keeps the XDIT_ULYSSES_* environment variables (see usp_sdma.configure_from).
+    ulysses_a2a: Optional[str] = None
+    ulysses_head_groups: Optional[int] = None
+    ulysses_group_streams: Optional[bool] = None
+    ulysses_overlap_qkv: Optional[bool] = None
 
     def __post_init__(self):
         if self.warmup_steps < 0:
