@@ -232,6 +232,46 @@ def test_compiled_sdma_matches_its_layout_over_rccl(accelerator_ranks):
     accelerator_ranks(_compiled_worker, world_size=4, timeout=900)
 
 
+def _cuda_graph_worker(rank, world_size, init_method):
+    import torch
+    import torch.distributed as dist
+
+    from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+    from xfuser.model_executor.layers.usp import USP
+
+    try:
+        device = _setup(rank, world_size, init_method, world_size)
+        torch._dynamo.config.recompile_limit = 64
+
+        def layer(x, w):
+            q, k, v = (torch.nn.functional.linear(x, w) * (i + 1) for i in range(3))
+            q, k, v = (t.unflatten(-1, (-1, HEAD_DIM)).transpose(1, 2) for t in (q, k, v))
+            return USP(q, k, v)
+
+        # CUDA graph trees run their warmup in the graph's memory pool: the ops must not leave an
+        # allocation of theirs alive there (this process has not used the SDMA transport yet).
+        graphed = torch.compile(layer, mode="reduce-overhead")
+        generator = torch.Generator(device=device).manual_seed(rank)
+        w = torch.randn(6 * world_size * HEAD_DIM, 256, generator=generator, device=device, dtype=torch.bfloat16)
+        w = w * 0.05
+        for call in range(4):
+            x = torch.randn(1, 384, 256, generator=generator, device=device, dtype=torch.bfloat16)
+            actual = _usp_call(graphed, x, w, "rccl_packed", 2).clone()
+            expected = _usp_call(layer, x, w, "rccl_packed", 2)
+            torch.testing.assert_close(actual, expected, msg=lambda m: f"call {call}: {m}")
+        dist.barrier()
+    finally:
+        # Graphs that captured RCCL kernels keep destroying their communicator from returning.
+        torch.compiler.reset()
+        torch.cuda.synchronize()
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+def test_packed_layout_runs_under_cuda_graphs(accelerator_ranks):
+    accelerator_ranks(_cuda_graph_worker, world_size=4, timeout=900)
+
+
 def _usp(q, k, v, mode, head_groups, **kwargs):
     from xfuser.model_executor.layers import usp_sdma
     from xfuser.model_executor.layers.usp import USP

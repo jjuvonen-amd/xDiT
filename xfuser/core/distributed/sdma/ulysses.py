@@ -241,8 +241,22 @@ class _State:
         self.plans: Dict[tuple, tuple] = {}
 
 
-_states: Dict[transport.PeerGroup, _State] = {}
+# Keyed by the group's ranks, as transport.group_for shares its buffers. A call that runs over
+# RCCL never creates the PeerGroup: under CUDA graph trees its first allocations would land in
+# the graph pool and outlive the graph.
+_states: Dict[tuple, _State] = {}
+_state_keys: Dict[dist.ProcessGroup, tuple] = {}
 _side_streams: Dict[torch.device, List[torch.cuda.Stream]] = {}
+
+
+def _state(process_group: dist.ProcessGroup) -> _State:
+    key = _state_keys.get(process_group)
+    if key is None:
+        key = _state_keys[process_group] = tuple(dist.get_process_group_ranks(process_group))
+    state = _states.get(key)
+    if state is None:
+        state = _states[key] = _State()
+    return state
 
 
 def _streams(device: torch.device, count: int) -> List[torch.cuda.Stream]:
@@ -316,18 +330,17 @@ def _plan(state, g, ex, direction, gi, inbox, outbox, flags, elt) -> transport.P
 def begin(process_group: dist.ProcessGroup, exchange: Exchange, rccl: bool = False) -> None:
     """Open a call on `process_group`. With `rccl`, or while a CUDA graph is being captured (host-
     issued copies would not be replayed), the call exchanges the same packed tensors with RCCL."""
-    g = transport.group_for(process_group)
-    state = _states.get(g)
-    if state is None:
-        state = _states[g] = _State()
+    state = _state(process_group)
     if state.open is not None:
         raise RuntimeError("an SDMA Ulysses call is already open on this group")
-    if exchange.world != g.world:
-        raise ValueError(f"exchange for {exchange.world} ranks on a group of {g.world}")
+    world = dist.get_world_size(process_group)
+    if exchange.world != world:
+        raise ValueError(f"exchange for {exchange.world} ranks on a group of {world}")
     rccl = rccl or torch.cuda.is_current_stream_capturing()
     if rccl:
         state.open = _Call(exchange, None, None, True)
         return
+    g = transport.group_for(process_group)
     ex, P, r = exchange, g.world, g.rank
     inbox, outbox, flags, elt = _buffers(g, ex)
     n_data = sum(
@@ -344,14 +357,14 @@ def begin(process_group: dist.ProcessGroup, exchange: Exchange, rccl: bool = Fal
 
 def send(process_group: dist.ProcessGroup, gi: int, packed: torch.Tensor) -> None:
     """Push head group `gi`'s packed tensor (`pack_group`) once the stream has produced it."""
-    g = transport.group_for(process_group)
-    state = _states[g]
+    state = _state(process_group)
     c = state.open
     if c is None or gi != c.sent:
         raise RuntimeError(f"SDMA Ulysses send of group {gi} out of order")
     c.packed.append(packed)
     if c.rccl:
         return
+    g = transport.group_for(process_group)
     ex, P, r, b, d = c.exchange, g.world, g.rank, c.exchange.batch, c.exchange.head_dim
     inbox, outbox, flags, elt = _buffers(g, ex)
     n_peers = P - 1
@@ -392,14 +405,14 @@ def finish(
     own (the first at high priority), so a group whose data has landed fills the GPU while the
     one before it drains: fewer heads per kernel leave more of its last wave idle.
     """
-    g = transport.group_for(process_group)
-    state = _states[g]
+    state = _state(process_group)
     c = state.open
     if c is None or c.sent != c.exchange.groups:
         raise RuntimeError("SDMA Ulysses finish before every group was sent")
     state.open = None
     if c.rccl:
         return _finish_rccl(process_group, c.exchange, c.packed, attend, local)
+    g = transport.group_for(process_group)
     ex, P, r, b, d, G = c.exchange, g.world, g.rank, c.exchange.batch, c.exchange.head_dim, c.exchange.groups
     inbox, outbox, flags, elt = _buffers(g, ex)
     stream = torch.cuda.current_stream()
