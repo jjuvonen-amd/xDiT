@@ -1369,6 +1369,7 @@ class xFuserModel(abc.ABC):
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=schedule,
+            on_trace_ready=self._export_profile,
             record_shapes=True,
             with_stack=with_stack,
         ) as profile_object:
@@ -1441,10 +1442,19 @@ class xFuserModel(abc.ABC):
             json.dump(timings, timing_file, indent=2)
         log(f"Timings saved to {self.config.output_directory}/timings.json")
 
+    def _profile_file(self) -> str:
+        return f"{self.config.output_directory}/profile_trace_rank_{get_world_group().rank}.json.gz"
+
+    def _export_profile(self, profile: torch.profiler.profiler.profile) -> None:
+        # With a schedule, the events exist only when the active steps end: exporting after the
+        # profiler's context has closed writes an empty trace.
+        profile.export_chrome_trace(self._profile_file())
+        self._profile_exported = True
+
     def save_profile(self, profile: torch.profiler.profiler.profile) -> None:
-        profile_file = f"{self.config.output_directory}/profile_trace_rank_{get_world_group().rank}.json.gz"
-        profile.export_chrome_trace(profile_file)
-        log(f"Profile trace saved to {profile_file}", log_from_all_processes=True)
+        if not getattr(self, "_profile_exported", False):
+            profile.export_chrome_trace(self._profile_file())
+        log(f"Profile trace saved to {self._profile_file()}", log_from_all_processes=True)
 
     def prepare_run(self, input_args: dict) -> None:
         """Prepare model state before a pipeline invocation."""

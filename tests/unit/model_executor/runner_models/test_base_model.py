@@ -1,3 +1,4 @@
+import gzip
 import json
 import logging
 from types import SimpleNamespace
@@ -34,6 +35,35 @@ def test_outputs_land_in_an_output_directory_that_did_not_exist(tmp_path):
     model.save_timings([1.5])
 
     assert json.loads((output_directory / "timings.json").read_text()) == [1.5]
+
+
+def test_profile_saves_the_profiled_iterations(monkeypatch, tmp_path):
+    """With a profiler schedule the trace holds events only once its active steps end, so it is
+    written from the profiler's trace-ready callback: exported after the profiler's context had
+    closed, it held no events."""
+    monkeypatch.setattr(base_model, "get_world_group", lambda: SimpleNamespace(world_size=1, rank=0))
+    model = _StubModel(
+        xFuserArgs(
+            model="test/model",
+            output_directory=str(tmp_path),
+            profile=True,
+            profile_wait=0,
+            profile_warmup=1,
+            profile_active=1,
+        )
+    )
+    x = torch.randn(32, 32)
+    model._validate_args = lambda input_args: None
+    model._split_prompts_for_dp = lambda input_args: input_args
+    model._gather_dp_outputs = lambda output: output
+    model._run_timed_pipe = lambda input_args: (torch.mm(x, x), 0.0)
+
+    _, _, profile = model.profile({})
+    model.save_profile(profile)
+
+    with gzip.open(tmp_path / "profile_trace_rank_0.json.gz", "rt") as trace:
+        names = {event.get("name") for event in json.load(trace)["traceEvents"]}
+    assert "aten::mm" in names
 
 
 @pytest.mark.parametrize("dp_rank", [0, 1])
