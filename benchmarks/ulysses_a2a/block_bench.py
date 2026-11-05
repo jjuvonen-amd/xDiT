@@ -18,11 +18,17 @@ the runners hand them.
 
 Variants:
   rccl     USP's all-to-alls on RCCL, as shipped
+  rccl2    rccl again, compared with rccl: what the kernels themselves vary run to run
   nocomm   each all-to-all replaced by a local copy of the same size: what the blocks
            cost with the exchange free. Its output is meaningless.
   sdma     the Ulysses all-to-alls on SDMA engines (xfuser/core/distributed/sdma), once
            for each --head-groups value
   sdmac    the same with each head group attending on a stream of its own
+  packed   the SDMA path's layout and head groups over RCCL all-to-alls: tells the
+           transport's share of a gain from the layout's
+  sdmaq    sdma with Q/K/V projected one head group at a time (MiniMax-H3, FLUX.3), so
+           each group's exchange overlaps the next group's projection; --qkv-groups groups
+  sdmaqc   sdmaq with group streams
 
 `exposed` = (variant - nocomm) / variant: the share of the forward spent waiting for
 the exchange. Every sdma variant is checked against rccl's output. Variants take turns
@@ -31,6 +37,8 @@ before each. `blocks` is
 the span from the first block's start to the last block's end, slowest and fastest
 rank: without per-layer exchanges (nocomm) the ranks drift apart and the forward's
 closing all-gather absorbs the drift, so a spread there is the GPUs' speed spread.
+`host` is the slowest rank's median host time to enqueue a forward: near the forward
+time, the GPU waits for the host.
 """
 
 import argparse
@@ -38,6 +46,7 @@ import contextlib
 import json
 import os
 import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -52,13 +61,24 @@ def parse_args():
     p.add_argument("--resolution", type=int, default=2048, help="flux3: square image side")
     p.add_argument("--backend", default="AITER", help="attention backend (AttentionBackendType name)")
     p.add_argument("--layers", type=int, default=2, help="transformer blocks (flux3: single-stream blocks)")
-    p.add_argument("--variants", nargs="+", default=["rccl", "nocomm"], choices=["rccl", "nocomm", "sdma", "sdmac"])
+    p.add_argument(
+        "--variants",
+        nargs="+",
+        default=["rccl", "nocomm"],
+        choices=["rccl", "rccl2", "nocomm", "sdma", "sdmac", "packed", "sdmaq", "sdmaqc"],
+    )
     p.add_argument("--head-groups", type=int, nargs="+", default=[1, 2])
+    p.add_argument(
+        "--qkv-groups", type=int, default=2, help="head groups of the sdmaq variant (its weights are cut once)"
+    )
     p.add_argument(
         "--compile", action="store_true", help="torch.compile each block (default mode, the runners' comm reordering)"
     )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=10)
+    p.add_argument(
+        "--check-blocks", action="store_true", help="also compare every block's output with rccl's, per rank"
+    )
     p.add_argument("--profile", default="", help="directory for a torch profiler trace of rank 0, per variant")
     p.add_argument("--output", default="")
     return p.parse_args()
@@ -227,7 +247,7 @@ def variant(name, head_groups):
     """Run the block forward with the named all-to-all transport."""
     import xfuser.model_executor.layers.usp as usp
 
-    if name == "rccl":
+    if name in ("rccl", "rccl2"):
         yield
     elif name == "nocomm":
         real = usp._sdpa_all_to_all_single
@@ -239,7 +259,10 @@ def variant(name, head_groups):
     else:
         from xfuser.model_executor.layers import usp_sdma
 
-        previous = usp_sdma.configure("sdma", head_groups, concurrent=name == "sdmac")
+        mode = "rccl_packed" if name == "packed" else "sdma"
+        previous = usp_sdma.configure(
+            mode, head_groups, concurrent=name in ("sdmac", "sdmaqc"), overlap_qkv=name in ("sdmaq", "sdmaqc")
+        )
         try:
             yield
         finally:
@@ -251,6 +274,14 @@ def main():
     device, cfg, ulysses = _setup(args)
     rank, world = dist.get_rank(), dist.get_world_size()
     model, inputs, tokens, blocks = {"wan": wan, "minimax": minimax, "flux3": flux3}[args.model](args, device)
+    if {"sdmaq", "sdmaqc"} & set(args.variants):
+        from xfuser.model_executor.layers import usp_sdma
+
+        previous = usp_sdma.configure("sdma", args.qkv_groups)
+        prepared = usp_sdma.prepare_grouped_qkv(model, ulysses)
+        usp_sdma.configure(*previous)
+        if rank == 0:
+            print(f"sdmaq: {prepared} attention modules project Q/K/V by head group", flush=True)
     if args.compile:
         # As the runners compile: Inductor may move collectives against compute
         # (xFuserModel._enable_compute_comm_overlap).
@@ -280,13 +311,28 @@ def main():
         f"{', compiled' if args.compile else ''}; {world} x {props.name}, torch {torch.__version__}"
     )
     say()
-    say("| variant | forward ms | exposed | blocks ms, slowest / fastest rank | max abs diff vs rccl |")
-    say("|---|---|---|---|---|")
+    say("| variant | forward ms | exposed | blocks ms, slowest / fastest rank | host ms | max abs diff vs rccl |")
+    say("|---|---|---|---|---|---|")
 
     # Events at the first block's start and the last block's end, per forward.
     marks = []
     blocks[0].register_forward_pre_hook(lambda *_: marks.append(_event()))
     blocks[-1].register_forward_hook(lambda *_: marks.append(_event()))
+    # With --check-blocks: every block's output in the last iteration, per variant.
+    block_outputs = {}
+    recording = []
+
+    def record(index):
+        def hook(module, args, output):
+            if recording:
+                out = output[0] if isinstance(output, (tuple, list)) else output
+                block_outputs.setdefault(recording[0], []).append((index, out.detach().float().clone()))
+
+        return hook
+
+    if args.check_blocks:
+        for index, block in enumerate(blocks):
+            block.register_forward_hook(record(index))
 
     def forward():
         with torch.no_grad():
@@ -294,21 +340,26 @@ def main():
         return out[0] if isinstance(out, (tuple, list)) else out.sample
 
     runs = [("rccl", 0)] if "rccl" in args.variants else []
+    runs += [("rccl2", 0)] if "rccl2" in args.variants else []
     runs += [("nocomm", 0)] if "nocomm" in args.variants else []
     runs += [("sdma", h) for h in args.head_groups] if "sdma" in args.variants else []
     runs += [("sdmac", h) for h in args.head_groups if h > 1] if "sdmac" in args.variants else []
-    labels = [name if name not in ("sdma", "sdmac") else f"{name} g{h}" for name, h in runs]
+    runs += [("packed", h) for h in args.head_groups] if "packed" in args.variants else []
+    runs += [(name, args.qkv_groups) for name in ("sdmaq", "sdmaqc") if name in args.variants]
+    labels = [name if name in ("rccl", "rccl2", "nocomm") else f"{name} g{h}" for name, h in runs]
 
     def timed(run):
-        """One forward under `run`: (forward events, block-span events, output)."""
+        """One forward under `run`: (forward events, block-span events, host ms to enqueue it, output)."""
         with variant(*run):
             dist.barrier()
             marks.clear()
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record()
+            host = time.perf_counter()
             out = forward()
+            host = (time.perf_counter() - host) * 1e3
             end.record()
-            return (start, end), (marks[0], marks[-1]), out
+            return (start, end), (marks[0], marks[-1]), host, out
 
     # Variants take turns every iteration, so clock and thermal drift falls on all of them alike.
     for _ in range(args.warmup):
@@ -316,30 +367,38 @@ def main():
             timed(run)
     times = {label: [] for label in labels}
     outputs = {}
-    for _ in range(args.iters):
+    for it in range(args.iters):
         for label, run in zip(labels, runs):
-            fwd, span, outputs[label] = timed(run)
-            times[label].append((fwd, span))
+            if args.check_blocks and it == args.iters - 1:
+                recording[:] = [label]
+                block_outputs[label] = []
+            fwd, span, host, outputs[label] = timed(run)
+            recording.clear()
+            times[label].append((fwd, span, host))
     torch.cuda.synchronize()
 
     results = {}
     reference = outputs["rccl"].float() if "rccl" in outputs else None
     per_rank = {}
     for label, run in zip(labels, runs):
-        ms = statistics.median(s.elapsed_time(e) for (s, e), _ in times[label])
-        block_ms = statistics.median(s.elapsed_time(e) for _, (s, e) in times[label])
-        worst = torch.tensor([ms, block_ms, -block_ms], device=device)
+        ms = statistics.median(s.elapsed_time(e) for (s, e), _, _ in times[label])
+        block_ms = statistics.median(s.elapsed_time(e) for _, (s, e), _ in times[label])
+        host_ms = statistics.median(h for _, _, h in times[label])
+        worst = torch.tensor([ms, block_ms, -block_ms, host_ms], device=device)
         dist.all_reduce(worst, op=dist.ReduceOp.MAX)
         every = [torch.zeros(1, device=device) for _ in range(world)]
         dist.all_gather(every, torch.tensor([block_ms], device=device))
         per_rank[label] = [round(t.item(), 1) for t in every]
         results[label] = worst[0].item()
         results[label + " blocks"] = f"{worst[1].item():.2f} / {-worst[2].item():.2f}"
+        results[label + " host"] = worst[3].item()
         diff = ""
-        if run[0] in ("sdma", "sdmac") and reference is not None:
-            d = torch.tensor([(outputs[label].float() - reference).abs().max().item()], device=device)
+        if run[0] not in ("rccl", "nocomm") and reference is not None:  # rccl2: RCCL run-to-run
+            d = torch.tensor(
+                [(outputs[label].float() - reference).abs().max().item(), reference.abs().max().item()], device=device
+            )
             dist.all_reduce(d, op=dist.ReduceOp.MAX)
-            diff = f"{d.item():.3g}"
+            diff = f"{d[0].item():.3g} (of max {d[1].item():.3g})"
         results[label + " diff"] = diff
         if args.profile:
             from torch.profiler import ProfilerActivity, profile
@@ -351,13 +410,29 @@ def main():
                 Path(args.profile).mkdir(parents=True, exist_ok=True)
                 prof.export_chrome_trace(str(Path(args.profile) / f"{label.replace(' ', '_')}.json"))
     base = results.get("nocomm")
-    for label in [k for k in results if not k.endswith((" diff", " blocks"))]:
+    for label in [k for k in results if not k.endswith((" diff", " blocks", " host"))]:
         exposed = "" if base is None or label == "nocomm" else f"{(results[label] - base) / results[label]:.1%}"
         say(
-            f"| {label} | {results[label]:.2f} | {exposed} | {results[label + ' blocks']} | {results[label + ' diff']} |"
+            f"| {label} | {results[label]:.2f} | {exposed} | {results[label + ' blocks']} | {results[label + ' host']:.2f} | {results[label + ' diff']} |"
         )
     say()
     say("Blocks ms per rank: " + "; ".join(f"{label} {times}" for label, times in per_rank.items()))
+    if args.check_blocks and "rccl" in block_outputs:
+        say()
+        say("Per block, max abs diff vs rccl on each rank:")
+        for label, outs in block_outputs.items():
+            if label == "rccl":
+                continue
+            for (index, out), (_, ref) in zip(outs, block_outputs["rccl"]):
+                wrong = (out - ref).abs() > 0.05
+                d = torch.tensor([(out - ref).abs().max().item(), wrong.sum().item()], device=device)
+                every = [torch.zeros(2, device=device) for _ in range(world)]
+                dist.all_gather(every, d)
+                rows = wrong.flatten(2).any(-1).nonzero()[:, 1].unique().tolist() if wrong.any() else []
+                say(
+                    f"- {label}, block {index}: max diff {[round(x[0].item(), 4) for x in every]}, elements off by "
+                    f"> 0.05 {[int(x[1].item()) for x in every]}; rank 0 rows {rows[:8]}{'...' if len(rows) > 8 else ''}"
+                )
 
     if args.output and rank == 0:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
