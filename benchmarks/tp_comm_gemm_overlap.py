@@ -16,9 +16,10 @@ model does today and with the collective pipelined against the GEMM:
               beyond ~10 MB on torch 2.13 / ROCm 7.16.
   symm_mem_sdma_kN  ROCm, opt-in (--symm-mem-sdma): the same torch ops on a torch patched with
               patches/pytorch (TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 for these calls only), N pieces
-              per rank. Natural row order, so the same inputs as symm_mem. With --graph also
-              symm_mem_sdma_graph_kN: the same call captured once in a CUDA graph and replayed (each
-              replay issues the copies from a host-function node).
+              per rank. Natural row order, so the same inputs as symm_mem. symm_mem_sdma_auto: the
+              patch's default piece count for the shape. With --graph also symm_mem_sdma_graph_kN /
+              _graph_auto: the same call captured once in a CUDA graph and replayed (each replay
+              issues the copies from a host-function node).
   sdma_kN     ROCm, opt-in (--sdma): xfuser's all-gather + GEMM with the gather on SDMA
               copy engines, all peers at once, in N pieces on the block-cyclic rows; each
               piece's GEMM starts as it lands (xfuser/model_executor/layers/sdma_all_gather.py).
@@ -26,6 +27,16 @@ model does today and with the collective pipelined against the GEMM:
               owners on SDMA engines and reduced chunk by chunk (sdma_linear_reduce_scatter).
 
 The all-gathers are called with return_A=False, as inference calls them.
+
+--fp8 adds the same pairs in fp8 with row-wise scales (activation rows and weight rows quantized
+to e4m3, bf16 output), checked against fp8_baseline:
+
+  fp8_baseline    all_gather of the fp8 rows and their scales -> _scaled_mm, or _scaled_mm ->
+                  reduce_scatter.
+  fp8_symm_mem    torch.ops.symm_mem.fused_all_gather_scaled_matmul /
+                  fused_scaled_matmul_reduce_scatter (with --symm-mem).
+  fp8_symm_mem_sdma_kN  the same ops on their patched SDMA path (with --symm-mem-sdma), N pieces
+                  per rank, or fp8_symm_mem_sdma_auto; fp8_symm_mem_sdma_graph_* with --graph.
 
 `comm_only` and `gemm_only` time each half alone; `ideal` is their max. Each
 variant is checked against baseline. Times are the slowest rank's median.
@@ -75,6 +86,7 @@ def _parse_args():
         "--symm-mem-sdma", action="store_true", help="also time torch's symm_mem ops on their patched SDMA path (ROCm)"
     )
     parser.add_argument("--graph", action="store_true", help="with --symm-mem-sdma, also time it replayed from a graph")
+    parser.add_argument("--fp8", action="store_true", help="also time each pair in fp8 with row-wise scales")
     parser.add_argument("--sdma-trigger", default="gpu", choices=["gpu", "host"])
     parser.add_argument("--sdma-direction", default="push", choices=["push", "pull"])
     parser.add_argument("--warmup", type=int, default=5)
@@ -171,11 +183,12 @@ class Bench:
 
     @contextlib.contextmanager
     def torch_sdma(self, k, op):
-        """Calls inside run torch's symm_mem ops on their SDMA path in k pieces per rank (patched torch)."""
+        """Calls inside run torch's symm_mem ops on their SDMA path in k pieces per rank, or the
+        patch's default count if k is None (patched torch)."""
         from torch.distributed._symmetric_memory import _rocm_sdma
 
         saved = {name: os.environ.get(name) for name in _TORCH_SDMA_ENV}
-        os.environ.update({"TORCH_SYMM_MEM_ENABLE_ROCM_SDMA": "1", "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": str(k)})
+        os.environ.update({"TORCH_SYMM_MEM_ENABLE_ROCM_SDMA": "1", "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": str(k or "")})
         calls = _rocm_sdma.num_calls[op]
         try:
             yield
@@ -199,16 +212,76 @@ class Bench:
             out = fn()
         return graph.replay, out
 
-    def time_torch_sdma(self, results, k, op, fn, expected):
-        """symm_mem_sdma_k{k} for `fn` (a stock symm_mem call), and replayed from a graph with --graph."""
-        with self.torch_sdma(k, op):
-            self.check(f"symm_mem_sdma_k{k}", fn(), expected)
-            results[f"symm_mem_sdma_k{k}"] = self.time(fn)
-            if self.args.graph:
-                replay, out = self.graphed(fn)
-                replay()
-                self.check(f"symm_mem_sdma_graph_k{k}", out, expected)
-                results[f"symm_mem_sdma_graph_k{k}"] = self.time(replay)
+    def time_torch_sdma(self, results, op, fn, expected, prefix=""):
+        """{prefix}symm_mem_sdma_k{k} for `fn` (a stock symm_mem call) for each --chunks k and the
+        default count, and replayed from a graph with --graph."""
+        for k in [*self.args.chunks, None]:
+            tag = _sdma_tag(k)
+            with self.torch_sdma(k, op):
+                self.check(f"{prefix}symm_mem_sdma_{tag}", fn(), expected)
+                results[f"{prefix}symm_mem_sdma_{tag}"] = self.time(fn)
+                if self.args.graph:
+                    replay, out = self.graphed(fn)
+                    replay()
+                    self.check(f"{prefix}symm_mem_sdma_graph_{tag}", out, expected)
+                    results[f"{prefix}symm_mem_sdma_graph_{tag}"] = self.time(replay)
+
+    # ---- fp8, row-wise scales ------------------------------------------------------------------
+    @staticmethod
+    def quantize(x):
+        """x as e4m3 rows and their fp32 scales, (rows, 1): x ~= q * scale."""
+        dtype = (
+            torch.float8_e4m3fnuz if "gfx94" in torch.cuda.get_device_properties().gcnArchName else torch.float8_e4m3fn
+        )
+        scale = x.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / torch.finfo(dtype).max
+        return (x.float() / scale).to(dtype), scale
+
+    def scaled_mm(self, a, a_scale, w, w_scale):
+        return torch._scaled_mm(a, w.t(), a_scale, w_scale, out_dtype=torch.bfloat16)
+
+    def ag_fp8_baseline(self, a_local, a_scale, w, w_scale):
+        full = torch.empty(self.seq, a_local.shape[1], dtype=torch.uint8, device=a_local.device)
+        dist.all_gather_into_tensor(full, a_local.view(torch.uint8))
+        scales = torch.empty(self.seq, 1, device=a_local.device)
+        dist.all_gather_into_tensor(scales, a_scale)
+        return self.scaled_mm(full.view(a_local.dtype), scales, w, w_scale)
+
+    def ag_fp8_symm_mem(self, a_local, a_scale, w, w_scale):
+        _, (out,) = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
+            a_local, [w.t()], a_scale, [w_scale], 0, self.group_name,
+            biases=[None], result_scales=[None], out_dtypes=[torch.bfloat16], use_fast_accum=[False],
+        )  # fmt: skip
+        return out
+
+    def rs_fp8_baseline(self, a_full, a_scale, w, w_scale):
+        partial = self.scaled_mm(a_full, a_scale, w, w_scale)
+        out = partial.new_empty(self.rows, partial.shape[1])
+        dist.reduce_scatter_tensor(out, partial)
+        return out
+
+    def rs_fp8_symm_mem(self, a_full, a_scale, w, w_scale):
+        return torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
+            a_full, w.t(), a_scale, w_scale, "sum", 0, 0, self.group_name,
+            [self.seq, w.shape[0]], out_dtype=torch.bfloat16,
+        )  # fmt: skip
+
+    def run_site_fp8(self, results, kind, weight, a):
+        """fp8 variants of the site; `a` is this rank's rows for AG, its partial-sum input for RS."""
+        w, w_scale = self.quantize(weight)
+        w_scale = w_scale.t().contiguous()  # (1, out features), as _scaled_mm takes it
+        a, a_scale = self.quantize(a)
+        if kind == "ag":
+            baseline, symm_mem, op = self.ag_fp8_baseline, self.ag_fp8_symm_mem, "fused_all_gather_scaled_matmul"
+        else:
+            baseline, symm_mem, op = self.rs_fp8_baseline, self.rs_fp8_symm_mem, "fused_scaled_matmul_reduce_scatter"
+        expected = baseline(a, a_scale, w, w_scale).clone()
+        results["fp8_baseline"] = self.time(lambda: baseline(a, a_scale, w, w_scale))
+        fn = lambda: symm_mem(a, a_scale, w, w_scale)  # noqa: E731
+        if self.args.symm_mem:
+            self.check("fp8_symm_mem", fn(), expected)
+            results["fp8_symm_mem"] = self.time(fn)
+        if self.args.symm_mem_sdma:
+            self.time_torch_sdma(results, op, fn, expected, prefix="fp8_")
 
     # ---- timing --------------------------------------------------------------------------------
     def time(self, fn):
@@ -259,14 +332,15 @@ class Bench:
                 self.check("symm_mem", self.ag_symm_mem(a_local, weight, out), expected)
                 results["symm_mem"] = self.time(lambda: self.ag_symm_mem(a_local, weight, out))
             if self.args.symm_mem_sdma:
-                for k in self.args.chunks:
-                    fn = lambda: self.ag_symm_mem(a_local, weight, out)  # noqa: E731
-                    self.time_torch_sdma(results, k, "fused_all_gather_matmul", fn, expected)
+                fn = lambda: self.ag_symm_mem(a_local, weight, out)  # noqa: E731
+                self.time_torch_sdma(results, "fused_all_gather_matmul", fn, expected)
             if self.args.sdma:
                 for k in self.args.chunks:
                     a_cyclic = self.cyclic_rows(x_full, k).contiguous()
                     self.check(f"sdma_k{k}", self.ag_sdma(a_cyclic, weight, k), expected)
                     results[f"sdma_k{k}"] = self.time(lambda: self.ag_sdma(a_cyclic, weight, k))
+            if self.args.fp8:
+                self.run_site_fp8(results, kind, weight, a_local)
         else:
             a_full = torch.randn(self.seq, k_in, **bf16)
             out = torch.empty(self.rows, n, **bf16)
@@ -286,51 +360,72 @@ class Bench:
                 self.check("symm_mem", self.rs_symm_mem(a_full, weight, out), expected_local)
                 results["symm_mem"] = self.time(lambda: self.rs_symm_mem(a_full, weight, out))
             if self.args.symm_mem_sdma:
-                for k in self.args.chunks:
-                    fn = lambda: self.rs_symm_mem(a_full, weight, out)  # noqa: E731
-                    self.time_torch_sdma(results, k, "fused_matmul_reduce_scatter", fn, expected_local)
+                fn = lambda: self.rs_symm_mem(a_full, weight, out)  # noqa: E731
+                self.time_torch_sdma(results, "fused_matmul_reduce_scatter", fn, expected_local)
             if self.args.sdma:
                 for k in self.args.chunks:
                     self.check(f"sdma_k{k}", self.rs_sdma(a_full, weight, k), self.cyclic_rows(expected_full, k))
                     results[f"sdma_k{k}"] = self.time(lambda: self.rs_sdma(a_full, weight, k))
+            if self.args.fp8:
+                self.run_site_fp8(results, kind, weight, a_full)
         results["ideal"] = max(results["comm_only"], results["gemm_only"])
         return results
 
 
+def _sdma_tag(k):
+    return f"k{k}" if k else "auto"
+
+
 def _report(bench, table):
     args = bench.args
+    sdma_ks = [*args.chunks, None]
     variants = (
         ["baseline"]
         + [f"chunked_k{k}" for k in args.chunks]
         + (["symm_mem"] if args.symm_mem else [])
-        + ([f"symm_mem_sdma_k{k}" for k in args.chunks] if args.symm_mem_sdma else [])
-        + ([f"symm_mem_sdma_graph_k{k}" for k in args.chunks] if args.symm_mem_sdma and args.graph else [])
+        + ([f"symm_mem_sdma_{_sdma_tag(k)}" for k in sdma_ks] if args.symm_mem_sdma else [])
+        + ([f"symm_mem_sdma_graph_{_sdma_tag(k)}" for k in sdma_ks] if args.symm_mem_sdma and args.graph else [])
         + ([f"sdma_k{k}" for k in args.chunks] if args.sdma else [])
     )
-    columns = ["comm_only", "gemm_only", "ideal", *variants]
+    fp8 = (
+        ["fp8_baseline"]
+        + (["fp8_symm_mem"] if args.symm_mem else [])
+        + ([f"fp8_symm_mem_sdma_{_sdma_tag(k)}" for k in sdma_ks] if args.symm_mem_sdma else [])
+        + ([f"fp8_symm_mem_sdma_graph_{_sdma_tag(k)}" for k in sdma_ks] if args.symm_mem_sdma and args.graph else [])
+        if args.fp8
+        else []
+    )
+    columns = ["comm_only", "gemm_only", "ideal", *variants, *fp8]
     channels = os.environ.get("NCCL_MAX_NCHANNELS", "default")
     lines = [
         f"# TP{bench.world} comm/GEMM overlap, hidden {args.hidden}, ffn {args.ffn}",
         "",
-        f"seq {bench.seq} ({bench.rows} rows/rank), hidden {args.hidden}, ffn {args.ffn}, bf16, "
+        f"seq {bench.seq} ({bench.rows} rows/rank), hidden {args.hidden}, ffn {args.ffn}, bf16"
+        + (" and fp8 row-wise (fp8_*)" if args.fp8 else "")
+        + ", "
         f"NCCL_MAX_NCHANNELS={channels}"
         + (f", SDMA {args.sdma_direction}, trigger {args.sdma_trigger}" if args.sdma else "")
         + f". Slowest rank's median ms over {args.iters} iterations.",
         "",
-        "| site | " + " | ".join(columns) + " | best vs baseline |",
-        "|---|" + "---|" * (len(columns) + 1),
+        "| site | " + " | ".join(columns) + " | best vs baseline |" + (" fp8 best vs fp8_baseline |" if fp8 else ""),
+        "|---|" + "---|" * (len(columns) + 1 + bool(fp8)),
     ]
-    for site, results in table.items():
-        best = min(variants[1:], key=lambda v: results[v]) if len(variants) > 1 else "baseline"
+
+    def best(results, names):
+        name = min(names[1:], key=lambda v: results[v]) if len(names) > 1 else names[0]
+        return f"{name} {results[names[0]] / results[name]:.2f}x"
+
+    def row(label, results):
         cells = " | ".join(f"{results[c]:.2f}" for c in columns)
-        lines.append(f"| {site} | {cells} | {best} {results['baseline'] / results[best]:.2f}x |")
+        return f"| {label} | {cells} | {best(results, variants)} |" + (f" {best(results, fp8)} |" if fp8 else "")
+
+    for site, results in table.items():
+        lines.append(row(site, results))
     for mode, counts in _PER_BLOCK.items():
         if not set(counts) <= set(table):
             continue
         totals = {c: sum(table[s][c] * n for s, n in counts.items()) for c in columns}
-        cells = " | ".join(f"{totals[c]:.2f}" for c in columns)
-        best = min(variants[1:], key=lambda v: totals[v]) if len(variants) > 1 else "baseline"
-        lines.append(f"| **block, cross-attn {mode}** | {cells} | {best} {totals['baseline'] / totals[best]:.2f}x |")
+        lines.append(row(f"**block, cross-attn {mode}**", totals))
     text = "\n".join(lines) + "\n"
     print(text, flush=True)
     path = Path(args.output_dir)
