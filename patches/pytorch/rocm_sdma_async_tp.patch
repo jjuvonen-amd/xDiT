@@ -1,4 +1,4 @@
-From c9747824e3dce7e563c6174c40354d71e0473066 Mon Sep 17 00:00:00 2001
+From 2f530bad3dbc20c425d34cba8aaec97273cfd663 Mon Sep 17 00:00:00 2001
 From: jjuvonen-amd <joni.juvonen@amd.com>
 Date: Mon, 2 Nov 2026 12:54:29 +0000
 Subject: [PATCH] [ROCm] symm_mem: fused all-gather + matmul and matmul +
@@ -20,10 +20,22 @@ bounded by a timeout, and another releases the copies after the
 symmetric-memory barrier. Rows land in natural order, so results, return_A and
 output strides match the default path.
 
+The fp8 variants, fused_all_gather_scaled_matmul and
+fused_scaled_matmul_reduce_scatter, take the same path with tensor-wise or
+row-wise scales. A push carries several copies of their own sizes under one
+flag, so row-wise scales sharded with A land with A's rows. _scaled_mm takes
+matrices only, so each piece runs one _scaled_mm per rank or per owner.
+
+Each call picks its pieces per rank from its size: the most, up to 8, that
+keep a piece at least 16 MiB (TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS overrides).
+
+Results are deterministic: the reduce-scatter sums each piece's partial sums in
+rank order, in fp32, so reruns are bitwise equal.
+
 Captured calls issue their copies from a host-function node on every replay.
-Unsupported cases (last-dim gather/scatter, the fp8 scaled ops, unvalidated
-architectures unless TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED=1) take the
-default path.
+Unsupported cases (last-dim gather/scatter, a scaled reduce-scatter of an A
+reshaped with another scatter dim, unvalidated architectures unless
+TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED=1) take the default path.
 
 The transport (_rocm_sdma.hip) is built with torch.utils.cpp_extension on
 first use and called through ctypes; a C++ port under
@@ -33,19 +45,27 @@ Test plan:
 python test/distributed/test_symmetric_memory.py -k "AsyncTPTest or AsyncTPRocmSdmaTest"
 TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 python test/distributed/test_symmetric_memory.py -k AsyncTPTest
 ---
- test/distributed/test_symmetric_memory.py     | 255 ++++++++
- .../distributed/_symmetric_memory/__init__.py |  30 +
- .../_symmetric_memory/_rocm_sdma.hip          | 542 ++++++++++++++++
- .../_symmetric_memory/_rocm_sdma.py           | 604 ++++++++++++++++++
- 4 files changed, 1431 insertions(+)
+ test/distributed/test_symmetric_memory.py     | 556 +++++++++++
+ .../distributed/_symmetric_memory/__init__.py |  81 ++
+ .../_symmetric_memory/_rocm_sdma.hip          | 542 +++++++++++
+ .../_symmetric_memory/_rocm_sdma.py           | 865 ++++++++++++++++++
+ 4 files changed, 2044 insertions(+)
  create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.hip
  create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.py
 
 diff --git a/test/distributed/test_symmetric_memory.py b/test/distributed/test_symmetric_memory.py
-index 2ded449..aeb037a 100644
+index 2ded4493e8..d0e631a593 100644
 --- a/test/distributed/test_symmetric_memory.py
 +++ b/test/distributed/test_symmetric_memory.py
-@@ -2000,6 +2000,261 @@ class AsyncTPTest(MultiProcContinuousTest):
+@@ -35,6 +35,7 @@ from torch.distributed._symmetric_memory import (
+     _fused_all_gather_matmul_fallback,
+     _fused_all_gather_scaled_matmul_fallback,
+     _fused_matmul_reduce_scatter_fallback,
++    _fused_scaled_matmul_reduce_scatter_fallback,
+     _test_mode,
+     restride_A_for_fused_matmul_reduce_scatter,
+     restride_A_shard_for_fused_all_gather_matmul,
+@@ -2000,6 +2001,561 @@ class AsyncTPTest(MultiProcContinuousTest):
          self.assertTrue(torch.allclose(x, t))
  
  
@@ -82,9 +102,9 @@ index 2ded449..aeb037a 100644
 +        # bf16 results against an fp32 reference of the same bf16 inputs: the
 +        # fallback's own bf16 reduce-scatter rounds each partial sum it adds,
 +        # so it is no closer to the exact result than this path.
-+        scale = expected.abs().max().item()
++        scale = expected.float().abs().max().item()
 +        torch.testing.assert_close(
-+            actual.float(), expected, rtol=2e-2, atol=1e-2 * scale
++            actual.float(), expected.float(), rtol=2e-2, atol=1e-2 * scale
 +        )
 +
 +    @skip_if_lt_x_gpu(2)
@@ -143,6 +163,21 @@ index 2ded449..aeb037a 100644
 +        )
 +        torch.testing.assert_close(output_1, output_0, rtol=1e-5, atol=1e-5)
 +        self.assertEqual(output_1.stride(), output_0.stride())
++
++    def test_auto_chunks(self) -> None:
++        """Without TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS, the piece count follows the bytes per rank."""
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        piece = _rocm_sdma.AUTO_MIN_PIECE_BYTES
++        with mock.patch.dict(os.environ, {"TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": ""}):
++            self.assertEqual(_rocm_sdma._chunks(64, piece // 128), 1)
++            self.assertEqual(_rocm_sdma._chunks(64, piece // 32), 2)
++            self.assertEqual(_rocm_sdma._chunks(64, piece // 11), 4)
++            self.assertEqual(_rocm_sdma._chunks(64, piece), 8)
++            # Lowered to a count that divides the rows.
++            self.assertEqual(_rocm_sdma._chunks(66, piece), 6)
++        with mock.patch.dict(os.environ, {"TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": "3"}):
++            self.assertEqual(_rocm_sdma._chunks(64, piece), 2)
 +
 +    @skip_if_lt_x_gpu(2)
 +    @parametrize("chunks", [1, 3, 4])
@@ -303,12 +338,297 @@ index 2ded449..aeb037a 100644
 +        else:
 +            _rocm_sdma.raise_if_failed()
 +
++    def _assert_close_scaled(self, actual, expected) -> None:
++        # Each piece's _scaled_mm against one over the whole input: the same
++        # rows, possibly another kernel. An fp8 result may differ by its
++        # rounding (3 mantissa bits).
++        rtol = 0.13 if actual.element_size() == 1 else 2e-2
++        scale = expected.float().abs().max().item()
++        torch.testing.assert_close(
++            actual.float(), expected.float(), rtol=rtol, atol=1e-2 * scale
++        )
++
++    def _fp8(self, *shape) -> torch.Tensor:
++        return torch.randn(*shape, device=device_type).to(e4m3_type)
++
++    def _scales(self, *shape) -> torch.Tensor:
++        # Unlike constant scales, these tell a misplaced scale row apart.
++        return torch.rand(*shape, device=device_type) + 0.5
++
++    def _all_gather_scaled(self, op, A_shard, Bs, A_scale, B_scales, gather_dim, out_dtypes):
++        return op(
++            A_shard,
++            Bs,
++            A_scale,
++            B_scales,
++            gather_dim=gather_dim,
++            group_name=dist.group.WORLD.group_name,
++            biases=[None] * len(Bs),
++            result_scales=[None] * len(Bs),
++            out_dtypes=out_dtypes,
++            use_fast_accum=[False] * len(Bs),
++        )
++
++    @skip_if_lt_x_gpu(2)
++    @parametrize("gather_dim", [0, 1])
++    @parametrize(
++        "scale_mode", ["tensor-wise", "row-wise-replicated", "row-wise-sharded"]
++    )
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_fused_all_gather_scaled_matmul(
++        self, gather_dim: int, scale_mode: str
++    ) -> None:
++        self._init_process()
++        BATCH, M, N, K = 8, 64, 32, 64
++        leading_dims = [BATCH, M]
++        leading_dims[gather_dim] //= self.world_size
++        A_shard = self._fp8(*leading_dims, K)
++        Bs = [self._fp8(N, K).T for _ in range(3)]
++        if scale_mode == "tensor-wise":
++            A_scale = self._scales(())
++            B_scales = [self._scales(()) for _ in Bs]
++            out_dtypes = [None, torch.bfloat16, torch.float32]
++        else:
++            if scale_mode == "row-wise-sharded":
++                A_scale = self._scales(*leading_dims, 1)
++            else:
++                # The same full scales on every rank.
++                torch.manual_seed(0)
++                A_scale = self._scales(BATCH, M, 1)
++            B_scales = [self._scales(1, N) for _ in Bs]
++            out_dtypes = [torch.bfloat16] * 3
++
++        calls = self._sdma_calls("fused_all_gather_scaled_matmul")
++        ag_0, mm_0 = self._all_gather_scaled(
++            _fused_all_gather_scaled_matmul_fallback,
++            A_shard, Bs, A_scale, B_scales, gather_dim, out_dtypes,
++        )
++        ag_1, mm_1 = self._all_gather_scaled(
++            torch.ops.symm_mem.fused_all_gather_scaled_matmul,
++            A_shard, Bs, A_scale, B_scales, gather_dim, out_dtypes,
++        )
++
++        self.assertEqual(
++            self._sdma_calls("fused_all_gather_scaled_matmul") - calls, 1
++        )
++        self.assertEqual(ag_1.view(torch.uint8), ag_0.view(torch.uint8))
++        self.assertEqual(ag_1.stride(), ag_0.stride())
++        for out_1, out_0 in zip(mm_1, mm_0):
++            self.assertEqual(out_1.dtype, out_0.dtype)
++            self.assertEqual(out_1.stride(), out_0.stride())
++            self._assert_close_scaled(out_1, out_0)
++
++    @skip_if_lt_x_gpu(2)
++    @parametrize("chunks", [1, 3, 8])
++    def test_scaled_chunks(self, chunks: int) -> None:
++        """Row-wise scales with several pieces per rank, some of them not 16-byte
++        aligned (15-row pieces)."""
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        rows, N, K = 120, 64, 128
++        A_shard = self._fp8(rows, K)
++        A_shard_scale = self._scales(rows, 1)
++        A = self._fp8(rows * self.world_size, K)
++        A_scale = self._scales(rows * self.world_size, 1)
++        B = self._fp8(N, K).T
++        B_scale = self._scales(1, N)
++
++        env = {**_ROCM_SDMA_ENV, "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": str(chunks)}
++        with mock.patch.dict(os.environ, env):
++            ag_1, (mm_1,) = self._all_gather_scaled(
++                torch.ops.symm_mem.fused_all_gather_scaled_matmul,
++                A_shard, [B], A_shard_scale, [B_scale], 0, [torch.bfloat16],
++            )
++            rs_1 = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
++                A, B, A_scale, B_scale, "sum", 0, 0, group_name,
++                [rows * self.world_size, N], out_dtype=torch.bfloat16,
++            )
++        ag_0, (mm_0,) = self._all_gather_scaled(
++            _fused_all_gather_scaled_matmul_fallback,
++            A_shard, [B], A_shard_scale, [B_scale], 0, [torch.bfloat16],
++        )
++        rs_0 = _fused_scaled_matmul_reduce_scatter_fallback(
++            A, B, A_scale, B_scale, "sum", 0, 0, group_name,
++            [rows * self.world_size, N], out_dtype=torch.bfloat16,
++        )
++
++        self.assertEqual(ag_1.view(torch.uint8), ag_0.view(torch.uint8))
++        self._assert_close_to_fp32(mm_1, mm_0)
++        self._assert_close_to_fp32(rs_1, rs_0)
++
++    @skip_if_lt_x_gpu(2)
++    @parametrize("scatter_dim", [0, 1])
++    @parametrize("rowwise", [True, False])
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_fused_scaled_matmul_reduce_scatter(
++        self, scatter_dim: int, rowwise: bool
++    ) -> None:
++        self._init_process()
++        # Row-wise scaling outputs bf16 only on ROCm; the fp32 output is
++        # tested with tensor-wise scales.
++        out_dtype = torch.bfloat16 if rowwise else torch.float32
++        BATCH, M, N, K = 8, 64, 32, 256
++        group_name = dist.group.WORLD.group_name
++        A = self._fp8(BATCH, M, K)
++        B = self._fp8(N, K).T
++        if rowwise:
++            A_scale, B_scale = self._scales(BATCH, M, 1), self._scales(1, N)
++        else:
++            A_scale, B_scale = self._scales(()), self._scales(())
++        output_shape = [BATCH, M, N]
++
++        calls = self._sdma_calls("fused_scaled_matmul_reduce_scatter")
++        output_1 = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
++            A, B, A_scale, B_scale, "avg", scatter_dim, scatter_dim, group_name,
++            output_shape, out_dtype=out_dtype,
++        )
++        output_0 = _fused_scaled_matmul_reduce_scatter_fallback(
++            A, B, A_scale, B_scale, "avg", scatter_dim, scatter_dim, group_name,
++            output_shape, out_dtype=out_dtype,
++        )
++
++        self.assertEqual(
++            self._sdma_calls("fused_scaled_matmul_reduce_scatter") - calls, 1
++        )
++        self.assertEqual(output_1.dtype, out_dtype)
++        self.assertEqual(output_1.shape, output_0.shape)
++        self.assertEqual(output_1.stride(), output_0.stride())
++        self._assert_close_to_fp32(output_1, output_0)
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_fused_scaled_matmul_reduce_scatter_flattened_A(self) -> None:
++        """A flattened from a 3D output's leading dims, as inductor's async-TP
++        pass passes it to _scaled_mm. Scattering the output's dim 0 takes this
++        path; another dim is left to the default path."""
++        self._init_process()
++        BATCH, M, N, K = 8, 64, 32, 256
++        group_name = dist.group.WORLD.group_name
++        A = self._fp8(BATCH * M, K)
++        B = self._fp8(N, K).T
++        A_scale, B_scale = self._scales(BATCH * M, 1), self._scales(1, N)
++        op = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter
++
++        calls = self._sdma_calls("fused_scaled_matmul_reduce_scatter")
++        output_1 = op(
++            A, B, A_scale, B_scale, "sum", 0, 0, group_name, [BATCH, M, N],
++            out_dtype=torch.bfloat16,
++        )
++        self.assertEqual(
++            self._sdma_calls("fused_scaled_matmul_reduce_scatter") - calls, 1
++        )
++        output_0 = _fused_scaled_matmul_reduce_scatter_fallback(
++            A, B, A_scale, B_scale, "sum", 0, 0, group_name, [BATCH, M, N],
++            out_dtype=torch.bfloat16,
++        )
++        self.assertEqual(output_1.shape, output_0.shape)
++        self._assert_close_to_fp32(output_1, output_0)
++
++        op(
++            A, B, A_scale, B_scale, "sum", 1, 0, group_name, [BATCH, M, N],
++            out_dtype=torch.bfloat16,
++        )
++        self.assertEqual(
++            self._sdma_calls("fused_scaled_matmul_reduce_scatter") - calls, 1
++        )
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(
++        os.environ, {**_ROCM_SDMA_ENV, "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": "4"}
++    )
++    def test_deterministic(self) -> None:
++        """Reruns of all four ops are bitwise equal."""
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        rows, N, K = 512, 256, 512
++        world = self.world_size
++        x = torch.randn(rows, K, device=device_type, dtype=torch.bfloat16)
++        X = torch.randn(rows * world, K, device=device_type, dtype=torch.bfloat16)
++        W = torch.randn(K, N, device=device_type, dtype=torch.bfloat16)
++        xq, xs = self._fp8(rows, K), self._scales(rows, 1)
++        Xq, Xs = self._fp8(rows * world, K), self._scales(rows * world, 1)
++        Wq, Ws = self._fp8(N, K).T, self._scales(1, N)
++
++        def run():
++            _, (ag,) = torch.ops.symm_mem.fused_all_gather_matmul(
++                x, [W], 0, group_name, return_A=False
++            )
++            rs = torch.ops.symm_mem.fused_matmul_reduce_scatter(
++                X, W, "sum", 0, group_name
++            )
++            _, (ag_fp8,) = self._all_gather_scaled(
++                torch.ops.symm_mem.fused_all_gather_scaled_matmul,
++                xq, [Wq], xs, [Ws], 0, [torch.bfloat16],
++            )
++            rs_fp8 = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
++                Xq, Wq, Xs, Ws, "sum", 0, 0, group_name, [rows * world, N],
++                out_dtype=torch.bfloat16,
++            )
++            return [ag, rs, ag_fp8, rs_fp8]
++
++        first = run()
++        for _ in range(3):
++            for out, ref in zip(run(), first):
++                torch.testing.assert_close(out, ref, rtol=0, atol=0)
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    def test_graph_capture_scaled(self) -> None:
++        """The scaled ops captured and replayed, row-wise scales gathered with A."""
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        rows, N, K = 256, 96, 128
++        world = self.world_size
++        xq, xs = self._fp8(rows, K), self._scales(rows, 1)
++        Xq, Xs = self._fp8(rows * world, K), self._scales(rows * world, 1)
++        Wq, Ws = self._fp8(N, K).T, self._scales(1, N)
++
++        def run(ag_op, rs_op, out_dtype):
++            ag, (mm,) = self._all_gather_scaled(
++                ag_op, xq, [Wq], xs, [Ws], 0, [out_dtype]
++            )
++            rs = rs_op(
++                Xq, Wq, Xs, Ws, "sum", 0, 0, group_name, [rows * world, N],
++                out_dtype=out_dtype,
++            )
++            return ag, mm, rs
++
++        sdma_ops = (
++            torch.ops.symm_mem.fused_all_gather_scaled_matmul,
++            torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter,
++        )
++        # Eager calls with the same shapes size the workspace, which cannot grow
++        # during capture.
++        run(*sdma_ops, torch.bfloat16)
++        calls = self._sdma_calls("fused_scaled_matmul_reduce_scatter")
++        graph = graph_cls()
++        with device_module.graph(graph):
++            ag_1, mm_1, rs_1 = run(*sdma_ops, torch.bfloat16)
++        self.assertEqual(
++            self._sdma_calls("fused_scaled_matmul_reduce_scatter") - calls, 1
++        )
++
++        for _ in range(3):
++            for t in (xq, Xq):
++                t.copy_(self._fp8(*t.shape))
++            for t in (xs, Xs):
++                t.copy_(self._scales(*t.shape))
++            graph.replay()
++            ag_0, mm_0, rs_0 = run(
++                _fused_all_gather_scaled_matmul_fallback,
++                _fused_scaled_matmul_reduce_scatter_fallback,
++                torch.bfloat16,
++            )
++            self.assertEqual(ag_1.view(torch.uint8), ag_0.view(torch.uint8))
++            self._assert_close_to_fp32(mm_1, mm_0)
++            self._assert_close_to_fp32(rs_1, rs_0)
++
 +
  # [READ ME FIRST]
  # The `SymmMemEmptySetDeviceTest` suite parameterizes whether user sets the
  # device before calling symm_mem.empty.  Either way should work.
 diff --git a/torch/distributed/_symmetric_memory/__init__.py b/torch/distributed/_symmetric_memory/__init__.py
-index c163062..fc4089e 100644
+index c1630628ad..672b46ad86 100644
 --- a/torch/distributed/_symmetric_memory/__init__.py
 +++ b/torch/distributed/_symmetric_memory/__init__.py
 @@ -981,6 +981,15 @@ def _fused_all_gather_matmul(
@@ -333,8 +653,8 @@ index c163062..fc4089e 100644
  
 +def _should_use_rocm_sdma() -> bool:
 +    # Opt-in: on ROCm, the fused all-gather + matmul and matmul + reduce-scatter
-+    # move data on SDMA copy engines (see _rocm_sdma.py), for the cases
-+    # _rocm_sdma.should_use_* accept.
++    # (and their scaled variants) move data on SDMA copy engines (see
++    # _rocm_sdma.py), for the cases _rocm_sdma.should_use_* accept.
 +    return (
 +        torch.version.hip is not None
 +        and os.environ.get("TORCH_SYMM_MEM_ENABLE_ROCM_SDMA") == "1"
@@ -344,7 +664,34 @@ index c163062..fc4089e 100644
  # Each 256-row M tile of the ROCm _async_input_mm waits on one chunk's signal,
  # so each rank's chunk must be a whole number of tiles.
  _ROCM_ASYNC_MM_TILE_M = 256
-@@ -1413,6 +1432,17 @@ def _fused_matmul_reduce_scatter(
+@@ -1335,6 +1354,26 @@ def _fused_all_gather_scaled_matmul(
+             use_fast_accum,
+         )
+ 
++    if _should_use_rocm_sdma():
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        if _rocm_sdma.should_use_all_gather_scaled_matmul(
++            A_shard, Bs, A_scale, gather_dim, group_name
++        ):
++            with torch.profiler.record_function("fused_all_gather_scaled_matmul"):
++                return _rocm_sdma.fused_all_gather_scaled_matmul(
++                    A_shard,
++                    Bs,
++                    A_scale,
++                    B_scales,
++                    gather_dim,
++                    group_name,
++                    biases,
++                    result_scales,
++                    out_dtypes,
++                    use_fast_accum,
++                )
++
+     with torch.profiler.record_function("fused_all_gather_scaled_matmul"):
+         A, res = _fused_all_gather_matmul_impl(
+             torch.ops.aten._scaled_mm.out,
+@@ -1413,6 +1452,17 @@ def _fused_matmul_reduce_scatter(
              A, B, reduce_op, scatter_dim, group_name
          )
  
@@ -362,9 +709,47 @@ index c163062..fc4089e 100644
      with torch.profiler.record_function("fused_matmul_reduce_scatter"):
          return _fused_matmul_reduce_scatter_impl(
              mm_out_op=torch.ops.aten.mm.out,
+@@ -1560,6 +1610,37 @@ def _fused_scaled_matmul_reduce_scatter(
+             out_dtype,
+             use_fast_accum,
+         )
++
++    if _should_use_rocm_sdma():
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        if _rocm_sdma.should_use_scaled_matmul_reduce_scatter(
++            A,
++            B,
++            A_scale,
++            reduce_op,
++            orig_scatter_dim,
++            scatter_dim_after_maybe_reshape,
++            group_name,
++            output_shape,
++            out_dtype,
++        ):
++            with torch.profiler.record_function("fused_scaled_matmul_reduce_scatter"):
++                return _rocm_sdma.fused_scaled_matmul_reduce_scatter(
++                    A,
++                    B,
++                    A_scale,
++                    B_scale,
++                    reduce_op,
++                    scatter_dim_after_maybe_reshape,
++                    group_name,
++                    output_shape,
++                    bias,
++                    result_scale,
++                    out_dtype,
++                    use_fast_accum,
++                )
++
+     with torch.profiler.record_function("fused_scaled_matmul_reduce_scatter"):
+         return _fused_scaled_matmul_reduce_scatter_impl(
+             mm_out_op=torch.ops.aten._scaled_mm.out,
 diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.hip b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
 new file mode 100644
-index 0000000..86e3559
+index 0000000000..4c912436e2
 --- /dev/null
 +++ b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
 @@ -0,0 +1,542 @@
@@ -435,14 +820,14 @@ index 0000000..86e3559
 +  int armed_flags = 0;
 +};
 +
-+// Copy j to peer i is dst[i * m + j] <- src[i * m + j], `bytes` each, on
++// Copy j to peer i is dst[i * m + j] <- src[i * m + j], bytes[j] bytes, on
 +// engines[i] once trigger k is released; then, once peer i's m copies have
 +// landed, the 4 bytes at `one` go to flag_dst[i] on the spare engine
 +// engines[n].
 +struct Push {
 +  int k, n, m;
-+  uint64_t bytes, one;
-+  std::vector<uint64_t> dst, src, flag_dst;
++  uint64_t one;
++  std::vector<uint64_t> bytes, dst, src, flag_dst;
 +  std::vector<int> engines;
 +};
 +
@@ -610,7 +995,7 @@ index 0000000..86e3559
 +        g_local,
 +        (const void*)p.src[c],
 +        g_local,
-+        p.bytes,
++        p.bytes[c % p.m],
 +        1,
 +        &s.trigger[p.k],
 +        s.data[first + c],
@@ -789,7 +1174,7 @@ index 0000000..86e3559
 +    int k,
 +    const uint64_t* dst,
 +    const uint64_t* src,
-+    uint64_t bytes,
++    const uint64_t* bytes,
 +    const int* engines,
 +    int n,
 +    int m,
@@ -805,8 +1190,8 @@ index 0000000..86e3559
 +          k,
 +          n,
 +          m,
-+          bytes,
 +          one,
++          std::vector<uint64_t>(bytes, bytes + m),
 +          std::vector<uint64_t>(dst, dst + n * m),
 +          std::vector<uint64_t>(src, src + n * m),
 +          std::vector<uint64_t>(flag_dst, flag_dst + n),
@@ -912,11 +1297,12 @@ index 0000000..86e3559
 +}
 diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.py b/torch/distributed/_symmetric_memory/_rocm_sdma.py
 new file mode 100644
-index 0000000..8129556
+index 0000000000..a80dc76329
 --- /dev/null
 +++ b/torch/distributed/_symmetric_memory/_rocm_sdma.py
-@@ -0,0 +1,604 @@
-+"""SDMA copy engines for symm_mem's fused all-gather + matmul and matmul + reduce-scatter on ROCm.
+@@ -0,0 +1,865 @@
++"""SDMA copy engines for symm_mem's fused all-gather + matmul and matmul + reduce-scatter on ROCm,
++and their scaled (_scaled_mm) variants.
 +
 +The default implementations move shards with tensor copies from peers'
 +symmetric-memory buffers (_pipelined_all_gather_and_consume,
@@ -932,12 +1318,19 @@ index 0000000..8129556
 +rank r lands in rows r * M + c * block of every peer's inbox, so the inbox holds
 +the gathered A in natural order. The compute stream waits for piece c of every
 +rank and runs its matmul, one batched GEMM over the (world, block, K) rows, while
-+later pieces are in flight.
++later pieces are in flight. The scaled variant runs one _scaled_mm per rank's
++piece; row-wise sharded A scales travel with A's rows, in the same pushes.
 +
 +Matmul + reduce-scatter: matmul c computes this rank's partial sums for piece c of
 +every rank's output rows; once it is done, the engines push each owner's piece
 +into that owner's inbox, and each rank sums the partials it received for piece c
-+(in fp32) one piece behind, so the next matmul is never held up by a wait.
++(in fp32) one piece behind, so the next matmul is never held up by a wait. The
++scaled variant computes the partial sums with one _scaled_mm per owner, in its
++output dtype.
++
++Each piece's GEMMs are the same for every call of a shape, and so are the order
++of the copies and the order of the fp32 sums, so results are bitwise
++reproducible from run to run.
 +
 +Each call zeroes its flags and puts this rank's own data in place on the compute
 +stream, then passes a symmetric-memory barrier; a one-thread kernel then releases
@@ -961,12 +1354,17 @@ index 0000000..8129556
 +built with torch.utils.cpp_extension on first use, for the GPU's architecture
 +(needs hipcc). It runs on the architectures in VALIDATED_ARCHS; on others the
 +default path runs unless TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED=1. Pieces per
-+rank: TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS (default 4), or the largest smaller count
-+that divides the rows.
++rank: TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS, or by default the most pieces, up to
++AUTO_MAX_CHUNKS, that keep each piece at least AUTO_MIN_PIECE_BYTES (a piece of the
++rank's A rows for the all-gather, of an owner's output rows for the reduce-scatter),
++taking a power of two; then the largest count not above that which divides the rows.
++Smaller pieces start the first GEMM sooner but give the engines and the GEMMs less
++work per launch.
 +"""
 +
 +import ctypes
 +import logging
++import math
 +import os
 +import sys
 +import threading
@@ -984,6 +1382,8 @@ index 0000000..8129556
 +# GPU architectures the path is validated on.
 +VALIDATED_ARCHS = ("gfx950",)
 +MAX_CHUNKS = 16  # triggers per slot in the transport
++AUTO_MAX_CHUNKS = 8
++AUTO_MIN_PIECE_BYTES = 16 << 20
 +MAX_WORLD = 64  # flag words one wait kernel checks
 +_EAGER_SLOTS = 4
 +_CAPTURE_SLOTS = 8
@@ -998,7 +1398,12 @@ index 0000000..8129556
 +_warned_archs: set[str] = set()
 +
 +# Calls that took this path, per op (for tests).
-+num_calls = {"fused_all_gather_matmul": 0, "fused_matmul_reduce_scatter": 0}
++num_calls = {
++    "fused_all_gather_matmul": 0,
++    "fused_matmul_reduce_scatter": 0,
++    "fused_all_gather_scaled_matmul": 0,
++    "fused_scaled_matmul_reduce_scatter": 0,
++}
 +
 +
 +def _env(name: str, default: str) -> str:
@@ -1075,6 +1480,61 @@ index 0000000..8129556
 +    return A.shape[scatter_dim] % c10d._resolve_process_group(group_name).size() == 0
 +
 +
++def should_use_all_gather_scaled_matmul(
++    A_shard: torch.Tensor,
++    Bs: list[torch.Tensor],
++    A_scale: torch.Tensor,
++    gather_dim: int,
++    group_name: str,
++) -> bool:
++    """Whether fused_all_gather_scaled_matmul takes this path: tensor-wise, row-wise sharded and
++    row-wise replicated A scales (other cases run the default path)."""
++    if not should_use_all_gather_matmul(A_shard, Bs, gather_dim, group_name):
++        return False
++    world = c10d._resolve_process_group(group_name).size()
++    try:
++        symm_mem._check_and_verify_fp8_all_gather_scale_mode(
++            A_shard, A_scale, gather_dim, world
++        )
++    except ValueError:
++        return False  # the default path reports it
++    return True
++
++
++def should_use_scaled_matmul_reduce_scatter(
++    A: torch.Tensor,
++    B: torch.Tensor,
++    A_scale: torch.Tensor,
++    reduce_op: str,
++    orig_scatter_dim: int,
++    scatter_dim_after_maybe_reshape: int,
++    group_name: str,
++    output_shape: list[int],
++    out_dtype: torch.dtype | None,
++) -> bool:
++    """Whether fused_scaled_matmul_reduce_scatter takes this path: tensor-wise or row-wise A scales,
++    a bf16, fp16 or fp32 result (the partial sums are pushed in it), and each rank's output rows a
++    block of A's rows: A has the output's leading dims and the scatter dims agree, or A was
++    flattened from them and both scatter dims are 0 (other cases run the default path)."""
++    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
++        return False
++    if A.dim() == len(output_shape) and list(A.shape[:-1]) == list(output_shape[:-1]):
++        if orig_scatter_dim != scatter_dim_after_maybe_reshape:
++            return False
++    elif orig_scatter_dim != 0 or scatter_dim_after_maybe_reshape != 0:
++        return False
++    if A_scale.numel() > 1 and (
++        A_scale.shape[:-1] != A.shape[:-1] or A_scale.shape[-1] != 1
++    ):
++        return False
++    if not should_use_matmul_reduce_scatter(
++        A, B, reduce_op, scatter_dim_after_maybe_reshape, group_name
++    ):
++        return False
++    world = c10d._resolve_process_group(group_name).size()
++    return output_shape[orig_scatter_dim] % world == 0
++
++
 +def _load():
 +    """Build (once, cached by torch.utils.cpp_extension) and load the transport."""
 +    global _lib
@@ -1100,7 +1560,7 @@ index 0000000..8129556
 +        ("rsdma_init", [i, i], i),
 +        ("rsdma_engine_plan", [i, ip, i, ip], i),
 +        ("rsdma_plan_new", [i, i, i, i], vp),
-+        ("rsdma_plan_push", [vp, i, u64p, u64p, u64, ip, i, i, u64p, u64], i),
++        ("rsdma_plan_push", [vp, i, u64p, u64p, u64p, ip, i, i, u64p, u64], i),
 +        ("rsdma_plan_run", [vp], i),
 +        ("rsdma_plan_enqueue", [vp, vp], i),
 +        ("rsdma_release", [i, i, vp], i),
@@ -1275,22 +1735,24 @@ index 0000000..8129556
 +        k: int,
 +        dst: list[int],
 +        src: list[int],
-+        nbytes: int,
++        nbytes: list[int],
 +        flag_dst: list[int],
 +        one: int,
 +    ) -> None:
-+        """Add the next piece: dst[i] <- src[i] for peer i (in g.peers order), released by trigger k."""
-+        n = len(self.g.peers)
++        """Add the next piece: for peer i (in g.peers order) and copy j, dst[i * m + j] <- src[i * m + j]
++        of nbytes[j] bytes, m = len(nbytes), released by trigger k; peer i's flag is written once
++        its m copies have landed."""
++        n, m = len(self.g.peers), len(nbytes)
 +        u64 = ctypes.c_uint64
 +        rc = self.lib.rsdma_plan_push(
 +            self.handle,
 +            k,
-+            (u64 * n)(*dst),
-+            (u64 * n)(*src),
-+            nbytes,
++            (u64 * (n * m))(*dst),
++            (u64 * (n * m))(*src),
++            (u64 * m)(*nbytes),
 +            self.g.engine_arr,
 +            n,
-+            1,
++            m,
 +            (u64 * n)(*flag_dst),
 +            one,
 +        )
@@ -1343,23 +1805,27 @@ index 0000000..8129556
 +        _check(rc, "rsdma_wait_flags")
 +
 +
-+def _inbox(
-+    group_name: str, rank: int, world: int, shape, dtype: torch.dtype, chunks: int
-+):
-+    """This rank's symmetric inbox of `shape` and its (chunks, world) int32 flag words, plus every
-+    rank's workspace base address and the flags' byte offset in it."""
-+    nbytes = torch.empty((), dtype=dtype).element_size()
-+    for d in shape:
-+        nbytes *= d
-+    flag_offset = -(-nbytes // 64) * 64
-+    size = flag_offset + chunks * world * 4
++def _inbox(group_name: str, rank: int, world: int, regions, chunks: int):
++    """This rank's symmetric inbox: one buffer per (shape, dtype) in `regions`, each 64-byte
++    aligned, then (chunks, world) int32 flag words. Also returns every rank's workspace base
++    address and the byte offsets of the regions and of the flags."""
++    offsets, size = [], 0
++    for shape, dtype in regions:
++        offsets.append(size)
++        nbytes = math.prod(shape) * dtype.itemsize
++        size += -(-nbytes // 64) * 64
++    flag_offset = size
++    size += chunks * world * 4
 +    ws = symm_mem.get_symm_mem_workspace(group_name, min_size=size)
-+    inbox = ws.get_buffer(rank, tuple(shape), dtype)
++    bufs = [
++        ws.get_buffer(rank, tuple(shape), dtype, storage_offset=offset // dtype.itemsize)
++        for (shape, dtype), offset in zip(regions, offsets)
++    ]
 +    flags = ws.get_buffer(
 +        rank, (chunks, world), torch.int32, storage_offset=flag_offset // 4
 +    )
 +    bases = [ws.get_buffer(r, (size,), torch.uint8).data_ptr() for r in range(world)]
-+    return ws, inbox, flags, bases, flag_offset
++    return ws, bufs, offsets, flags, bases, flag_offset
 +
 +
 +def _barrier(ws) -> None:
@@ -1367,9 +1833,15 @@ index 0000000..8129556
 +    ws.barrier(channel=0, timeout_ms=int(_timeout_s() * (MAX_CHUNKS + 2) * 1000))
 +
 +
-+def _chunks(rows: int) -> int:
-+    """Pieces per rank: TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS, or the largest smaller count dividing `rows`."""
-+    want = int(_env("ROCM_SDMA_CHUNKS", "4"))
++def _chunks(rows: int, row_bytes: int) -> int:
++    """Pieces per rank for `rows` rows of `row_bytes` bytes each pushed per rank: the count set by
++    TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS or picked from the piece size, lowered to divide `rows`."""
++    env = _env("ROCM_SDMA_CHUNKS", "")
++    if env:
++        want = int(env)
++    else:
++        fit = rows * row_bytes // AUTO_MIN_PIECE_BYTES
++        want = 1 << (min(max(fit, 1), AUTO_MAX_CHUNKS).bit_length() - 1)
 +    if not 1 <= want <= MAX_CHUNKS:
 +        raise ValueError(
 +            f"TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS must be 1 to {MAX_CHUNKS}; got {want}"
@@ -1377,51 +1849,64 @@ index 0000000..8129556
 +    return max(c for c in range(1, want + 1) if rows % c == 0)
 +
 +
-+def fused_all_gather_matmul(
-+    A_shard: torch.Tensor,
-+    Bs: list[torch.Tensor],
-+    gather_dim: int,
-+    group_name: str,
-+    return_A: bool = True,
-+) -> tuple[torch.Tensor | None, list[torch.Tensor]]:
-+    """all_gather(A_shard, gather_dim) @ B for every B in Bs, as symm_mem.fused_all_gather_matmul."""
++def _aligned(scale: torch.Tensor) -> torch.Tensor:
++    # As the default path: _scaled_mm's row-wise kernels need 16-byte aligned scales.
++    return scale if scale.data_ptr() % 16 == 0 else scale.clone()
++
++
++def _gather_rows(t: torch.Tensor, gather_dim: int, world: int):
++    """As _fused_all_gather_matmul_impl: `t` with gather_dim first, flattened to rows, and the
++    function that turns gathered rows back into the gathered tensor's shape."""
++    flat = t.movedim(gather_dim, 0)
++    leading_dims = [world] + list(flat.shape[:-1])
++
++    def unflatten(rows: torch.Tensor) -> torch.Tensor:
++        return rows.view(*leading_dims, -1).flatten(0, 1).movedim(0, gather_dim)
++
++    return flat.flatten(0, -2), unflatten
++
++
++def _all_gather_and_consume(
++    tensors: list[torch.Tensor], chunks: int, group_name: str, consume, return_A: bool
++) -> torch.Tensor | None:
++    """Gathers every rank's rows of each (rows, features) tensor in `tensors` (A, then any per-row
++    data that goes with it, such as row-wise scales) into this rank's inbox, rank r's rows at
++    r * rows. Once piece c of every rank has landed, calls consume(c, pieces): pieces[j] is the
++    (world, block, features) piece c of tensors[j]. Returns the gathered tensors[0] if return_A."""
 +    lib = _load()
 +    g = _group(group_name)
-+    world, rank, n = g.world, g.rank, len(g.peers)
-+    # As _fused_all_gather_matmul_impl: gather_dim first, flattened to rows.
-+    A_shard_flat = A_shard.movedim(gather_dim, 0)
-+    leading_dims = [world] + list(A_shard_flat.shape[:-1])
-+    x = A_shard_flat.flatten(0, -2)
-+    rows, features = x.shape
-+    chunks = _chunks(rows)
++    world, rank = g.world, g.rank
++    rows = tensors[0].shape[0]
 +    block = rows // chunks
-+    elt = x.element_size()
-+    piece_bytes = block * features * elt
 +    stream = torch.cuda.current_stream()
 +
-+    # The inbox is the gathered A: rank r's rows at r * rows.
-+    ws, inbox, flags, bases, flag_offset = _inbox(
-+        group_name, rank, world, (world, rows, features), x.dtype, chunks
++    # Region j of the inbox is the gathered tensors[j].
++    regions = [((world, rows, t.shape[1]), t.dtype) for t in tensors]
++    ws, inboxes, offsets, flags, bases, flag_offset = _inbox(
++        group_name, rank, world, regions, chunks
 +    )
-+    plan = _Plan(lib, g, chunks, 1)
-+    own = (
-+        bases[rank] + rank * rows * features * elt
-+    )  # this rank's rows in its own inbox: the copies' source
-+    one = _one(x.device).data_ptr()
++    row_bytes = [t.shape[1] * t.element_size() for t in tensors]
++    plan = _Plan(lib, g, chunks, len(tensors))
++    one = _one(tensors[0].device).data_ptr()
 +    for c in range(chunks):
-+        offset = (rank * rows + c * block) * features * elt
++        # Piece c of this rank's rows, at the same offsets in every rank's inbox; the copies'
++        # source is this rank's own inbox.
++        at = [
++            offset + (rank * rows + c * block) * size
++            for offset, size in zip(offsets, row_bytes)
++        ]
 +        plan.push(
 +            0,
-+            [bases[p] + offset for p in g.peers],
-+            [own + c * piece_bytes] * n,
-+            piece_bytes,
++            [bases[p] + a for p in g.peers for a in at],
++            [bases[rank] + a for _ in g.peers for a in at],
++            [block * size for size in row_bytes],
 +            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
 +            one,
 +        )
 +    flags.zero_()
 +    flags[:, rank] = 1
-+    inbox[rank].copy_(x)
-+    outputs = [x.new_empty(world * rows, B.shape[1], dtype=B.dtype) for B in Bs]
++    for inbox, t in zip(inboxes, tensors):
++        inbox[rank].copy_(t)
 +
 +    # Every rank's own rows and cleared flags are in place, and its inbox is free, past this barrier.
 +    _barrier(ws)
@@ -1429,72 +1914,59 @@ index 0000000..8129556
 +    # wait for the release.
 +    plan.start(stream)
 +    plan.release(0, stream)
-+    pieces = inbox.view(world, chunks, block, features)
++    pieces = [inbox.view(world, chunks, block, -1) for inbox in inboxes]
 +    for c in range(chunks):
 +        plan.wait(stream, flags[c], c)
-+        for B, out in zip(Bs, outputs):
-+            torch.bmm(
-+                pieces[:, c],
-+                B.expand(world, *B.shape),
-+                out=out.view(world, chunks, block, -1)[:, c],
-+            )
-+    A = inbox.reshape(world * rows, features).clone() if return_A else None
++        consume(c, [p[:, c] for p in pieces])
++    A = inboxes[0].reshape(world * rows, -1).clone() if return_A else None
 +    # Every rank waited for every piece before its last matmul, so past this barrier no copy reads
 +    # or writes this call's inboxes.
 +    _barrier(ws)
-+    num_calls["fused_all_gather_matmul"] += 1
-+
-+    def unflatten(t: torch.Tensor) -> torch.Tensor:
-+        return t.view(*leading_dims, -1).flatten(0, 1).movedim(0, gather_dim)
-+
-+    return (unflatten(A) if A is not None else None), [
-+        unflatten(out) for out in outputs
-+    ]
++    return A
 +
 +
-+def fused_matmul_reduce_scatter(
-+    A: torch.Tensor, B: torch.Tensor, reduce_op: str, scatter_dim: int, group_name: str
++def _produce_and_reduce_scatter(
++    rows: int,
++    out_features: int,
++    dtype: torch.dtype,
++    chunks: int,
++    reduce_op: str,
++    group_name: str,
++    produce,
 +) -> torch.Tensor:
-+    """reduce_scatter(A @ B, reduce_op, scatter_dim), as symm_mem.fused_matmul_reduce_scatter."""
++    """Reduce-scatter of a (world * rows, out_features) product that every rank holds a partial sum
++    of: owner r gets rows r * rows onward. produce(c, partials) writes this rank's partial sums for
++    piece c of every owner's rows into partials, (world, block, out_features) of `dtype`. Returns
++    this rank's (rows, out_features) rows, summed in fp32."""
 +    lib = _load()
 +    g = _group(group_name)
 +    world, rank = g.world, g.rank
-+    # As _fused_matmul_reduce_scatter_impl: scatter_dim first, flattened to rows; owner r gets
-+    # rows r * rows .. (r + 1) * rows of the result.
-+    x = A.movedim(scatter_dim, 0)
-+    owner_dims = list(x.shape[:-1])
-+    owner_dims[0] //= world
-+    x = x.flatten(0, -2).contiguous()
-+    rows = x.shape[0] // world
-+    chunks = _chunks(rows)
 +    block = rows // chunks
-+    out_features = B.shape[1]
-+    elt = x.element_size()
-+    block_bytes = block * out_features * elt
++    block_bytes = block * out_features * dtype.itemsize
 +    stream = torch.cuda.current_stream()
 +
 +    # inbox[c, s] = sender s's partial sums for piece c of this rank's rows.
 +    shape = (chunks, world, block, out_features)
-+    ws, inbox, flags, bases, flag_offset = _inbox(
-+        group_name, rank, world, shape, x.dtype, chunks
++    ws, (inbox,), _, flags, bases, flag_offset = _inbox(
++        group_name, rank, world, [(shape, dtype)], chunks
 +    )
 +    # partials[c, r] = this rank's partial sums for piece c of owner r's rows.
-+    partials = x.new_empty(shape)
++    partials = torch.empty(shape, dtype=dtype, device=inbox.device)
 +    plan = _Plan(lib, g, chunks, 1)
-+    one = _one(x.device).data_ptr()
++    one = _one(inbox.device).data_ptr()
 +    for c in range(chunks):
 +        # Piece c is pushed once its matmul is done: trigger c.
 +        plan.push(
 +            c,
 +            [bases[p] + (c * world + rank) * block_bytes for p in g.peers],
 +            [partials[c, p].data_ptr() for p in g.peers],
-+            block_bytes,
++            [block_bytes],
 +            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
 +            one,
 +        )
 +    flags.zero_()
 +    flags[:, rank] = 1
-+    out = x.new_empty(rows, out_features)
++    out = inbox.new_empty(rows, out_features)
 +    # Every rank's inbox is free and its flags cleared past this barrier.
 +    _barrier(ws)
 +    # As for the all-gather: issued while the GPU runs the kernels above; each piece waits for its release.
@@ -1507,9 +1979,8 @@ index 0000000..8129556
 +            total /= world
 +        out[c * block : (c + 1) * block] = total
 +
-+    owners = x.view(world, chunks, block, -1)
 +    for c in range(chunks):
-+        torch.bmm(owners[:, c], B.expand(world, *B.shape), out=partials[c])
++        produce(c, partials[c])
 +        inbox[c, rank].copy_(partials[c, rank])
 +        plan.release(c, stream)
 +        if c > 0:
@@ -1518,10 +1989,185 @@ index 0000000..8129556
 +    # Every rank waited for every piece from every peer, so past this barrier no copy reads
 +    # `partials` or writes an inbox.
 +    _barrier(ws)
++    return out
++
++
++def fused_all_gather_matmul(
++    A_shard: torch.Tensor,
++    Bs: list[torch.Tensor],
++    gather_dim: int,
++    group_name: str,
++    return_A: bool = True,
++) -> tuple[torch.Tensor | None, list[torch.Tensor]]:
++    """all_gather(A_shard, gather_dim) @ B for every B in Bs, as symm_mem.fused_all_gather_matmul."""
++    world = _group(group_name).world
++    x, unflatten = _gather_rows(A_shard, gather_dim, world)
++    rows = x.shape[0]
++    chunks = _chunks(rows, x.shape[1] * x.element_size())
++    block = rows // chunks
++    outputs = [x.new_empty(world * rows, B.shape[1], dtype=B.dtype) for B in Bs]
++
++    def consume(c: int, pieces: list[torch.Tensor]) -> None:
++        # One batched GEMM over every rank's piece c.
++        for B, out in zip(Bs, outputs):
++            torch.bmm(
++                pieces[0],
++                B.expand(world, *B.shape),
++                out=out.view(world, chunks, block, -1)[:, c],
++            )
++
++    A = _all_gather_and_consume([x], chunks, group_name, consume, return_A)
++    num_calls["fused_all_gather_matmul"] += 1
++    return (unflatten(A) if A is not None else None), [
++        unflatten(out) for out in outputs
++    ]
++
++
++def fused_all_gather_scaled_matmul(
++    A_shard: torch.Tensor,
++    Bs: list[torch.Tensor],
++    A_scale: torch.Tensor,
++    B_scales: list[torch.Tensor],
++    gather_dim: int,
++    group_name: str,
++    biases: list[torch.Tensor | None],
++    result_scales: list[torch.Tensor | None],
++    out_dtypes: list[torch.dtype | None],
++    use_fast_accum: list[bool],
++) -> tuple[torch.Tensor, list[torch.Tensor]]:
++    """_scaled_mm(all_gather(A_shard, gather_dim), B, ...) for every B in Bs, as
++    symm_mem.fused_all_gather_scaled_matmul. Row-wise sharded scales are gathered with A's rows."""
++    world = _group(group_name).world
++    mode = symm_mem._check_and_verify_fp8_all_gather_scale_mode(
++        A_shard, A_scale, gather_dim, world
++    )
++    x, unflatten = _gather_rows(A_shard, gather_dim, world)
++    rows = x.shape[0]
++    chunks = _chunks(rows, x.shape[1] * x.element_size())
++    block = rows // chunks
++    outputs = [
++        x.new_empty(world * rows, B.shape[1], dtype=out_dtype or B.dtype)
++        for B, out_dtype in zip(Bs, out_dtypes)
++    ]
++    tensors = [x]
++    if mode == symm_mem._ScaleMode.ROW_WISE_SHARDED:
++        tensors.append(A_scale.movedim(gather_dim, 0).flatten(0, -2))
++    elif mode == symm_mem._ScaleMode.ROW_WISE_REPLICATED:
++        replicated = (
++            A_scale.movedim(gather_dim, 0).flatten(0, -2).reshape(world, chunks, block, -1)
++        )
++
++    def consume(c: int, pieces: list[torch.Tensor]) -> None:
++        # _scaled_mm takes matrices only: one GEMM per rank's piece c.
++        for r in range(world):
++            if mode == symm_mem._ScaleMode.ROW_WISE_SHARDED:
++                scale = _aligned(pieces[1][r])
++            elif mode == symm_mem._ScaleMode.ROW_WISE_REPLICATED:
++                scale = _aligned(replicated[r, c])
++            else:
++                scale = A_scale
++            for i, B in enumerate(Bs):
++                torch.ops.aten._scaled_mm.out(
++                    pieces[0][r],
++                    B,
++                    scale,
++                    B_scales[i],
++                    biases[i],
++                    result_scales[i],
++                    out_dtypes[i],
++                    use_fast_accum[i],
++                    out=outputs[i].view(world, chunks, block, -1)[r, c],
++                )
++
++    A = _all_gather_and_consume(tensors, chunks, group_name, consume, True)
++    num_calls["fused_all_gather_scaled_matmul"] += 1
++    return unflatten(A), [unflatten(out) for out in outputs]
++
++
++def fused_matmul_reduce_scatter(
++    A: torch.Tensor, B: torch.Tensor, reduce_op: str, scatter_dim: int, group_name: str
++) -> torch.Tensor:
++    """reduce_scatter(A @ B, reduce_op, scatter_dim), as symm_mem.fused_matmul_reduce_scatter."""
++    world = _group(group_name).world
++    # As _fused_matmul_reduce_scatter_impl: scatter_dim first, flattened to rows; owner r gets
++    # rows r * rows .. (r + 1) * rows of the result.
++    x = A.movedim(scatter_dim, 0)
++    owner_dims = list(x.shape[:-1])
++    owner_dims[0] //= world
++    x = x.flatten(0, -2).contiguous()
++    rows = x.shape[0] // world
++    chunks = _chunks(rows, B.shape[1] * x.element_size())
++    owners = x.view(world, chunks, rows // chunks, -1)
++
++    def produce(c: int, partials: torch.Tensor) -> None:
++        # One batched GEMM over piece c of every owner's rows.
++        torch.bmm(owners[:, c], B.expand(world, *B.shape), out=partials)
++
++    out = _produce_and_reduce_scatter(
++        rows, B.shape[1], x.dtype, chunks, reduce_op, group_name, produce
++    )
 +    num_calls["fused_matmul_reduce_scatter"] += 1
-+    return out.view(*owner_dims, out_features).movedim(0, scatter_dim).contiguous()
++    return out.view(*owner_dims, B.shape[1]).movedim(0, scatter_dim).contiguous()
++
++
++def fused_scaled_matmul_reduce_scatter(
++    A: torch.Tensor,
++    B: torch.Tensor,
++    A_scale: torch.Tensor,
++    B_scale: torch.Tensor,
++    reduce_op: str,
++    scatter_dim: int,
++    group_name: str,
++    output_shape: list[int],
++    bias: torch.Tensor | None,
++    result_scale: torch.Tensor | None,
++    out_dtype: torch.dtype,
++    use_fast_accum: bool,
++) -> torch.Tensor:
++    """reduce_scatter(_scaled_mm(A, B, ...), reduce_op, scatter_dim), as
++    symm_mem.fused_scaled_matmul_reduce_scatter, for the cases should_use_scaled_matmul_reduce_scatter
++    accepts. As there, every rank's partial sum gets `bias`."""
++    world = _group(group_name).world
++    x = A.movedim(scatter_dim, 0)
++    # A reshaped from the output's leading dims only with both scatter dims 0.
++    owner_dims = list(x.shape[:-1] if A.dim() == len(output_shape) else output_shape[:-1])
++    owner_dims[0] //= world
++    x = x.flatten(0, -2).contiguous()
++    rows = x.shape[0] // world
++    chunks = _chunks(rows, B.shape[1] * out_dtype.itemsize)
++    block = rows // chunks
++    owners = x.view(world, chunks, block, -1)
++    scales = None
++    if A_scale.numel() > 1:
++        scales = (
++            A_scale.movedim(scatter_dim, 0)
++            .flatten(0, -2)
++            .contiguous()
++            .view(world, chunks, block, -1)
++        )
++
++    def produce(c: int, partials: torch.Tensor) -> None:
++        # _scaled_mm takes matrices only: one GEMM per owner's piece c.
++        for r in range(world):
++            torch.ops.aten._scaled_mm.out(
++                owners[r, c],
++                B,
++                A_scale if scales is None else _aligned(scales[r, c]),
++                B_scale,
++                bias,
++                result_scale,
++                out_dtype,
++                use_fast_accum,
++                out=partials[r],
++            )
++
++    out = _produce_and_reduce_scatter(
++        rows, B.shape[1], out_dtype, chunks, reduce_op, group_name, produce
++    )
++    num_calls["fused_scaled_matmul_reduce_scatter"] += 1
++    return out.view(*owner_dims, B.shape[1]).movedim(0, scatter_dim).contiguous()
 
 base-commit: 1d09b5ff92cf50820425fe85058bc6f6a8c2c745
 -- 
-2.43.0
+2.34.1
 

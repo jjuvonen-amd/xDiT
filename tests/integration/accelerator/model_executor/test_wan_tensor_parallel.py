@@ -139,7 +139,9 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         if torch_sdma:
             from torch.distributed._symmetric_memory import _rocm_sdma
 
-            assert min(_rocm_sdma.num_calls.values()) > 0, f"the SDMA path did not run: {_rocm_sdma.num_calls}"
+            bf16_ops = ("fused_all_gather_matmul", "fused_matmul_reduce_scatter")
+            calls = _rocm_sdma.num_calls
+            assert min(calls[op] for op in bf16_ops) > 0, f"the SDMA path did not run: {calls}"
         if rank == 0:
             torch.save(output.cpu(), output_path)
     finally:
