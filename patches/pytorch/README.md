@@ -1,10 +1,12 @@
 # torch symm_mem AsyncTP on ROCm SDMA engines (prototype patch)
 
-`rocm_sdma_async_tp.patch` gives PyTorch's fused AsyncTP ops,
-`torch.ops.symm_mem.fused_all_gather_matmul` and `torch.ops.symm_mem.fused_matmul_reduce_scatter`,
-an opt-in ROCm path that moves the data on SDMA copy engines. Code that already calls these ops
-(directly, or through `torch.compile`'s micro-pipeline TP pass) picks it up with one environment
-variable and no change of its own.
+`rocm_sdma_async_tp.patch` gives PyTorch's fused AsyncTP ops an opt-in ROCm path that moves the
+data on SDMA copy engines:
+- `torch.ops.symm_mem.fused_all_gather_matmul` and `fused_matmul_reduce_scatter`;
+- their fp8 variants, `fused_all_gather_scaled_matmul` and `fused_scaled_matmul_reduce_scatter`.
+
+Code that already calls these ops (directly, or through `torch.compile`'s micro-pipeline TP pass)
+picks it up with one environment variable and no change of its own.
 
 ## Why
 
@@ -21,6 +23,14 @@ With the patch, every rank pushes its data into each peer's symmetric-memory inb
 
 The copies use no compute units. Each rank's rows land in natural order, so the results, including
 `return_A` and the output strides, are the same as the default path's.
+
+The fp8 variants use the same pipeline. Row-wise scales that are sharded with A travel in the same
+pushes as A's rows, under the same flag, so a piece's matmul never starts before its scales have
+landed. `_scaled_mm` takes matrices only, so each piece runs one `_scaled_mm` per rank instead of
+one batched matmul.
+
+Results are deterministic: the copies only move data, and the reduce-scatter sums every piece's
+partial sums in rank order, in fp32. Reruns with the same inputs are bitwise equal.
 
 ## Apply
 
@@ -47,17 +57,42 @@ Requirements:
 | Variable | Default | Meaning |
 |---|---|---|
 | `TORCH_SYMM_MEM_ENABLE_ROCM_SDMA` | `0` | `1` turns the SDMA path on |
-| `TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS` | `4` | pieces per rank (at most 16); fewer if they do not divide the rows |
+| `TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS` | by size | pieces per rank (at most 16; see Pieces); fewer if they do not divide the rows |
 | `TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S` | `30` | how long a flag wait waits before it is reported |
 | `TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT` | `abort` | `abort`: hold the stream and abort the process, logging what was missing; `raise`: let the stream move on and raise on the next call |
 | `TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED` | `0` | `1` also runs on GPU architectures other than gfx950 |
 
 The SDMA path is used for any dtype when the gather or scatter dimension is not the last one and
-the group has 2 to 64 ranks. Everything else runs the default path, with no error:
+the group has 2 to 64 ranks. The fp8 variants take it with tensor-wise or row-wise scales. Everything
+else runs the default path, with no error:
 - the last-dimension variants;
-- the fp8 scaled ops;
+- a scaled reduce-scatter whose A was reshaped with the scatter dimension other than 0, or whose
+  `out_dtype` is not bf16, fp16 or fp32;
 - other architectures (unless `ALLOW_UNTESTED` is set);
 - non-ROCm builds.
+
+## Pieces
+
+By default each call picks its number of pieces per rank from the bytes each rank pushes per call
+(its A rows for the all-gather, an owner's output rows for the reduce-scatter): the most pieces,
+up to 8 and a power of two, that keep each piece at least 16 MiB. More pieces start the first
+matmul sooner and leave less of the transfer exposed at the end. Pieces much below 16 MiB lose
+more to per-piece costs (flag waits, engine launches, and for the fp8 variants one `_scaled_mm`
+per rank's piece) than they gain. On gfx950, with Wan2.2 shapes at TP4 and TP8, this count was
+the fastest or within a few percent of it in `benchmarks/tp_comm_gemm_overlap.py`, for bf16 and
+fp8. The fp8 all-gather moves half the bytes of bf16, so it gets half as many pieces. Set
+`TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS` to fix the count; the benchmark's `--chunks` sweeps it.
+
+## Memory
+
+Each call takes its inbox from the group's symmetric-memory workspace, which grows to the largest
+call so far and is kept:
+- all-gather: the gathered A (`world * rows * K` elements), plus the gathered row-wise scales for
+  the fp8 variant with sharded scales. The fp8 variant always returns A (its schema does), as a copy
+  of the inbox.
+- reduce-scatter: this rank's share of every rank's partial sums, `world * rows * N` elements in the
+  output dtype, plus as much again for this rank's own partial sums before they are pushed. That is
+  twice the unreduced product, against once for the default path.
 
 ## CUDA graphs
 
@@ -71,7 +106,12 @@ it will be captured with.
 `test/distributed/test_symmetric_memory.py` gains `AsyncTPRocmSdmaTest`:
 - the existing AsyncTP cases with the path on, each checking that the path ran;
 - bf16 with a batch, several pieces and two Bs;
-- graph capture with replays on new inputs;
+- the default piece count for a range of sizes;
+- the fp8 variants with each scale mode, against the default path, with random (not constant)
+  scales and pieces whose scales are not 16-byte aligned;
+- a scaled reduce-scatter that is left to the default path;
+- bitwise-equal reruns of all four ops;
+- graph capture with replays on new inputs, bf16 and fp8;
 - two process groups;
 - a lost flag that is reported instead of hanging.
 
@@ -89,6 +129,8 @@ xDiT's Wan2.2 tensor parallelism calls the stock ops with `XDIT_TP_COMM_OVERLAP=
 bash patches/pytorch/apply_to_installed_torch.sh
 # per site, stock ops vs the same ops on SDMA, eager and replayed from a graph
 torchrun --nproc_per_node 8 benchmarks/tp_comm_gemm_overlap.py --symm-mem --symm-mem-sdma --graph --chunks 2 4 8
+# (symm_mem_sdma_auto is the default piece count) the same in fp8 with row-wise scales, next to bf16
+torchrun --nproc_per_node 8 benchmarks/tp_comm_gemm_overlap.py --symm-mem --symm-mem-sdma --fp8 --chunks 2 4 8
 # Wan2.2 T2V TP8, the same command with the path off and on
 PROFILE=0 STEPS=40 bash benchmarks/wan_tp/run_profiles.sh tp8_xrepl_fused
 TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 PROFILE=0 STEPS=40 bash benchmarks/wan_tp/run_profiles.sh tp8_xrepl_fused
@@ -96,10 +138,13 @@ TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 PROFILE=0 STEPS=40 bash benchmarks/wan_tp/run_
 
 ## Toward an upstream PR
 
-This patch is a prototype for discussion. An upstream version would need:
+This patch is a prototype for discussion with the PyTorch ROCm maintainers. It shows that on ROCm
+the fused AsyncTP ops can overlap their communication with their matmuls, which the default path
+does not do there (see Why), without changing their callers. An upstream version would need:
 - the transport in C++ under `torch/csrc/distributed/c10d/symm_mem/`, as a ROCm-only source,
-  instead of a JIT-built library called through ctypes;
+  instead of a JIT-built library called through ctypes. The Python side would stay: it only plans
+  the pieces and runs the matmuls;
 - ROCr version guards;
-- the fp8 scaled variants;
 - reporting through the distributed watchdog instead of its own thread;
-- a decision on when the path is on by default.
+- the scaled reduce-scatter's remaining layouts (A reshaped with another scatter dimension);
+- a decision on when the path is on by default, and a piece-count rule checked on more GPUs.
