@@ -108,6 +108,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_SDMA_LIB": lambda: os.environ.get("XDIT_SDMA_LIB", ""),
     "XDIT_SDMA_WAIT_S": lambda: os.environ.get("XDIT_SDMA_WAIT_S", "30"),
     "XDIT_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_SDMA_ALLOW_UNTESTED", "0"),
+    # 1: a 2-rank Ulysses group (U2 under TP or CFG) sends through every GPU of the node, not only its
+    # one link (core/distributed/sdma/relay.py). Needs every rank in 2-rank groups making the same calls.
+    "XDIT_ULYSSES_SDMA_RELAY": lambda: os.environ.get("XDIT_ULYSSES_SDMA_RELAY", "0"),
 }
 
 

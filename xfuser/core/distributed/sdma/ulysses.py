@@ -55,7 +55,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
-from xfuser.core.distributed.sdma import interface, transport
+from xfuser.core.distributed.sdma import interface, relay, transport
 
 # What `attend` gets: one head group's tensors, each a [b, h, rows, d] view of a bshd
 # tensor (Q, K, V, then the extras); it returns the group's attention output as
@@ -320,6 +320,13 @@ def _out_copies(g, ex, gi, outbox, elt):
     ]
 
 
+def _transport(process_group: dist.ProcessGroup) -> interface.PeerTransport:
+    """The group's transport: the relayed one for a 2-rank group with XDIT_ULYSSES_SDMA_RELAY=1."""
+    if relay.applies(process_group):
+        return relay.relay_for(process_group)
+    return transport.group_for(process_group)
+
+
 def host_issued() -> bool:
     """Whether the transport queues its copies from the host, so a CUDA graph would not replay them."""
     return transport.PeerGroup.host_issued
@@ -338,7 +345,7 @@ def begin(process_group: dist.ProcessGroup, exchange: Exchange, rccl: bool = Fal
     if rccl or (host_issued() and torch.cuda.is_current_stream_capturing()):
         state.open = _Call(exchange, None)
         return
-    state.open = _Call(exchange, transport.group_for(process_group).begin())
+    state.open = _Call(exchange, _transport(process_group).begin())
 
 
 def send(
@@ -367,7 +374,7 @@ def send(
             c.groups.append(parts[0].reshape(-1) if len(parts) == 1 else torch.cat(parts, dim=1).reshape(-1))
             c.parts = []
     else:
-        g = transport.group_for(process_group)
+        g = _transport(process_group)
         inbox, _, elt = _buffers(g, ex)
         route = g.route(
             (ex, "in", gi, tensors), lambda: _in_copies(g, ex, gi, tensors, inbox, elt), gi if last else None
@@ -426,7 +433,7 @@ def finish(
     state.open = None
     if c.rccl:
         return _finish_rccl(process_group, c.exchange, c.groups, attend, local)
-    g = transport.group_for(process_group)
+    g = _transport(process_group)
     ex, P, r, b, d, G = c.exchange, g.world, g.rank, c.exchange.batch, c.exchange.head_dim, c.exchange.groups
     inbox, outbox, elt = _buffers(g, ex)
     stream = torch.cuda.current_stream()

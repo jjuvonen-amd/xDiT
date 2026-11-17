@@ -173,6 +173,59 @@ def test_sdma_exchange_under_cfg_parallel(accelerator_ranks, world_size):
     accelerator_ranks(_exchange_worker, world_size=world_size, timeout=600, args=(2, False))
 
 
+def _relay_worker(rank, world_size, init_method, cfg, tp):
+    import os
+
+    import torch
+    import torch.distributed as dist
+    from yunchang.globals import PROCESS_GROUP
+
+    from xfuser.config.args import xFuserArgs
+    from xfuser.core.distributed import (
+        get_runtime_state,
+        init_distributed_environment,
+        initialize_model_parallel,
+        initialize_runtime_state,
+    )
+    from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+    from xfuser.core.distributed.sdma import relay, ulysses
+
+    os.environ["XDIT_ULYSSES_SDMA_RELAY"] = "1"
+    try:
+        torch.cuda.set_device(rank)
+        init_distributed_environment(
+            rank=rank, world_size=world_size, local_rank=rank, distributed_init_method=init_method
+        )
+        initialize_model_parallel(classifier_free_guidance_degree=cfg, ulysses_degree=2, tensor_parallel_degree=tp)
+        engine_config, _ = xFuserArgs(
+            attention_backend=BACKEND, ulysses_degree=2, use_cfg_parallel=cfg > 1, tensor_parallel_degree=tp
+        ).create_config()
+        initialize_runtime_state(engine_config=engine_config)
+        get_runtime_state().set_attention_backend(BACKEND)
+        group = PROCESS_GROUP.ULYSSES_PG
+        assert dist.get_world_size(group) == 2
+        assert isinstance(ulysses._transport(group), relay.RelayPair)
+        # Every rank makes the same calls, as the relay requires; each checks every element.
+        for index, case in enumerate(EXCHANGES):
+            for call in range(3):
+                wrong = exchange_mismatches(group, case, 10 * index + call)
+                assert wrong == 0, f"relayed {case}: {wrong} wrong elements"
+        for sweep in range(2):
+            for index, case in enumerate(EXCHANGES):
+                wrong = exchange_mismatches(group, case, 1000 + 100 * sweep + index)
+                assert wrong == 0, f"relayed, interleaved {case}: {wrong} wrong elements"
+        dist.barrier()
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+@pytest.mark.parametrize("world_size, cfg, tp", [(4, 2, 1), (8, 1, 4)])
+def test_relayed_pair_exchange(accelerator_ranks, world_size, cfg, tp):
+    """2-rank Ulysses groups (CFG x U2, TP4 x U2) relayed through every GPU (XDIT_ULYSSES_SDMA_RELAY=1)."""
+    accelerator_ranks(_relay_worker, world_size=world_size, timeout=900, args=(cfg, tp))
+
+
 def test_packed_exchange_over_rccl(accelerator_ranks):
     accelerator_ranks(_exchange_worker, world_size=4, timeout=600, args=(1, True))
 
