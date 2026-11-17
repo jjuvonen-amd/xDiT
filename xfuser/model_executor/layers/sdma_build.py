@@ -5,7 +5,7 @@ Standard library only, so an image build can run it without importing xfuser
 
     python xfuser/model_executor/layers/sdma_build.py --out DIR [--offload-arch gfx942,gfx950]
 
-The library, DIR/libsdma_all_gather.so, is what XDIT_SDMA_LIB points at. Built
+The library, DIR/libsdma_all_gather.so, is what XDIT_TP_SDMA_LIB points at. Built
 into this directory, sdma_all_gather.py loads it while it matches the source.
 """
 
@@ -32,7 +32,7 @@ def build(out_dir, archs) -> Path:
     if not Path(hipcc).exists():
         raise RuntimeError(
             "the SDMA transport needs hipcc to build. Build it where hipcc is available with `python "
-            f"{Path(__file__)} --out DIR` and set XDIT_SDMA_LIB=DIR/{LIB_NAME}"
+            f"{Path(__file__)} --out DIR` and set XDIT_TP_SDMA_LIB=DIR/{LIB_NAME}"
         )
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

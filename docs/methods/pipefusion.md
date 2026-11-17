@@ -1,50 +1,85 @@
-## PipeFusion: Displaced Patch Pipeline Parallelism for Diffusion Models
-[Chinese Blog 1](https://zhuanlan.zhihu.com/p/699612077); [Chinese Blog 2](https://zhuanlan.zhihu.com/p/706475158)
+# PipeFusion
 
-PipeFusion is the innovative method first proposed by us. 
-It is a sequence-level pipeline parallel method, similar to [TeraPipe](https://proceedings.mlr.press/v139/li21y.html), demonstrates significant advantages in weakly interconnected network hardware such as PCIe/Ethernet. 
+PipeFusion splits transformer blocks into stages on different GPUs. Latent patches
+pass through these stages. Attention retains previous-step KV entries until each
+patch is updated. Stage partitioning reduces the transformer weights on each GPU.
+KV reuse can change the generated output.
 
-PipeFusion innovatively harnesses input temporal redundancy—the similarity between inputs and activations across diffusion steps, a diffusion-specific characteristics also employed in DistriFusion. PipeFusion not only reduces communication volume but also streamlines pipeline parallelism with TeraPipe, avoiding the load balancing issues inherent in LLM models with Causal Attention.
-It significantly surpasses other methods in communication efficiency, particularly in multi-node setups connected via Ethernet and multi-GPU configurations linked with PCIe.
+## Start with two stages
 
-<div align="center">
-    <img src="https://raw.githubusercontent.com/xdit-project/xdit_assets/main/overview.png" alt="PipeFusion Image">
-</div>
+The unified runner supports PipeFusion for selected models, including FLUX.1-dev.
+This command launches two ranks:
 
-The above picture compares DistriFusion and PipeFusion.
-(a) DistriFusion replicates DiT parameters on two devices. 
-It splits an image into 2 patches and employs asynchronous allgather for activations of every layer.
-(b) PipeFusion shards DiT parameters on two devices.
-It splits an image into 4 patches and employs asynchronous P2P for activations across two devices.
-
-We briefly explain the workflow of PipeFusion. It partitions an input image into $M$ non-overlapping patches.
-The DiT network is partitioned into $N$ stages ($N$ < $L$), which are sequentially assigned to $N$ computational devices. 
-Note that $M$ and $N$ can be unequal, which is different from the image-splitting approaches used in sequence parallelism and DistriFusion.
-Each device processes the computation task for one patch of its assigned stage in a pipelined manner. 
-
-The PipeFusion pipeline workflow when $M$ = $N$ =4 is shown in the following picture.
-
-<div align="center">
-    <img src="https://raw.githubusercontent.com/xdit-project/xdit_assets/main/workflow.png" alt="Pipeline Image">
-</div>
-
-
-We have evaluated the accuracy of PipeFusion, DistriFusion and the baseline as shown bolow. To conduct the FID experiment, follow the detailed instructions provided in the [documentation](../../docs/fid/FID.md).
-
-<div align="center">
-    <img src="https://raw.githubusercontent.com/xdit-project/xdit_assets/main/image_quality.png" alt="image_quality">
-</div>
-
-
-For more details, please refer to the following paper.
-
+```bash
+xdit --model FLUX.1-dev \
+    --prompt "A cat running in a garden" \
+    --pipefusion_parallel_degree 2
 ```
-@inproceedings{
-    fang2025pipefusion,
-    title={PipeFusion: Patch-level Pipeline Parallelism for Diffusion Transformers Inference},
-    author={Jiarui Fang and Jinzhe Pan and Aoyu Li and Xibo Sun and WANG Jiannan},
-    booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
-    year={2025},
-    url={https://openreview.net/forum?id=5xwyxupsLL}
-}
+
+This example defaults to two patches and one synchronous denoising step to initialize
+attention KV caches. Compare its output and latency with `--pipefusion_parallel_degree 1`.
+Tune the layout if the workload benefits.
+
+[![Latent patches flow through two transformer stages](../assets/pipefusion.svg)](../assets/pipefusion.svg)
+
+## Tune the layout
+
+| Option | Use |
+| --- | --- |
+| `--pipefusion_parallel_degree N` | Set the stage count. `1` disables PipeFusion. |
+| `--num_pipeline_patch N` | Set the number of latent patches; defaults to the stage count. More patches can improve overlap but add overhead. |
+| `--warmup_steps N` | Run this many synchronous denoising steps before patch updates. Must be at least `1`. Increase it if the initial patch updates affect output quality. |
+| `--attn_layer_num_for_pp N …` | Override the layer split with one positive count per stage. Counts must cover all transformer blocks and respect the model's stage boundaries. |
+
+Patch and stage counts can differ. The output dimensions must permit the model's
+patch layout. `--warmup_steps` counts denoising steps within a generation.
+`--warmup_calls` counts complete, untimed generations before a benchmark.
+
+## Qwen Image and Image Edit
+
+Qwen Image and Qwen Image 2512 support PipeFusion. The original Qwen Image Edit
+checkpoint also supports it, with exactly one input image. Qwen Image Edit Plus
+2509/2511 and Qwen Image 2.1 do not support PipeFusion.
+
+```bash
+xdit --model Qwen-Image-2512 \
+    --prompt "An isometric botanical library" \
+    --pipefusion_parallel_degree 2
 ```
+
+The stage split balances the 60 transformer blocks by default. An explicit
+`--attn_layer_num_for_pp` must assign all 60 blocks, with one positive count per
+stage. Qwen uses token-row patches; Image Edit appends fixed reference-image
+tokens, while scheduler feedback updates only generated tokens.
+
+Use pipeline parallelism alone for Qwen Image. The original Image Edit also
+supports CFG parallelism with PipeFusion. For example, `--use_cfg_parallel
+--pipefusion_parallel_degree 2` launches four ranks. Qwen PipeFusion rejects
+Ulysses and Ring composition, and step-end callbacks.
+
+<a id="composition-and-validation-boundaries"></a>
+
+## Combine with other options
+
+| Option | Constraint |
+| --- | --- |
+| Ulysses, Ring, or CFG parallelism | Require model support and multiply the rank count. See [hybrid parallelism](hybrid.md). |
+| Parallel VAE | Uses a separate VAE decode schedule over the existing ranks. See [Parallel VAE](parallel_vae.md). |
+| Step caching | Use `--cache_method pipefusion` on a model with a supported DBCache layout. Other cache methods are rejected; data parallelism must remain `1`. Caching adds another approximation to check for output quality. |
+| `--memory_efficient_replicated_load` | On supported FLUX and Qwen Image runners, load only each stage's transformer blocks. Replicated pipeline components remain eager. Availability depends on the model; SD3.5 rejects this option with PipeFusion. |
+| FSDP | Select replicated components explicitly with `--fully_shard_components`. The stage-local transformer cannot be FSDP-wrapped. |
+| `--use_torch_compile` | Supported stage wrappers capture and compile their local calls during runner warmup. Allow for compilation startup before measuring inference. |
+| LoRA | Startup LoRA fusion currently rejects PipeFusion. |
+
+Ascend NPU currently does not support PipeFusion. Backend availability and model
+capability checks also apply; consult the [runner guide](../runner/runner.md) and
+[CLI reference](../runner/cli.md) for supported launch and loading options.
+
+Use fixed seeds and representative prompts when checking output quality. Stage balance, communication,
+and the number of denoising steps affect latency. More stages or patches do not
+guarantee a faster run.
+
+For the method, see the [PipeFusion paper](https://openreview.net/forum?id=5xwyxupsLL).
+Implementation entry points are the [stage split](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/transformers/base_transformer.py),
+[patch schedules](https://github.com/xdit-project/xDiT/tree/main/xfuser/model_executor/pipefusion/schedules),
+and [compile warmup](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/pipefusion/compile.py).

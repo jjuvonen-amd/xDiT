@@ -13,7 +13,7 @@ import torch
 
 from xfuser.model_executor.models.runner_models import base_model
 from xfuser.model_executor.models.runner_models.base_model import xFuserModel
-from xfuser.model_executor.models.runner_models.loading import transformer_load
+from xfuser.model_executor.models.runner_models.loading import placement, transformer_load
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +34,7 @@ def _model(*, local_rank, monkeypatch, **offload_flags):
         components={},
     )
     flags = {
-        "use_spargeattn_head_balance": False,
+        "use_sparseattn_head_balance": False,
         "enable_slicing": False,
         "enable_tiling": False,
         "enable_group_cpu_offload": False,
@@ -50,7 +50,10 @@ def _model(*, local_rank, monkeypatch, **offload_flags):
         _decoding_vaes=lambda: [],
         _get_compiled_pipe_components=lambda: [],
     )
+    model._block_level_offload_components = lambda: xFuserModel._block_level_offload_components(model)
     model._local_onload_device = lambda: xFuserModel._local_onload_device(model)
+    model._group_offload_kwargs = lambda offload_type: xFuserModel._group_offload_kwargs(model, offload_type)
+    model._enable_cpu_offload = lambda: xFuserModel._enable_cpu_offload(model)
     return model, calls
 
 
@@ -92,6 +95,86 @@ def test_group_offload_onloads_to_this_ranks_device(monkeypatch, local_rank):
     xFuserModel._enable_options(model)
 
     assert str(offloaded["onload_device"]) == f"cuda:{local_rank}"
+
+
+def test_group_offload_splits_only_the_components_block_level_reaches(monkeypatch):
+    """A component whose blocks block-level grouping cannot reach stays on leaf level."""
+    model, _ = _model(
+        local_rank=0,
+        monkeypatch=monkeypatch,
+        enable_group_cpu_offload=True,
+    )
+    model._get_compiled_pipe_components = lambda: ["transformer", "text_encoder"]
+    model._block_level_offload_components = lambda: ["transformer"]
+    offload_types = {}
+
+    class Component(torch.nn.Module):
+        """The loop filters on Module, so each recorder has to be one."""
+
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def enable_group_offload(self, **kwargs):
+            offload_types[self.name] = kwargs["offload_type"]
+
+    model.pipe.components = {
+        "transformer": Component("transformer"),
+        "text_encoder": Component("text_encoder"),
+        "vae": Component("vae"),
+    }
+
+    xFuserModel._enable_options(model)
+
+    assert offload_types == {
+        "transformer": "block_level",
+        "text_encoder": "leaf_level",
+        "vae": "leaf_level",
+    }
+
+
+def test_offload_places_only_the_runners_resident_components(monkeypatch):
+    """A runner that offloads part of its pipeline gets the rest placed, and quantized, on device."""
+    monkeypatch.setattr(placement, "get_world_group", lambda: SimpleNamespace(local_rank=3))
+    moved = []
+
+    class Component:
+        def __init__(self, name):
+            self.name = name
+
+        def to(self, device):
+            moved.append((self.name, device))
+            return self
+
+    def whole_pipeline_to(device):
+        raise AssertionError("an offloaded pipeline must not be moved whole")
+
+    pipe = SimpleNamespace(
+        transformer=Component("transformer"),
+        text_encoder=Component("text_encoder"),
+        to=whole_pipeline_to,
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_model_cpu_offload=True,
+            enable_sequential_cpu_offload=False,
+            enable_group_cpu_offload=False,
+            use_fp4_gemms=False,
+            use_int8_gemms=False,
+        ),
+        pipe=pipe,
+        _offload_resident_components=lambda: ("transformer",),
+    )
+    loader = SimpleNamespace(
+        model=model,
+        fill_eager_transformers=lambda: None,
+        replicated_broadcast_load=lambda: False,
+        backends=SimpleNamespace(fp8=None),
+    )
+
+    placement.place_pipeline_components(loader)
+
+    assert moved == [("transformer", "cuda:3")]
 
 
 @pytest.mark.parametrize(

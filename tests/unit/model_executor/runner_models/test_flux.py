@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from xfuser import xFuserArgs
 from xfuser.model_executor.models.runner_models import flux
 from xfuser.model_executor.models.runner_models.flux import (
     xFuserFluxKontextModel,
@@ -48,3 +49,52 @@ def test_ulysses_runs_record_the_requested_size(monkeypatch, flux_runtime_state,
 
     assert output.images == ["image"]
     assert (state.input_config.height, state.input_config.width) == (size, size)
+
+
+@pytest.fixture
+def single_process(monkeypatch):
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "model"),
+    [
+        (flux.xFuserFlux2Model, "FLUX.2-dev"),
+        (flux.xFuserFlux2Klein9BModel, "FLUX.2-klein-9B"),
+        (flux.xFuserFlux2Klein4BModel, "FLUX.2-klein-4B"),
+    ],
+)
+def test_flux2_pipefusion_accepts_parallel_vae(single_process, tmp_path, model_cls, model):
+    # With --use_parallel_vae the wrapper broadcasts the latents and decodes on every
+    # pipeline stage, the same path FLUX.1 PipeFusion already uses. Last-stage-only
+    # decode is the non-parallel branch.
+    runner = model_cls(
+        xFuserArgs(
+            model=model,
+            pipefusion_parallel_degree=2,
+            use_parallel_vae=True,
+            output_directory=str(tmp_path),
+        )
+    )
+
+    assert runner.config.pipefusion_parallel_degree == 2
+    assert runner.config.use_parallel_vae is True
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [flux.xFuserFlux2Klein9BModel, flux.xFuserFlux2Klein4BModel],
+)
+def test_klein_compiles_the_text_encoder_but_offloads_it_leaf_level(model_cls):
+    """Compilation reaches the encoder's nested blocks; block-level grouping does not.
+
+    Klein declares its text-encoder blocks at ``model.layers``, which group
+    offload only reaches by recursing, so the two policies name different
+    components.
+    """
+    runner = object.__new__(model_cls)
+
+    assert "text_encoder" in runner._get_compiled_pipe_components()
+    assert runner._block_level_offload_components() == ["transformer"]
+    assert model_cls.settings.fsdp_strategy["text_encoder"]["wrap_attrs"] == ["model.layers"]

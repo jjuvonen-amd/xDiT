@@ -6,8 +6,9 @@ import os
 from math import gcd
 from PIL.Image import Image
 from typing import Callable, List, Optional, Tuple, Generator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from torch.profiler import profile, record_function, ProfilerActivity
+from torch.utils._pytree import tree_map_only
 import diffusers
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import load_image, export_to_video
@@ -18,20 +19,31 @@ from xfuser.envs import (
     PACKAGES_CHECKER,
     _is_hip,
     _is_cuda,
+    bind_group_norm,
 )
 from xfuser.core.utils.outputs_equal import outputs_equal
+from xfuser.logger import warn_once
 from xfuser.core.utils.runner_utils import (
     log,
     log_error,
+    logger,
     load_dataset_prompts,
     rgetattr,
 )
+from xfuser.model_executor.models.runner_models.image_postprocess import enable_fast_pil_postprocess
+from xfuser.model_executor.layers import usp_sdma
+from xfuser.model_executor.pipelines.base_pipeline import xFuserPipelineBaseWrapper
 from xfuser.model_executor.models.runner_models.vae_manager import (
     VAEManager,
     validate_vae_config,
 )
 
-from xfuser.model_executor.cache.presets import DBCacheSettings, ModelCacheConfig
+from xfuser.model_executor.cache.presets import (
+    DBCachePreset,
+    DBCacheSettings,
+    ModelCacheConfig,
+)
+from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed import (
     get_world_group,
     get_model_replica_group,
@@ -40,12 +52,16 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_classifier_free_guidance_rank,
     get_pipeline_parallel_world_size,
+    get_pp_group,
+    is_pipeline_first_stage,
     initialize_runtime_state,
     get_runtime_state,
     runtime_state_is_initialized,
     init_distributed_environment,
 )
 from xfuser.core.attention import registry as attention_registry
+from xfuser.core.attention.backends.aiter_mha_v4.spec import SPARGE_FORMATS as MHA_V4_SPARGE_FORMATS
+from xfuser.core.attention.backends.aiter_sol.spec import SOL_RECIPES
 from xfuser.core.attention.spec import AttentionBackendType, Sparsity
 from xfuser.core.distributed.fp8_comms import setup_fp8_comms, validate_fp8_comms_config
 from xfuser.core.distributed.attention_schedule import (
@@ -60,6 +76,11 @@ from xfuser.model_executor.models.runner_models.loading.contracts import (
 )
 from xfuser.model_executor.models.runner_models.loading.quantization_plan import (
     apply_fp8_override_cli_to_settings,
+)
+from xfuser.model_executor.pipefusion import (
+    pipefusion_recompile_limit,
+    record_pipefusion_stage_calls,
+    replay_pipefusion_stage_calls,
 )
 
 packages_info = PACKAGES_CHECKER.get_packages_info()
@@ -83,15 +104,21 @@ def register_model(name: str) -> Callable:
 
 
 # Derived from the backend specs rather than listed here: each backend declares
-# its sparsity strategy, so adding one cannot miss these sets. SPARGE and VSA
-# are grouped because both need a separate, dense cross-attention backend.
+# its sparsity strategy, so adding one cannot miss these sets. SPARGE, VSA and
+# SOL are grouped because all three need a separate, dense cross-attention
+# backend. Sol-Attn routes over KV blocks, and a short text KV has too few.
 _SPARSE_ATTENTION_BACKENDS = attention_registry.types_where(sparsity=Sparsity.SSTA)
-_SPARGE_ATTENTION_BACKENDS = attention_registry.types_where(sparsity=Sparsity.SPARGE) | attention_registry.types_where(
-    sparsity=Sparsity.VSA
+_SPARGE_ATTENTION_BACKENDS = (
+    attention_registry.types_where(sparsity=Sparsity.SPARGE)
+    | attention_registry.types_where(sparsity=Sparsity.VSA)
+    | attention_registry.types_where(sparsity=Sparsity.SOL)
 )
 # Prism's block-sparse attention needs a token grid that only models declaring the
 # capability publish; anywhere else it would quietly run dense.
 _BSA_ATTENTION_BACKENDS = attention_registry.types_where(sparsity=Sparsity.BSA)
+
+# A model opts into Sol-Attn separately from Sparge: support for one does not imply the other.
+_SOL_ATTENTION_BACKENDS = attention_registry.types_where(sparsity=Sparsity.SOL)
 
 
 def _parse_attention_backend(name: Optional[str], kind: str) -> Optional[AttentionBackendType]:
@@ -104,12 +131,12 @@ def _parse_attention_backend(name: Optional[str], kind: str) -> Optional[Attenti
 
 
 def _validate_cross_attention_for_sparge(config: xFuserArgs) -> None:
-    """Cross-attention must be set and must not itself be a Sparge backend
-    whenever Sparge Attention is in play (either as the explicit backend or
-    via the hybrid schedule)."""
+    """Cross-attention must be set and must not itself be a Sparge, VSA or Sol backend
+    whenever one of those is in play (either as the explicit backend or via the
+    hybrid schedule)."""
     if config.cross_attention_backend is None:
         raise ValueError(
-            "When Sparge Attention is used, --cross_attention_backend must be set to a non-Sparge backend."
+            "A Sparge, VSA or Sol attention backend needs --cross_attention_backend set to a dense backend."
         )
     cross = _parse_attention_backend(
         config.cross_attention_backend,
@@ -117,14 +144,18 @@ def _validate_cross_attention_for_sparge(config: xFuserArgs) -> None:
     )
     if cross in _SPARGE_ATTENTION_BACKENDS:
         raise ValueError(
-            f"--cross_attention_backend cannot be {cross.name} when Sparge "
-            f"Attention is used. Pick a non-Sparge cross attention backend."
+            f"--cross_attention_backend cannot be {cross.name}, a Sparge, VSA or Sol backend. "
+            f"Pick a dense cross attention backend."
         )
 
 
 def _selected_attention_backends(config: xFuserArgs) -> list[AttentionBackendType]:
     """Every backend the run would actually dispatch to, named as the user named them."""
-    if config.use_hybrid_attn_schedule:
+    scheduled: list[AttentionBackendType] = []
+    if config.use_hybrid_attn_schedule and config.hybrid_attn_schedule:
+        scheduled = AttentionSchedule.from_comma_delimited_string(config.hybrid_attn_schedule).backends
+        specs = []
+    elif config.use_hybrid_attn_schedule:
         specs = [
             (config.hybrid_attn_high_precision_backend, "hybrid attention high precision backend"),
             (config.hybrid_attn_low_precision_backend, "hybrid attention low precision backend"),
@@ -132,7 +163,31 @@ def _selected_attention_backends(config: xFuserArgs) -> list[AttentionBackendTyp
     else:
         specs = [(config.attention_backend, "attention backend")]
     specs.append((config.cross_attention_backend, "cross attention backend"))
-    return [backend for value, kind in specs if (backend := _parse_attention_backend(value, kind)) is not None]
+    return scheduled + [
+        backend for value, kind in specs if (backend := _parse_attention_backend(value, kind)) is not None
+    ]
+
+
+def _validate_sparseattn_block_size(config: xFuserArgs) -> None:
+    """Refuse, before loading, a --sparseattn_block_size no selected backend reads.
+
+    Whether the GPU has a kernel at that tile is checked by the backend's spec
+    when it is selected, once the device is set.
+    """
+    if config.sparseattn_block_size is None:
+        return
+    if not any(b in MHA_V4_SPARGE_FORMATS or b in SOL_RECIPES for b in _selected_attention_backends(config)):
+        raise ValueError(
+            "--sparseattn_block_size applies only to the AITER MHA v4 Sparge and AITER Sol attention backends."
+        )
+
+
+def _validate_solattn_beta_schedule(config: xFuserArgs) -> None:
+    """Refuse, before loading, a --solattn_beta_schedule no selected backend reads."""
+    if config.solattn_beta_schedule is None:
+        return
+    if not any(b in SOL_RECIPES for b in _selected_attention_backends(config)):
+        raise ValueError("--solattn_beta_schedule applies only to the AITER Sol attention backends.")
 
 
 def _validate_attention_head_dims(model: "xFuserModel", config: xFuserArgs) -> None:
@@ -219,12 +274,16 @@ class ModelCapabilities:
     use_a6w4_gemms: bool = False
     supports_step_caching: bool = False
     supports_lora: bool = False
+    # The runner fuses the LoRA into bf16 weights before quantized GEMMs are materialized.
+    supports_lora_with_quantized_gemms: bool = False
     use_fp8_comms: bool = False
+    supports_attention_a2a: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
     cross_attention_backend: bool = False
     supports_sparse_attention_backends: bool = False
     supports_sparge_attention_backends: bool = False
+    supports_sol_attention_backends: bool = False
     supports_bsa_attention_backends: bool = False
     supports_distilled_weights: bool = False
     profile_capture_phase: bool = False
@@ -392,6 +451,9 @@ class xFuserModel(abc.ABC):
     # model's support has not been released yet, and leave None when no floor is known.
     min_diffusers_version: Optional[str] = None
 
+    # The pipeline when it is a legacy xFuserPipelineBaseWrapper, set by initialize().
+    _legacy_pipe: Optional[xFuserPipelineBaseWrapper] = None
+
     def __init__(self, config: xFuserArgs) -> None:
         self.settings = copy.deepcopy(self.__class__.settings)
         self._customize_settings(config)
@@ -458,6 +520,7 @@ class xFuserModel(abc.ABC):
                 f"{self.settings.model_name} is unavailable with diffusers {diffusers.__version__}: {e}. {remedy}"
             ) from e
 
+    @torch.inference_mode()
     def initialize(self, input_args: dict) -> None:
         """Load the model pipeline"""
 
@@ -467,16 +530,32 @@ class xFuserModel(abc.ABC):
 
         self.loader.preflight(world_size=get_world_group().world_size)
         self.engine_config, _ = self.config.create_config()
+        # The runner applies these optimizations after loading, when its
+        # model-specific managers can select the correct implementation.
+        # Deferring prevents legacy pipeline wrappers from wrapping the same
+        # VAE decoder or transformer forward a second time.
+        self.engine_config.runtime_config.runner_managed_parallel_vae = True
+        self.engine_config.runtime_config.runner_managed_torch_compile = (
+            getattr(self.config, "pipefusion_parallel_degree", 1) > 1
+        )
+        bind_group_norm(use_aiter=self._uses_aiter_group_norm())
         log("Loading model pipeline...")
         self.pipe = self._load_model_checked()
+        enable_fast_pil_postprocess([self.pipe, getattr(self, "second_pipe", None)])
+        self._legacy_pipe = self.pipe if isinstance(self.pipe, xFuserPipelineBaseWrapper) else None
+        if self._legacy_pipe is not None:
+            self._legacy_pipe.prompts_split_by_caller = True
 
         log("Initializing runtime state...")
         initialize_runtime_state(self._get_runtime_state_pipeline(), self.engine_config)
 
         self._post_load_and_state_initialization(input_args)
-        if self.config.use_parallel_vae:
+        if self.config.use_parallel_vae and self.config.vae_parallel_size == 0:
             self._vae_manager.setup_parallel_vae(self._decoding_vaes())
         self._enable_options()
+        # Before anything below runs the pipe: FP8 comms calibrates on it, and compile
+        # guards on `training`, so a later switch would recompile.
+        self._set_eval_mode()
         fp8_comms = get_runtime_state().fp8_comms if runtime_state_is_initialized() else None
         if fp8_comms is not None:
             setup_fp8_comms(
@@ -486,6 +565,34 @@ class xFuserModel(abc.ABC):
                 run_pipe_fn=self._run_timed_pipe,
                 split_prompts_fn=self._split_prompts_for_dp,
                 batch_size=self.config.batch_size,
+            )
+
+        pp_degree = getattr(self.config, "pipefusion_parallel_degree", 1)
+        if pp_degree > 1 and self.config.use_torch_compile:
+            # Materialize both directional P2P communicators before rank-local
+            # compilation can make the stages reach their first receive at
+            # different times.
+            group = get_pp_group()
+            token = torch.zeros(
+                1,
+                device=self._local_onload_device(),
+                dtype=self.engine_config.runtime_config.dtype,
+            )
+            if is_pipeline_first_stage():
+                group.pipeline_send(token, name="_xfuser_compile_prime", segment_idx=0)
+                group.pipeline_recv(idx=0, name="_xfuser_compile_prime")
+            else:
+                group.pipeline_recv(idx=0, name="_xfuser_compile_prime")
+                group.pipeline_send(token, name="_xfuser_compile_prime", segment_idx=0)
+
+        # Before compilation sees the modules.
+        if usp_sdma.overlap_qkv():
+            config = self.config
+            offload = config.enable_group_cpu_offload or config.enable_sequential_cpu_offload
+            usp_sdma.prepare(
+                self.pipe,
+                self._get_compiled_pipe_components(),
+                cpu_offload=offload or config.enable_model_cpu_offload,
             )
 
         # Compile and warm the original blocks before cache adapters replace or
@@ -503,45 +610,99 @@ class xFuserModel(abc.ABC):
         if self.config.cache_method:
             self._apply_step_cache()
 
+    def _set_eval_mode(self) -> None:
+        """Switch every module the runner holds to eval mode, warning about those that were not.
+
+        inference_mode only disables autograd; Dropout and BatchNorm follow `training`, which
+        from_pretrained clears but manual construction (from_config + load_state_dict) does not.
+        Runners keep pipelines beside self.pipe (e.g. LTX upsample/decode, LingBot refiner), and a
+        pipeline may hold modules it never registered, so attributes are walked two levels deep
+        rather than through `components`. Submodules are inspected too, as a block swapped in
+        after loading leaves an eval-mode parent with a training-mode child.
+        """
+        candidates = []
+        for name, value in vars(self).items():
+            if isinstance(value, torch.nn.Module):
+                candidates.append((name, value))
+            elif isinstance(getattr(value, "__dict__", None), dict):
+                candidates.extend(
+                    (f"{name}.{sub_name}", sub_value)
+                    for sub_name, sub_value in vars(value).items()
+                    if isinstance(sub_value, torch.nn.Module)
+                )
+
+        seen = set()
+        in_training = []
+        for name, module in candidates:
+            # Pipelines share components (e.g. LTX upsample_pipe reuses pipe.vae).
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            if any(submodule.training for submodule in module.modules()):
+                in_training.append(name)
+            module.eval()
+
+        if in_training:
+            warn_once(
+                logger,
+                f"Switched {', '.join(in_training)} from training to eval mode. "
+                f"{type(self).__name__} should load them with .eval().",
+            )
+
     def _local_onload_device(self) -> torch.device:
         """The device this rank offloads to and from, which is never implicitly cuda:0."""
         return torch.device(f"cuda:{get_world_group().local_rank}")
 
     def _enable_options(self) -> None:
         """Enable model options based on config"""
-        if getattr(self.config, "use_spargeattn_head_balance", False):
-            log("Enabling Sparge block-sparse head balancing...")
+        if getattr(self.config, "use_sparseattn_head_balance", False):
+            log("Enabling block-sparse head balancing...")
 
         self._vae_manager.enable_options(self._decoding_vaes())
+        self._enable_cpu_offload()
 
+    def _offload_resident_components(self) -> tuple[str, ...]:
+        """Pipeline components placed on the device even when CPU offload is requested.
+
+        Offload placement otherwise leaves every component on the host for the offload hooks to
+        move. A runner whose offload mode moves only some components names the rest here, and
+        they are placed before quantization like an unoffloaded pipeline's.
+        """
+        return ()
+
+    def _group_offload_kwargs(self, offload_type: str) -> dict:
+        kwargs = dict(
+            onload_device=self._local_onload_device(),
+            offload_type=offload_type,
+            use_stream=True,
+            record_stream=True,
+            # Pin each tensor as it is offloaded instead of pre-pinning the whole component:
+            # host RAM stays flat where it is the binding constraint, at some of the
+            # streaming win. Opt-in because it costs latency where host RAM is plentiful.
+            low_cpu_mem_usage=self.config.group_offload_low_cpu_mem,
+            non_blocking=True,
+        )
+        if offload_type == "block_level":
+            kwargs["num_blocks_per_group"] = 1
+        return kwargs
+
+    def _enable_cpu_offload(self) -> None:
+        """Apply the CPU offload mode the config selects, if any."""
         if self.config.enable_group_cpu_offload:
-            # block_level groups only top-level ModuleLists: fits compiled transformers
-            # (blocks are top-level) and avoids the per-block-compile recompile storm that
-            # leaf-level hooks trigger. Eager components nest their layers (e.g. Mistral-3 at
-            # model.language_model.layers) where block_level cannot reach, leaving the whole
-            # component in one unmatched group and OOMing; they use leaf_level, which recurses.
+            # block_level groups only top-level ModuleLists, which also avoids the
+            # per-block-compile recompile storm that leaf-level hooks trigger. Components
+            # that nest their layers (e.g. Mistral-3 at model.language_model.layers) are out
+            # of its reach and would offload as one group, so they use leaf_level, which
+            # recurses. _block_level_offload_components names the ones it fits.
             from diffusers.hooks import apply_group_offloading
 
-            log("Enabling group CPU offload (transformer block-level, others leaf-level, streamed)...")
-            onload_device = self._local_onload_device()
-            block_level_names = set(self._get_compiled_pipe_components())
+            log("Enabling group CPU offload (declared components block-level, others leaf-level, streamed)...")
+            block_level_names = set(self._block_level_offload_components())
             for name, component in self.pipe.components.items():
                 if not isinstance(component, torch.nn.Module):
                     continue
                 offload_type = "block_level" if name in block_level_names else "leaf_level"
-                kwargs = dict(
-                    onload_device=onload_device,
-                    offload_type=offload_type,
-                    use_stream=True,
-                    record_stream=True,
-                    # Pin each tensor as it is offloaded instead of pre-pinning the whole component:
-                    # host RAM stays flat where it is the binding constraint, at some of the
-                    # streaming win. Opt-in because it costs latency where host RAM is plentiful.
-                    low_cpu_mem_usage=self.config.group_offload_low_cpu_mem,
-                    non_blocking=True,
-                )
-                if offload_type == "block_level":
-                    kwargs["num_blocks_per_group"] = 1
+                kwargs = self._group_offload_kwargs(offload_type)
                 if hasattr(component, "enable_group_offload"):
                     component.enable_group_offload(**kwargs)
                 else:
@@ -564,14 +725,27 @@ class xFuserModel(abc.ABC):
         from xfuser.model_executor.cache.adapters import apply_cache
 
         cache_method = self.config.cache_method
-        method_cfg = (self.settings.step_cache_config or {}).get(cache_method)
+        supported_methods = self.settings.step_cache_config or {}
+        method_cfg = supported_methods.get(cache_method)
+        if cache_method == "pipefusion" and method_cfg is None:
+            method_cfg = supported_methods.get("dbcache")
+        if (
+            cache_method == "pipefusion"
+            and isinstance(method_cfg, DBCacheSettings)
+            and isinstance(method_cfg.adapter, list)
+        ):
+            raise ValueError("--cache_method pipefusion does not yet support multi-transformer cache adapters.")
         # A configured FBCache entry uses cache-dit's DBCache engine with an
         # Fn=1 preset. None marks an in-tree FBCache adapter.
         engine_method = (
-            "dbcache" if cache_method == "fbcache" and isinstance(method_cfg, DBCacheSettings) else cache_method
+            "dbcache"
+            if (cache_method == "pipefusion" or (cache_method == "fbcache" and isinstance(method_cfg, DBCacheSettings)))
+            else cache_method
         )
         pp_size = get_pipeline_parallel_world_size()
-        if engine_method == "dbcache" and pp_size > 1:
+        if cache_method == "pipefusion" and pp_size <= 1:
+            raise ValueError("--cache_method pipefusion requires --pipefusion_parallel_degree greater than 1.")
+        if engine_method == "dbcache" and cache_method != "pipefusion" and pp_size > 1:
             raise ValueError(
                 f"dbcache is incompatible with PipeFusion (PP={pp_size}): "
                 "the residual-diff skip decision is computed via a collective that only runs on the "
@@ -590,11 +764,23 @@ class xFuserModel(abc.ABC):
             )
         if cache_method == "teacache" and get_tensor_model_parallel_world_size() > 1:
             raise RuntimeError("teacache requires TP=1")
+        preset = method_cfg.preset if method_cfg else None
+        if cache_method == "pipefusion":
+            if isinstance(preset, list):
+                preset = [
+                    replace(item, share_pipefusion_decisions=True) if isinstance(item, DBCachePreset) else item
+                    for item in preset
+                ]
+            elif isinstance(preset, DBCachePreset):
+                preset = replace(
+                    preset,
+                    share_pipefusion_decisions=True,
+                )
         apply_cache(
             cache_method=engine_method,
             num_steps=self.config.num_inference_steps,
             pipe=self.pipe,
-            preset_kwargs=method_cfg.preset if method_cfg else None,
+            preset_kwargs=preset,
             adapter_config=method_cfg.adapter if method_cfg else None,
             cache_config=self.config.cache_config,
             transformer_attr=self.settings.transformer_attr_names[0],
@@ -661,10 +847,18 @@ class xFuserModel(abc.ABC):
                 or config.fully_shard_degree > 1
                 or config.memory_efficient_sharding
                 or config.memory_efficient_replicated_load
-                or not config.gemm_quantization_spec.is_pure("none")
             ):
                 raise ValueError("Startup LoRA fusion requires eager, unquantized loading without FSDP or PipeFusion.")
+            if (
+                not config.gemm_quantization_spec.is_pure("none")
+                and not self.capabilities.supports_lora_with_quantized_gemms
+            ):
+                raise ValueError(
+                    f"Model {self.settings.model_name} requires eager, unquantized loading for startup LoRA fusion."
+                )
         _validate_attention_head_dims(self, config)
+        if config.attention_a2a != "none" and not self.capabilities.supports_attention_a2a:
+            raise ValueError(f"Model {self.settings.model_name} does not support --attention_a2a.")
         for key in ModelCapabilities.__annotations__.keys():
             config_value = getattr(
                 config, key, None
@@ -680,13 +874,23 @@ class xFuserModel(abc.ABC):
             if not self.capabilities.supports_step_caching:
                 raise ValueError(f"Model {self.settings.model_name} does not support step caching.")
             supported_methods = self.settings.step_cache_config or {}
-            if config.cache_method not in supported_methods:
+            pipefusion_supported = (
+                config.cache_method == "pipefusion"
+                and isinstance(supported_methods.get("dbcache"), DBCacheSettings)
+                and not isinstance(
+                    supported_methods["dbcache"].adapter,
+                    list,
+                )
+            )
+            if config.cache_method not in supported_methods and not pipefusion_supported:
                 raise ValueError(
                     f"Model {self.settings.model_name} does not support --cache_method {config.cache_method}. "
                     f"Supported: {', '.join(supported_methods)}"
                 )
 
         self._validate_supported_attn_backends(config)
+        _validate_sparseattn_block_size(config)
+        _validate_solattn_beta_schedule(config)
 
         if not self.capabilities.supports_bsa_attention_backends:
             for value, label in (
@@ -705,6 +909,7 @@ class xFuserModel(abc.ABC):
         backend = _parse_attention_backend(config.attention_backend, "attention backend")
         supports_sparse = self.capabilities.supports_sparse_attention_backends
         supports_sparge = self.capabilities.supports_sparge_attention_backends
+        supports_sol = self.capabilities.supports_sol_attention_backends
 
         if backend is None:
             if supports_sparse:
@@ -724,6 +929,9 @@ class xFuserModel(abc.ABC):
                     config.hybrid_attn_high_precision_backend,
                     "hybrid high-precision attention backend",
                 )
+                if low in _SOL_ATTENTION_BACKENDS or high in _SOL_ATTENTION_BACKENDS:
+                    if not supports_sol:
+                        raise ValueError(f"Model {config.model} does not support Sol-Attn attention backends.")
                 if low in _SPARGE_ATTENTION_BACKENDS or high in _SPARGE_ATTENTION_BACKENDS:
                     _validate_cross_attention_for_sparge(config)
         else:
@@ -739,7 +947,10 @@ class xFuserModel(abc.ABC):
                     f"model equivalent."
                 )
             if backend in _SPARGE_ATTENTION_BACKENDS:
-                if not supports_sparge:
+                if backend in _SOL_ATTENTION_BACKENDS:
+                    if not supports_sol:
+                        raise ValueError(f"Model {config.model} does not support Sol-Attn attention backends.")
+                elif not supports_sparge:
                     raise ValueError(f"Model {config.model} does not support Sparge attention backend.")
                 if self.capabilities.cross_attention_backend:
                     _validate_cross_attention_for_sparge(config)
@@ -805,7 +1016,7 @@ class xFuserModel(abc.ABC):
         # CUDA graphs are slow on RDNA4.
         return "default"  # TODO: Configurable
 
-    def _get_compile_dynamic(self) -> Optional[bool]:
+    def _get_compile_dynamic(self, input_args=None) -> Optional[bool]:
         return None  # torch default (auto)
 
     def _prefer_blockwise_compile(self) -> bool:
@@ -834,8 +1045,55 @@ class xFuserModel(abc.ABC):
         component.register_forward_pre_hook(_mark, with_kwargs=True, prepend=True)
         component._xfuser_marks_cudagraph_steps = True
 
+    def _compiles_vae_decoder(self) -> bool:
+        """Whether ``--use_torch_compile`` covers this model's VAE decoder too.
+
+        Off by default.  A decoder is compiled where a runner has measured it,
+        because this also builds the VAE with torch GroupNorm instead of AITER's,
+        which is the faster of the two for a decoder that stays eager.
+        """
+        return False
+
+    def _uses_aiter_group_norm(self) -> bool:
+        """Whether this run builds its model with AITER's GroupNorm.
+
+        AITER's kernel is the faster of the two run eagerly, so a run takes it
+        unless something needs the torch class: DistVAE identifies the layers to
+        shard by that type, and Inductor cannot fuse across AITER's custom op.
+        """
+        if self.config.use_parallel_vae:
+            return False
+        return not (self.config.use_torch_compile and self._compiles_vae_decoder())
+
+    def _compile_vae_decoder(self, mode: str = "default") -> None:
+        """Forward decoder compilation to the VAE manager, which owns the policy."""
+        self._vae_manager.compile_decoders(self._decoding_vaes(), mode=mode)
+
+    def _compile_whole(self, module: torch.nn.Module, kwargs: dict) -> torch.nn.Module:
+        """Compile a whole component; under CUDA graphs, copy its outputs out of the graph's pool.
+
+        The next replay overwrites the pool, and sequential true CFG reads one call's output after the next call.
+        """
+        compiled = torch.compile(module, **kwargs)
+        if kwargs["mode"] in self.CUDAGRAPH_COMPILE_MODES:
+            compiled.register_forward_hook(
+                lambda _module, _args, output: tree_map_only(torch.Tensor, torch.clone, output)
+            )
+        return compiled
+
     def _get_compiled_pipe_components(self) -> List[str]:
         return ["transformer"]
+
+    def _block_level_offload_components(self) -> List[str]:
+        """Components that group CPU offload splits block by block.
+
+        ``block_level`` groups the ModuleLists that are direct children of a
+        component, which suits a transformer that holds its blocks there. A
+        component that nests its blocks deeper matches nothing, and group
+        offload then holds all of it on the device at once, so such a component
+        belongs on ``leaf_level``, which recurses.
+        """
+        return self._get_compiled_pipe_components()
 
     def _get_compile_warmup_steps(self, input_args: dict) -> Optional[int]:
         return 2  # None = skip step reduction, run full warmup cycle
@@ -859,70 +1117,169 @@ class xFuserModel(abc.ABC):
         # graphs at data-dependent times), so that collective deadlocks. For SPMD
         # runs the check is a cheap, useful guard, so only disable it under PP.
         if get_pipeline_parallel_world_size() > 1:
+            # KV cache updates specialize on full/patch mode and the Python patch
+            # index. The default limit of eight variants is too small for larger
+            # patch counts and silently falls back to eager execution.
+            # Use the normalized engine config: the runner's CLI config keeps
+            # ``None`` when --num_pipeline_patch was omitted, while
+            # PipeFusionParallelConfig resolves it to the pipeline degree.
+            num_pipeline_patch = self.engine_config.parallel_config.pp_config.num_pipeline_patch
+            required_recompile_limit = 2 * num_pipeline_patch + 4
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit,
+                required_recompile_limit,
+            )
             _ado = getattr(torch._inductor.config, "aten_distributed_optimizations", None)
             if _ado is not None and hasattr(_ado, "spmd_check"):
                 _ado.spmd_check = False
 
+    def _reset_pipefusion_compile_state(self, components) -> None:
+        """Remove state mutated by eager capture or rank-local compile replay."""
+        get_cache_manager().clear()
+        state = get_runtime_state()
+        state.set_patched_mode(False)
+        get_pp_group().reset_buffer()
+        for component in components.values():
+            reset = getattr(component, "reset_pipefusion_state", None)
+            if reset is not None:
+                reset()
+
     def _compile_model(self, input_args: dict) -> None:
-        """Compile pipe components with torch.compile.
+        """Apply the runner's ``torch.compile`` policy and warm every graph.
 
-        When FSDP is active, compiles each FSDP-wrapped component's block lists
-        individually (read from fsdp_strategy wrap_attrs)
-        to avoid dynamo tracing through FSDP2 forward_pre_hooks and fragmenting
-        the graph at every block boundary.
+        Compilation is runner-managed because pipeline wrapping, FSDP, and
+        step-cache adapters all change the safe graph boundary. "Declared
+        blocks" are the ``fsdp_strategy[name]["wrap_attrs"]`` lists that resolve
+        on a component.
+
+        * A PipeFusion stage (any component FSDP does not shard) stays eager,
+          because it owns the P2P boundaries and mutable patch/KV state. Its
+          declared blocks are compiled, or its bound ``forward`` when the lists
+          hold no block. Its real calls are recorded eagerly before wrapping and
+          replayed on every rank together afterwards, so no rank traces a graph
+          while another waits in ``pipeline_recv``.
+        * FSDP components and step-cache targets compile their declared blocks
+          and keep the component object, so FSDP hooks and the cache's
+          ``forward`` patch stay outside the graphs. So do components of a runner
+          that prefers blockwise compilation. A list that resolves counts even
+          when empty. With none, a step-cache target is an error and any other
+          component falls back to a whole-component wrapper.
+        * Other components are replaced by a whole-component compiled wrapper.
+
+        PipeFusion raises Dynamo's recompile limit and leaves it raised: the
+        step-cache adapters, applied after this method, trace their own graphs
+        when ``run`` or ``profile`` executes. The final warmup runs
+        ``_get_compile_warmup_steps`` steps, or the caller's count when that
+        returns ``None``.
+
+        A runner that opts in through ``_compiles_vae_decoder`` also has its VAE
+        decoder compiled here, in the mode the VAE manager selects for it.
         """
+        if self._compiles_vae_decoder():
+            self._compile_vae_decoder()
         self._enable_compute_comm_overlap()
-
-        mode = self._get_compile_mode()
-        dynamic = self._get_compile_dynamic()
-        for component_name in self._get_compiled_pipe_components():
-            component = getattr(self.pipe, component_name, None)
-            if component is None:
-                continue
-            requested_shards = getattr(
-                self.config,
-                "fully_shard_components",
-                None,
-            )
-            component_is_sharded = (
-                self.config.fully_shard_degree > 1
-                and component_name in self.settings.fsdp_strategy
-                and (requested_shards is None or component_name in requested_shards)
-            )
-            if component_is_sharded or self.config.cache_method or self._prefer_blockwise_compile():
-                # Per-block compile: leaves transformer as original object so cache-dit's
-                # transformer.forward patch remains visible during compiled execution.
-                wrap_attrs = self.settings.fsdp_strategy.get(component_name, {}).get("wrap_attrs", [])
-                compiled_any = False
-                for attr in wrap_attrs:
-                    try:
-                        block_list = rgetattr(component, attr)
-                    except AttributeError:
-                        block_list = None
-                    if block_list is not None:
-                        for i in range(len(block_list)):
-                            block_list[i] = torch.compile(block_list[i], mode=mode, dynamic=dynamic)
-                        compiled_any = True
-                if compiled_any and mode in self.CUDAGRAPH_COMPILE_MODES:
-                    self._mark_cudagraph_steps(component)
-                if not compiled_any and self.config.cache_method:
-                    # Compiling the whole component would put the step cache's
-                    # transformer.forward patch behind (or inside) the compiled graph.
-                    raise ValueError(
-                        f"--cache_method {self.config.cache_method} with --use_torch_compile compiles "
-                        f"{component_name} block by block, but none of its block lists "
-                        f"{list(wrap_attrs)} exist. Name them in "
-                        f"fsdp_strategy[{component_name!r}]['wrap_attrs'] of {type(self).__name__}."
-                    )
-                if not compiled_any:
-                    setattr(self.pipe, component_name, torch.compile(component, mode=mode, dynamic=dynamic))
-            else:
-                setattr(self.pipe, component_name, torch.compile(component, mode=mode, dynamic=dynamic))
+        compile_kwargs = {"mode": self._get_compile_mode()}
+        pp_degree = getattr(self.config, "pipefusion_parallel_degree", 1)
+        compile_kwargs["dynamic"] = (
+            self._get_compile_dynamic(input_args) if pp_degree > 1 else self._get_compile_dynamic()
+        )
+        cache_targets = set(self.settings.transformer_attr_names if self.config.cache_method else ())
+        requested_shards = getattr(self.config, "fully_shard_components", None)
         compile_args = copy.deepcopy(input_args)
         warmup_steps = self._get_compile_warmup_steps(input_args)
         if warmup_steps is not None:
             compile_args["num_inference_steps"] = warmup_steps
+
+        components = {}
+        for name in self._get_compiled_pipe_components():
+            if getattr(self.pipe, name, None) is not None:
+                components[name] = getattr(self.pipe, name)
+        sharded = {
+            name
+            for name in components
+            if self.config.fully_shard_degree > 1
+            and name in self.settings.fsdp_strategy
+            and (requested_shards is None or name in requested_shards)
+        }
+        stages = {name: module for name, module in components.items() if name not in sharded} if pp_degree > 1 else {}
+
+        if pp_degree > 1:
+            num_patches = self.engine_config.parallel_config.pp_config.num_pipeline_patch
+            local_blocks = sum(
+                len(block_list)
+                for name, module in components.items()
+                for block_list in self._declared_blocks(name, module)
+            )
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit,
+                pipefusion_recompile_limit(pp_degree, num_patches, local_blocks),
+            )
+
+        capture = None
+        if stages and runtime_state_is_initialized():
+            log("Capturing eager PipeFusion stage inputs for concurrent compile replay...", log_from_all_processes=True)
+
+            def run_pipe(num_inference_steps):
+                self._run_timed_pipe({**copy.deepcopy(compile_args), "num_inference_steps": num_inference_steps})
+
+            capture = record_pipefusion_stage_calls(stages, get_runtime_state(), run_pipe)
+            if capture.calls:
+                log(f"Captured {len(capture.calls)} PipeFusion stage signature(s).", log_from_all_processes=True)
+                self._reset_pipefusion_compile_state(stages)
+
+        for name, module in components.items():
+            kwargs = compile_kwargs
+            if usp_sdma.uses_sdma() and name in self.settings.transformer_attr_names:
+                kwargs = {**compile_kwargs, "mode": usp_sdma.compile_mode(compile_kwargs["mode"])}
+            blockwise = name in stages or name in sharded or name in cache_targets or self._prefer_blockwise_compile()
+            if not blockwise:
+                setattr(self.pipe, name, self._compile_whole(module, kwargs))
+                continue
+            block_lists = self._declared_blocks(name, module)
+            for block_list in block_lists:
+                for index in range(len(block_list)):
+                    block_list[index] = torch.compile(block_list[index], **kwargs)
+            if name in stages and not any(len(block_list) for block_list in block_lists):
+                module.forward = torch.compile(module.forward, **kwargs)
+                continue
+            if not block_lists:
+                if name in cache_targets:
+                    # Compiling the whole component would put the step cache's
+                    # transformer.forward patch behind (or inside) the compiled graph.
+                    raise ValueError(
+                        f"--cache_method {self.config.cache_method} with --use_torch_compile compiles "
+                        f"{name} block by block, but none of its block lists "
+                        f"{self.settings.fsdp_strategy.get(name, {}).get('wrap_attrs', [])} exist. Name them in "
+                        f"fsdp_strategy[{name!r}]['wrap_attrs'] of {type(self).__name__}."
+                    )
+                setattr(self.pipe, name, self._compile_whole(module, kwargs))
+                continue
+            if kwargs["mode"] in self.CUDAGRAPH_COMPILE_MODES:
+                self._mark_cudagraph_steps(module)
+
+        if capture is not None and capture.calls:
+            log(
+                f"Compiling {len(capture.calls)} captured PipeFusion stage signature(s) locally...",
+                log_from_all_processes=True,
+            )
+            try:
+                replay_pipefusion_stage_calls(capture, self._local_onload_device(), get_model_replica_group())
+            finally:
+                self._reset_pipefusion_compile_state(stages)
+            log("Concurrent PipeFusion compile replay completed.", log_from_all_processes=True)
         self._run_compile_warmup(compile_args)
+
+    def _declared_blocks(self, name: str, module: torch.nn.Module) -> list:
+        """Return the block lists named by ``fsdp_strategy[name]["wrap_attrs"]`` that exist on ``module``."""
+        block_lists = []
+        for attr in self.settings.fsdp_strategy.get(name, {}).get("wrap_attrs", []):
+            try:
+                block_list = rgetattr(module, attr)
+            except AttributeError:
+                continue
+            if block_list is not None:
+                block_lists.append(block_list)
+        return block_lists
 
     def _save_determinism_check_failed_outputs(
         self,
@@ -979,6 +1336,7 @@ class xFuserModel(abc.ABC):
 
         return determinism_failures, expected_output
 
+    @torch.inference_mode()
     def run(self, input_args: dict) -> Tuple[DiffusionOutput, list]:
         """Run the model and optionally check repeated outputs for determinism.
 
@@ -1105,6 +1463,7 @@ class xFuserModel(abc.ABC):
                 self._run_timed_pipe(input_args)
             log("Warmup complete.")
 
+    @torch.inference_mode()
     def profile(self, input_args: dict) -> Tuple[DiffusionOutput, list, torch.profiler.profiler.profile]:
         """Profile the model execution"""
         self._validate_args(input_args)
@@ -1209,6 +1568,9 @@ class xFuserModel(abc.ABC):
     def prepare_run(self, input_args: dict) -> None:
         """Prepare model state before a pipeline invocation."""
         self._vae_manager.prepare_run(self._decoding_vaes(), input_args)
+        # Warmups advance the step counter too, so each invocation starts the schedules at step 0.
+        if runtime_state_is_initialized():
+            get_runtime_state().reset_step_counter()
 
     def _run_timed_pipe(self, input_args: dict) -> Tuple[DiffusionOutput, float]:
         """Run the pipeline and time its latency from the synchronized across all ranks beginning
@@ -1288,6 +1650,9 @@ class xFuserModel(abc.ABC):
         if self.config.use_hybrid_gemm_schedule:
             self._setup_hybrid_gemm_schedule(input_args)
 
+        if getattr(self.config, "solattn_beta_schedule", None) is not None:
+            self._setup_solattn_beta_schedule(input_args)
+
         if self.config.use_vae_channels_last_format:
             self._convert_vae_to_channels_last()
 
@@ -1329,6 +1694,17 @@ class xFuserModel(abc.ABC):
         log("Enabling hybrid attention schedule")
         log(f"Hybrid attention schedule: {attention_schedule.backends}", debug=True)
         get_runtime_state().set_attention_schedule(attention_schedule, total_steps=total_steps)
+
+    def _setup_solattn_beta_schedule(self, input_args: dict) -> None:
+        """Hand --solattn_beta_schedule to the Sol backends, which _validate_config made sure are selected."""
+        from xfuser.core.attention.backends.aiter_sol import kernel as sol_kernel
+
+        beta_schedule = sol_kernel.install_beta_schedule(
+            self.config.solattn_beta_schedule,
+            input_args["num_inference_steps"],
+            self._calculate_hybrid_attention_step_multiplier(input_args),
+        )
+        log(f"Sol-Attn beta schedule: {beta_schedule.per_denoising_step}", debug=True)
 
     def _setup_hybrid_gemm_schedule(self, input_args: dict) -> None:
         """
@@ -1407,6 +1783,12 @@ class xFuserModel(abc.ABC):
                 f"Number of prompts ({len(prompts)}) is less than data_parallel_world_size ({dp_world_size}). "
             )
 
+        if self._wrapper_parallelizes_vae() and len(prompts) % dp_world_size:
+            raise ValueError(
+                f"--use_parallel_vae gathers the latents of every DP group, so the {len(prompts)} prompts "
+                f"must divide evenly across --data_parallel_degree {dp_world_size}."
+            )
+
         local_prompts = prompts[dp_rank::dp_world_size]
         if isinstance(negative_prompts, list) and len(negative_prompts) != 1:
             local_negative_prompts = negative_prompts[dp_rank::dp_world_size]
@@ -1419,6 +1801,14 @@ class xFuserModel(abc.ABC):
         split_args["negative_prompt"] = local_negative_prompts
         return split_args
 
+    def _wrapper_parallelizes_vae(self) -> bool:
+        """Return whether a legacy wrapper runs its parallel VAE decode path.
+
+        The runner shards the decoder, but such a wrapper gathers every DP group's
+        latents for the decode and returns the output on rank 0.
+        """
+        return self._legacy_pipe is not None and self._legacy_pipe.parallelizes_vae()
+
     def _gather_dp_outputs(self, output: DiffusionOutput) -> Optional[DiffusionOutput]:
         """
         Gathers DiffusionOutput objects from all DP groups onto the last rank.
@@ -1427,14 +1817,21 @@ class xFuserModel(abc.ABC):
         Only the first rank in the SP group sends the real payload,
         the other ranks send None to keep the collective valid.
 
+        A legacy pipeline wrapper returns images only on the ranks its own
+        ``is_dp_last_group()`` selects, so those ranks send instead.
         """
-        if self.config.data_parallel_degree == 1:
+        # Without DP the output is already on the saving rank, unless a legacy
+        # wrapper decodes with a parallel VAE and so returns it on rank 0.
+        if self.config.data_parallel_degree == 1 and not self._wrapper_parallelizes_vae():
             return output
 
         world_group = get_world_group()
         last_rank = world_group.world_size - 1
 
-        is_representative = get_sequence_parallel_rank() == 0 and get_classifier_free_guidance_rank() == 0
+        if self._legacy_pipe is not None:
+            is_representative = self._legacy_pipe.is_dp_last_group()
+        else:
+            is_representative = get_sequence_parallel_rank() == 0 and get_classifier_free_guidance_rank() == 0
         send_obj = output if is_representative else None
 
         gather_list = [None] * world_group.world_size if world_group.rank == last_rank else None

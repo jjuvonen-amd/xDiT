@@ -4,6 +4,7 @@ import numpy as np
 from typing import Optional, Dict, Any, Union, Tuple, List
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
+    QwenDoubleStreamAttnProcessor2_0,
     QwenImageTransformer2DModel,
     apply_rotary_emb_qwen,
     compute_text_seq_len_from_mask,
@@ -13,18 +14,42 @@ from diffusers.utils import (
     scale_lora_layers,
     unscale_lora_layers,
 )
-from xfuser.model_executor.layers.usp import USP
+from xfuser.model_executor.layers.usp import USP, masked_attention_backend
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.core.distributed import (
+    get_runtime_state,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
+    runtime_state_is_initialized,
 )
-from xfuser.model_executor.models.transformers.transformers_utils import chunk_and_pad_sequence, gather_and_unpad
+from xfuser.model_executor.models.transformers.transformers_utils import (
+    chunk_and_pad_sequence,
+    gather_and_unpad,
+    local_sp_pad_rows,
+    sp_pad_spans_ranks,
+    zero_sp_pad_rows_hook,
+)
+from xfuser.core.distributed.parallel_state import _SP
+from xfuser.core.cache_manager.cache_manager import get_cache_manager
+from xfuser.envs import PACKAGES_CHECKER
+from xfuser.model_executor.layers.attention_processor import (
+    xFuserAttentionProcessorRegister,
+)
+from xfuser.model_executor.models.transformers.base_transformer import (
+    xFuserTransformerBaseWrapper,
+)
+from xfuser.model_executor.models.transformers.register import (
+    xFuserTransformerWrappersRegister,
+)
 
 from xfuser.model_executor.layers.fused_qk_rope_flydsl import (
     flydsl_fused_qk_norm_rope,
     _HAS_FLYDSL,
 )
+
+HAS_LONG_CTX_ATTN = PACKAGES_CHECKER.get_packages_info()["has_long_ctx_attn"]
 
 
 def _qwen_cos_sin(freqs: torch.Tensor):
@@ -42,7 +67,13 @@ def _qwen_cos_sin(freqs: torch.Tensor):
     return cos, sin
 
 
-class xFuserQwenDoubleStreamAttnProcessor:
+@xFuserAttentionProcessorRegister.register(QwenDoubleStreamAttnProcessor2_0)
+class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
+    def __init__(self, attention_kwargs=None):
+        super().__init__()
+        self.attention_kwargs = attention_kwargs if attention_kwargs is not None else {}
+        self.use_long_ctx_attn_kvcache = HAS_LONG_CTX_ATTN and _SP and get_sequence_parallel_world_size() > 1
+
     def __call__(
         self,
         attn,
@@ -51,8 +82,11 @@ class xFuserQwenDoubleStreamAttnProcessor:
         encoder_hidden_states_mask: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        latte_temporal_attention: bool = False,
     ) -> torch.FloatTensor:
+        del latte_temporal_attention
         seq_txt = encoder_hidden_states.shape[1]
+        seq_img = hidden_states.shape[1]
 
         # Compute QKV for image stream (sample projections)
         img_query = attn.to_q(hidden_states)
@@ -105,28 +139,141 @@ class xFuserQwenDoubleStreamAttnProcessor:
                 txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
                 txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
 
-        # Concatenate for joint attention
-        # Order: [text, image]
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+        uses_pipefusion = runtime_state_is_initialized() and get_runtime_state().num_pipeline_patch > 1
+        reordered_padding = False
+        if uses_pipefusion:
+            if self.use_long_ctx_attn_kvcache:
+                raise RuntimeError("Qwen Image PipeFusion does not support sequence parallel attention.")
+            img_key, img_value = get_cache_manager().update_and_get_kv_cache(
+                new_kv=[img_key, img_value],
+                layer=attn,
+                slice_dim=1,
+                layer_type="attn",
+            )
+            if attention_mask is None and encoder_hidden_states_mask is not None:
+                image_mask = torch.ones(
+                    (hidden_states.shape[0], img_key.shape[1]),
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            if attention_mask is not None and attention_mask.ndim == 2:
+                attention_mask = attention_mask[:, None, None, :]
 
-        joint_hidden_states = USP(
-            joint_query.transpose(1, 2),
-            joint_key.transpose(1, 2),
-            joint_value.transpose(1, 2),
-            dropout_p=0.0,
-            is_causal=False,
-            attn_layer=attn,
-        ).transpose(1, 2)
+            # Text QKV is always recomputed; only image K/V participates in
+            # PipeFusion's patch cache.
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
+            query, key, value = (tensor.transpose(1, 2) for tensor in (joint_query, joint_key, joint_value))
+            attention_kwargs = {"attn_mask": attention_mask} if attention_mask is not None else None
+            joint_hidden_states = USP(
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                is_causal=False,
+                backend=masked_attention_backend(query, key, value, attention_kwargs),
+                attention_kwargs=attention_kwargs,
+                attn_layer=None,
+                head_balance_layer=attn,
+            ).transpose(1, 2)
+            joint_dtype = img_query.dtype
+        elif self.attention_kwargs.get("replicated_prompt_tokens"):
+            # Tiny sequences can have padding on several ranks. Keep their prompt
+            # as joint tokens so the image padding remains globally trailing.
+            joint_hidden_states = USP(
+                img_query.transpose(1, 2),
+                img_key.transpose(1, 2),
+                img_value.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=False,
+                joint_query=txt_query.transpose(1, 2),
+                joint_key=txt_key.transpose(1, 2),
+                joint_value=txt_value.transpose(1, 2),
+                joint_strategy="front",
+                attn_layer=attn,
+                attention_kwargs=self.attention_kwargs,
+            ).transpose(1, 2)
+            joint_dtype = img_query.dtype
+        elif self.attention_kwargs.get("sharded_padding"):
+            # Keep both streams sharded and move only their local pad rows behind
+            # their real rows. Since ordinary SP padding lives on the last rank,
+            # the gathered order is [... real image, real text, image pad, text
+            # pad], so USP can trim all padding while Q/K/V retain equal shapes.
+            image_pad_rows = self.attention_kwargs["local_image_pad_rows"]
+            text_pad_rows = self.attention_kwargs["local_text_pad_rows"]
+
+            def real_and_pad(tensor, pad_rows):
+                if not pad_rows:
+                    return tensor, tensor[:, :0]
+                return tensor[:, :-pad_rows], tensor[:, -pad_rows:]
+
+            img_q_real, img_q_pad = real_and_pad(img_query, image_pad_rows)
+            img_k_real, img_k_pad = real_and_pad(img_key, image_pad_rows)
+            img_v_real, img_v_pad = real_and_pad(img_value, image_pad_rows)
+            txt_q_real, txt_q_pad = real_and_pad(txt_query, text_pad_rows)
+            txt_k_real, txt_k_pad = real_and_pad(txt_key, text_pad_rows)
+            txt_v_real, txt_v_pad = real_and_pad(txt_value, text_pad_rows)
+            joint_query = torch.cat([img_q_real, txt_q_real, img_q_pad, txt_q_pad], dim=1)
+            joint_key = torch.cat([img_k_real, txt_k_real, img_k_pad, txt_k_pad], dim=1)
+            joint_value = torch.cat([img_v_real, txt_v_real, img_v_pad, txt_v_pad], dim=1)
+            joint_hidden_states = USP(
+                joint_query.transpose(1, 2),
+                joint_key.transpose(1, 2),
+                joint_value.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=False,
+                attn_layer=attn,
+                attention_kwargs=self.attention_kwargs,
+            ).transpose(1, 2)
+            joint_dtype = joint_query.dtype
+            reordered_padding = True
+        else:
+            # Concatenate for joint attention
+            # Order: [text, image]. Each rank holds [text shard, image shard], and
+            # only the last rank's image shard ends with padding, so the gathered
+            # keys end with it too.
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
+
+            joint_hidden_states = USP(
+                joint_query.transpose(1, 2),
+                joint_key.transpose(1, 2),
+                joint_value.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=False,
+                attn_layer=attn,
+                attention_kwargs=self.attention_kwargs,
+            ).transpose(1, 2)
+            joint_dtype = joint_query.dtype
 
         # Reshape back
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
-        joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
+        joint_hidden_states = joint_hidden_states.to(joint_dtype)
 
         # Split attention outputs back
-        txt_attn_output = joint_hidden_states[:, :seq_txt, :]  # Text part
-        img_attn_output = joint_hidden_states[:, seq_txt:, :]  # Image part
+        if reordered_padding:
+            real_img = seq_img - image_pad_rows
+            real_txt = seq_txt - text_pad_rows
+            img_attn_output = torch.cat(
+                [
+                    joint_hidden_states[:, :real_img],
+                    joint_hidden_states[:, real_img + real_txt : real_img + real_txt + image_pad_rows],
+                ],
+                dim=1,
+            )
+            txt_attn_output = torch.cat(
+                [
+                    joint_hidden_states[:, real_img : real_img + real_txt],
+                    joint_hidden_states[:, real_img + real_txt + image_pad_rows :],
+                ],
+                dim=1,
+            )
+        else:
+            txt_attn_output = joint_hidden_states[:, :seq_txt, :]  # Text part
+            img_attn_output = joint_hidden_states[:, seq_txt:, :]  # Image part
 
         # Apply output projections
         img_attn_output = attn.to_out[0](img_attn_output.contiguous())
@@ -169,9 +316,21 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
             use_layer3d_rope=use_layer3d_rope,
         )
 
+        self._self_attn_kwargs = {
+            "valid_kv_len": None,
+            "replicated_prompt_tokens": 0,
+            "sharded_padding": False,
+            "local_image_pad_rows": 0,
+            "local_text_pad_rows": 0,
+        }
+        self._sp_pad = {"local_rows": 0}
+        self._text_sp_pad = {"local_rows": 0}
         for block in self.transformer_blocks:
-            block.attn.processor = xFuserQwenDoubleStreamAttnProcessor()
-        register_fp8_comms_eligible_modules(self, [block.attn for block in self.transformer_blocks])
+            block.attn.processor = xFuserQwenDoubleStreamAttnProcessor(self._self_attn_kwargs)
+            # Qwen returns (encoder, image); each stream tracks its own SP pad.
+            block.register_forward_hook(zero_sp_pad_rows_hook(self._sp_pad, index=1))
+            block.register_forward_hook(zero_sp_pad_rows_hook(self._text_sp_pad, index=0))
+        register_fp8_comms_eligible_modules(self, qwen_attn_modules(self))
 
     def forward(
         self,
@@ -189,6 +348,33 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         sp_world_rank = get_sequence_parallel_rank()
         sp_world_size = get_sequence_parallel_world_size()
+
+        image_seq_len = hidden_states.shape[1]
+        full_text_seq_len = encoder_hidden_states.shape[1]
+        pad_amount = (sp_world_size - (image_seq_len % sp_world_size)) % sp_world_size
+        local_image_len = (image_seq_len + pad_amount) // sp_world_size
+        text_pad_amount = (sp_world_size - (full_text_seq_len % sp_world_size)) % sp_world_size
+        # Local reordering makes both streams' ordinary last-rank padding
+        # globally trailing. Replicate the prompt only for tiny sequences whose
+        # padding occupies more than one rank.
+        replicated_text = sp_pad_spans_ranks(image_seq_len, sp_world_size) or sp_pad_spans_ranks(
+            full_text_seq_len, sp_world_size
+        )
+        if replicated_text and get_runtime_state().fp8_comms is not None:
+            # The replicated prompt joins attention as joint tokens, which FP8
+            # communication does not handle: it would silently fall back to bf16.
+            if full_text_seq_len % sp_world_size != 0:
+                reason = (
+                    f"the prompt length ({full_text_seq_len} tokens) to be divisible by "
+                    f"the sequence parallel degree ({sp_world_size}). Change the prompt, "
+                    "--max_sequence_length or the parallel degrees"
+                )
+            else:
+                reason = (
+                    f"an image whose padding fits in one shard (got {image_seq_len} tokens at "
+                    f"sequence parallel degree {sp_world_size}). Use a larger image or smaller parallel degrees"
+                )
+            raise ValueError(f"--use_fp8_comms needs {reason}, or drop --use_fp8_comms.")
 
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -233,16 +419,38 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
 
         image_rotary_emb = self.pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device)
 
-        pad_amount = (sp_world_size - (hidden_states.shape[1] % sp_world_size)) % sp_world_size
-        encoder_pad_amount = (sp_world_size - (encoder_hidden_states.shape[1] % sp_world_size)) % sp_world_size
         hidden_states = chunk_and_pad_sequence(hidden_states, sp_world_rank, sp_world_size, pad_amount, dim=1)
-        encoder_hidden_states = chunk_and_pad_sequence(
-            encoder_hidden_states, sp_world_rank, sp_world_size, encoder_pad_amount, dim=1
+        valid_kv_len = image_seq_len if replicated_text else image_seq_len + full_text_seq_len
+        self._self_attn_kwargs["valid_kv_len"] = valid_kv_len if pad_amount or text_pad_amount else None
+        self._self_attn_kwargs["replicated_prompt_tokens"] = full_text_seq_len if replicated_text else 0
+        self._self_attn_kwargs["sharded_padding"] = not replicated_text and bool(pad_amount or text_pad_amount)
+        self._sp_pad["local_rows"] = local_sp_pad_rows(image_seq_len, local_image_len, sp_world_rank)
+        local_text_len = (full_text_seq_len + text_pad_amount) // sp_world_size
+        self._text_sp_pad["local_rows"] = (
+            local_sp_pad_rows(full_text_seq_len, local_text_len, sp_world_rank) if not replicated_text else 0
         )
+        self._self_attn_kwargs["local_image_pad_rows"] = self._sp_pad["local_rows"]
+        self._self_attn_kwargs["local_text_pad_rows"] = self._text_sp_pad["local_rows"]
+        txt_freqs = image_rotary_emb[1]
+        if not replicated_text:
+            encoder_hidden_states = chunk_and_pad_sequence(
+                encoder_hidden_states,
+                sp_world_rank,
+                sp_world_size,
+                text_pad_amount,
+                dim=1,
+            )
+            txt_freqs = chunk_and_pad_sequence(
+                txt_freqs,
+                sp_world_rank,
+                sp_world_size,
+                text_pad_amount,
+                dim=0,
+            )
 
         image_rotary_emb = [
             chunk_and_pad_sequence(image_rotary_emb[0], sp_world_rank, sp_world_size, pad_amount, dim=0),
-            chunk_and_pad_sequence(image_rotary_emb[1], sp_world_rank, sp_world_size, encoder_pad_amount, dim=0),
+            txt_freqs,
         ]
 
         # Construct joint attention mask once to avoid reconstructing in every block
@@ -284,6 +492,11 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
                 interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
                 interval_control = int(np.ceil(interval_control))
                 hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
+                # The pad-row hook ran before this residual was added, and the controlnet
+                # output is not zero on the pad rows: clear them again.
+                local_pad_rows = self._sp_pad["local_rows"]
+                if local_pad_rows:
+                    hidden_states[:, -local_pad_rows:] = 0
 
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
@@ -300,4 +513,145 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
         if not return_dict:
             return (output,)
 
+        return Transformer2DModelOutput(sample=output)
+
+
+def qwen_attn_modules(transformer) -> list[torch.nn.Module]:
+    return [block.attn for block in transformer.transformer_blocks]
+
+
+@xFuserTransformerWrappersRegister.register(QwenImageTransformer2DModel)
+class xFuserQwenImageTransformer2DWrapper(xFuserTransformerBaseWrapper):
+    """Stage-local Qwen Image backbone for generic PipeFusion schedules."""
+
+    def __init__(self, transformer: QwenImageTransformer2DModel):
+        super().__init__(
+            transformer=transformer,
+            submodule_name_to_wrap=["attn"],
+            transformer_blocks_name=["transformer_blocks"],
+        )
+        register_fp8_comms_eligible_modules(self, qwen_attn_modules(self))
+
+    def pipefusion_compile_capture_forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        *args,
+        return_dict=True,
+        **kwargs,
+    ):
+        if is_pipeline_first_stage():
+            hidden_states = hidden_states.new_zeros((*hidden_states.shape[:-1], self.img_in.out_features))
+            encoder_hidden_states = encoder_hidden_states.new_zeros(
+                (*encoder_hidden_states.shape[:-1], self.txt_in.out_features)
+            )
+        if is_pipeline_last_stage():
+            hidden_states = hidden_states.new_zeros((*hidden_states.shape[:-1], self.proj_out.out_features))
+            output = (hidden_states, None)
+        else:
+            output = (hidden_states, encoder_hidden_states)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        txt_seq_lens: Optional[List[int]] = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples=None,
+        additional_t_cond=None,
+        return_dict: bool = True,
+    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        del txt_seq_lens
+        if attention_kwargs is not None:
+            attention_kwargs = attention_kwargs.copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
+
+        if USE_PEFT_BACKEND:
+            scale_lora_layers(self, lora_scale)
+
+        if is_pipeline_first_stage():
+            hidden_states = self.img_in(hidden_states)
+            encoder_hidden_states = self.txt_in(self.txt_norm(encoder_hidden_states))
+
+        timestep = timestep.to(hidden_states.dtype)
+        if self.zero_cond_t:
+            timestep = torch.cat([timestep, timestep * 0], dim=0)
+            modulate_index = torch.tensor(
+                [[0] * prod(sample[0]) + [1] * sum(prod(shape) for shape in sample[1:]) for sample in img_shapes],
+                device=timestep.device,
+                dtype=torch.int,
+            )
+        else:
+            modulate_index = None
+
+        text_seq_len, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
+            encoder_hidden_states, encoder_hidden_states_mask
+        )
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+        temb = (
+            self.time_text_embed(timestep, hidden_states, additional_t_cond)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
+        )
+        if image_rotary_emb is None:
+            image_rotary_emb = self.pos_embed(
+                img_shapes,
+                max_txt_seq_len=text_seq_len,
+                device=hidden_states.device,
+            )
+
+        block_attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
+        if encoder_hidden_states_mask is not None:
+            sample_shapes = img_shapes if isinstance(img_shapes[0], tuple) else img_shapes[0]
+            image_seq_len = sum(prod(shape) for shape in sample_shapes)
+            image_mask = torch.ones(
+                (hidden_states.shape[0], image_seq_len),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            block_attention_kwargs["attention_mask"] = torch.cat(
+                (encoder_hidden_states_mask, image_mask),
+                dim=1,
+            )
+
+        for index_block, block in enumerate(self.transformer_blocks):
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=None,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=block_attention_kwargs,
+                modulate_index=modulate_index,
+            )
+            if controlnet_block_samples is not None:
+                total_blocks = self.config.num_layers
+                interval_control = int(np.ceil(total_blocks / len(controlnet_block_samples)))
+                global_index = getattr(block, "_xfuser_checkpoint_block_index", index_block)
+                hidden_states = hidden_states + controlnet_block_samples[global_index // interval_control]
+
+        if self.zero_cond_t:
+            temb = temb.chunk(2, dim=0)[0]
+
+        if is_pipeline_last_stage():
+            hidden_states = self.norm_out(hidden_states, temb)
+            output = (self.proj_out(hidden_states), None)
+        else:
+            output = (hidden_states, encoder_hidden_states)
+
+        if USE_PEFT_BACKEND:
+            unscale_lora_layers(self, lora_scale)
+        if not return_dict:
+            return (output,)
         return Transformer2DModelOutput(sample=output)

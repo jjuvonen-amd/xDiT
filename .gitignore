@@ -10,6 +10,8 @@ profile/
 xfuser.egg-info/
 xfuser/__version__.py
 dist/*
+site/
+.venv-docs/
 *.mp4
 
 # SDMA transport built into the package (xfuser/model_executor/layers/sdma_build.py)

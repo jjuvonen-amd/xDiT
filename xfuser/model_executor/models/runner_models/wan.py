@@ -74,6 +74,7 @@ def _build_attention_kwargs(config: "xFuserArgs") -> dict:
         "spargeattn_cdfthreshold": config.spargeattn_cdfthreshold,
         "spargeattn_reorder_sequence": config.spargeattn_reorder_sequence,
         "use_spargeattn_static_block_mask": config.use_spargeattn_static_block_mask,
+        "solattn_beta": config.solattn_beta,
         "vsa_block_size": config.vsa_block_size,
         "vsa_top_k": config.vsa_top_k,
         "vsa_top_k_ratio": config.vsa_top_k_ratio,
@@ -191,9 +192,11 @@ class xFuserWan21I2VModel(xFuserWanModel):
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_step_caching=True,
+        supports_attention_a2a=True,
     )
     default_input_values = DefaultInputValues(
         height=720,
@@ -464,6 +467,7 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_distilled_weights=True,
@@ -623,6 +627,7 @@ class xFuserWan21T2VModel(xFuserWanModel):
         use_parallel_vae=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
     )
@@ -649,6 +654,7 @@ class xFuserWan21T2VModel(xFuserWanModel):
         use_parallel_vae=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_step_caching=True,
@@ -783,7 +789,12 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
     )
 
     # See xFuserWan22I2VModel: "fbcache" == DBCache first-block (Fn_compute_blocks=1).
-    capabilities = replace(xFuserWan21T2VModel.capabilities, use_fp8_comms=True, tensor_parallel_degree=True)
+    capabilities = replace(
+        xFuserWan21T2VModel.capabilities,
+        use_fp8_comms=True,
+        supports_attention_a2a=True,
+        tensor_parallel_degree=True,
+    )
 
     def _validate_config(self, config: xFuserArgs) -> None:
         super()._validate_config(config)
@@ -972,6 +983,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         use_parallel_vae_encoder=True,
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
+        supports_sol_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
         supports_step_caching=True,

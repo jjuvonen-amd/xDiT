@@ -11,6 +11,40 @@ from xfuser.model_executor.layers import usp
 from xfuser.model_executor.layers.attention_mask import make_attn_mask_with_meta
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@mock.patch("xfuser.model_executor.layers.usp.attention_registry.find")
+@mock.patch("xfuser.model_executor.layers.usp._compile_capture_bypasses_attention", return_value=True)
+def test_compile_capture_bypasses_attention_backend(bypass, find, dtype):
+    query = torch.randn(1, 4, 8, 16, dtype=dtype)
+
+    output = usp.attention(query, query, query, backend=object())
+
+    torch.testing.assert_close(output, torch.zeros_like(query))
+    assert output.dtype == dtype
+    bypass.assert_called_once()
+    find.assert_not_called()
+
+
+@mock.patch("xfuser.model_executor.layers.usp._compile_capture_bypasses_attention", return_value=True)
+def test_compile_capture_bypass_preserves_joint_output_shape(bypass):
+    query = torch.randn(1, 4, 8, 16)
+    joint_query = torch.randn(1, 4, 3, 16)
+
+    output = usp.USP(
+        query,
+        query,
+        query,
+        joint_query=joint_query,
+        joint_key=joint_query,
+        joint_value=joint_query,
+        joint_strategy="front",
+    )
+
+    assert output.shape == (1, 4, 11, 16)
+    assert output.dtype == query.dtype
+    bypass.assert_called_once()
+
+
 @mock.patch("xfuser.model_executor.layers.usp.get_cache_manager")
 def test_cache_update_requires_registered_layer(get_cache_manager):
     cache_manager = get_cache_manager.return_value
@@ -205,7 +239,7 @@ def usp_kv_lens(monkeypatch):
     runtime_state = SimpleNamespace(
         fp8_comms=None,
         attention_backend=AttentionBackendType.SDPA,
-        runtime_config=SimpleNamespace(use_spargeattn_head_balance=False),
+        runtime_config=SimpleNamespace(use_sparseattn_head_balance=False),
     )
     monkeypatch.setattr(usp, "get_runtime_state", lambda: runtime_state)
     for degree in ("sequence", "ulysses", "ring"):
@@ -239,6 +273,13 @@ def _padded_qkv():
             False,
             _PADDED_LEN,
             id="vsa-strips-it",
+        ),
+        pytest.param(
+            {"valid_kv_len": _REAL_LEN, "thw": (3, 3, 5), "encoder_sp_padding": 1},
+            AttentionBackendType.FLEX_BLOCK_ATTN,
+            False,
+            _PADDED_LEN,
+            id="ssta-strips-it",
         ),
         pytest.param(
             {"valid_kv_len": _REAL_LEN, "thw": None},
@@ -289,3 +330,133 @@ def test_usp_refuses_packed_keys_together_with_ring_attention(ring_of_two):
     }
     with pytest.raises(ValueError, match="valid_kv_len must be in"):
         usp.USP(*local, attention_kwargs=attention_kwargs)
+
+
+def _joint(length=3):
+    return {name: torch.randn(1, 2, length, 8) for name in ("joint_query", "joint_key", "joint_value")}
+
+
+def _vsa_like_function(seen):
+    """An attention function whose kernel crops K to `valid_kv_len` as AITER_VSA's dense fallback does."""
+
+    def kernel(query, key, value, call):
+        valid = call.attention_kwargs.get("valid_kv_len")
+        if valid is not None and valid < key.shape[2]:
+            key, value = key[:, :, :valid], value[:, :, :valid]
+        seen.append(key.shape[2])
+        return _attention_with_lse(query, key, value)
+
+    spec = Spec(AttentionBackendType.SDPA, impl=kernel, ring=ALWAYS, accepts=ANY_CALL, requires=ALWAYS)
+    return usp.concat_joint_tensors_decorator(usp._spec_adapter(spec))
+
+
+@pytest.mark.parametrize("strategy", ["front", "rear"])
+def test_usp_publishes_no_pad_length_for_the_keys_joined_after_the_trim(monkeypatch, usp_kv_lens, strategy):
+    # The declared length counts the main keys only. Left in the kwargs, a backend that crops K to it
+    # (the dense fallback of AITER_VSA) would cut the joint tokens' keys off again.
+    seen = []
+    monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: 0)
+    monkeypatch.setattr(usp, "_get_attention_function", lambda backend=None: _vsa_like_function(seen))
+    attention_kwargs = {"valid_kv_len": _REAL_LEN}
+
+    usp.USP(*_padded_qkv(), joint_strategy=strategy, **_joint(), attention_kwargs=attention_kwargs)
+
+    assert seen == [_REAL_LEN + 3]
+    # The wrapper-owned dict keeps its declaration for the next layer.
+    assert attention_kwargs == {"valid_kv_len": _REAL_LEN}
+
+
+@pytest.mark.parametrize(
+    "attention_kwargs, backend, is_causal",
+    [
+        pytest.param({"valid_kv_len": _REAL_LEN}, AttentionBackendType.SDPA, True, id="causal"),
+        pytest.param(
+            {"valid_kv_len": _REAL_LEN, "indices_k": torch.arange(_REAL_LEN)},
+            AttentionBackendType.SDPA,
+            False,
+            id="packed-keys",
+        ),
+        pytest.param(
+            {"valid_kv_len": _REAL_LEN, "thw": (3, 3, 5)}, AttentionBackendType.AITER_SPARGE, False, id="sparge"
+        ),
+        pytest.param({"valid_kv_len": _REAL_LEN, "thw": (3, 3, 5)}, AttentionBackendType.AITER_VSA, False, id="vsa"),
+        pytest.param(
+            {"valid_kv_len": _REAL_LEN, "thw": (3, 3, 5)}, AttentionBackendType.FLEX_BLOCK_ATTN, False, id="ssta"
+        ),
+    ],
+)
+def test_usp_refuses_a_declared_pad_with_joint_tensors_where_the_backend_would_keep_it(
+    monkeypatch, usp_kv_lens, attention_kwargs, backend, is_causal
+):
+    monkeypatch.setattr(usp, "get_ulysses_parallel_rank", lambda: 0)
+    with pytest.raises(NotImplementedError, match="valid_kv_len cannot be combined with joint tensors"):
+        usp.USP(
+            *_padded_qkv(),
+            is_causal=is_causal,
+            joint_strategy="front",
+            **_joint(),
+            backend=backend,
+            attention_kwargs=attention_kwargs,
+        )
+
+
+@pytest.mark.parametrize("route", ["native", "fallback", "override"])
+@pytest.mark.parametrize("additive", [False, True])
+def test_dense_mask_preserves_output_and_backend_selection(route, additive):
+    from xfuser.core.attention import registry
+    from xfuser.core.attention.backends.sdpa.kernel import sdpa
+    from xfuser.core.attention.spec import AttnCall
+
+    query = torch.zeros(1, 1, 1, 8)
+    key = torch.zeros(1, 1, 2, 8)
+    value = torch.stack([torch.ones(8), torch.full((8,), 100.0)]).view(1, 1, 2, 8)
+    mask = torch.tensor([[[[0.0, float("-inf")]]]]) if additive else torch.tensor([[[[True, False]]]])
+    kwargs = {"attn_mask": mask}
+    capable = Spec(
+        AttentionBackendType.SDPA, impl=sdpa, accepts=ANY_CALL, requires=ALWAYS, ring=ALWAYS, applies_attn_mask=True
+    )
+    selected = Spec(
+        AttentionBackendType.AITER_BF16,
+        impl=sdpa,
+        accepts=ANY_CALL,
+        requires=ALWAYS,
+        ring=ALWAYS,
+        applies_attn_mask=route == "native",
+        fallback=AttentionBackendType.SDPA if route == "fallback" else None,
+    )
+    with registry.using([capable, selected]):
+        backend = usp.masked_attention_backend(query, key, value, kwargs, backend=selected.type)
+        assert backend == (capable.type if route == "override" else selected.type)
+        output, _ = registry.get(backend).run(query, key, value, AttnCall(attention_kwargs=kwargs))
+        torch.testing.assert_close(output, torch.ones_like(query))
+        if route == "override":
+            with pytest.raises(NotImplementedError, match="does not apply attn_mask"):
+                registry.get(selected.type).run(query, key, value, AttnCall(attention_kwargs=kwargs))
+
+
+@pytest.mark.parametrize("unsafe", ["query", "key", "value", "pre_quantized", "q_descale", "k_descale", "v_descale"])
+def test_dense_mask_refuses_unsafe_sdpa_override(monkeypatch, unsafe):
+    query, key, value = (torch.zeros(1, 1, 2, 8) for _ in range(3))
+    tensors = [query, key, value]
+    kwargs = {"attn_mask": torch.tensor([True, False])}
+    if unsafe in ("query", "key", "value"):
+        tensors[("query", "key", "value").index(unsafe)] = tensors[0].to(torch.float8_e4m3fn)
+    else:
+        kwargs[unsafe] = True if unsafe == "pre_quantized" else torch.ones(1)
+    with pytest.raises(NotImplementedError, match="prequantized"):
+        usp.masked_attention_backend(*tensors, kwargs, backend=AttentionBackendType.AITER_FLYDSL_FP8)
+
+
+def test_usp_refuses_a_masked_sdpa_override_before_ring_exchange(monkeypatch):
+    state = SimpleNamespace(attention_backend=AttentionBackendType.AITER_FLYDSL_FP8)
+    monkeypatch.setattr(usp, "get_runtime_state", lambda: state)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(usp, "get_ring_parallel_world_size", lambda: 2)
+    query = torch.zeros(1, 1, 2, 8)
+    kwargs = {"attn_mask": torch.tensor([True, False])}
+    backend = usp.masked_attention_backend(query, query, query, kwargs)
+    with mock.patch.object(usp, "ring_attn") as exchange, mock.patch.object(usp, "fp8_attention_kwargs") as quantize:
+        with pytest.raises(NotImplementedError, match="SDPA cannot be used with ring parallelism"):
+            usp.USP(query, query, query, backend=backend, attention_kwargs=kwargs)
+    exchange.assert_not_called()
+    quantize.assert_not_called()

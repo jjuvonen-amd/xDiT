@@ -30,7 +30,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # used in distributed environment to determine the master address
     "MASTER_ADDR": lambda: os.getenv("MASTER_ADDR", ""),
     # used in distributed environment to manually set the communication port
-    "MASTER_PORT": lambda: (int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None),
+    "MASTER_PORT": lambda: int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None,
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
     "CUDA_HOME": lambda: os.environ.get("CUDA_HOME", None),
@@ -93,9 +93,16 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_TP_SDMA_ON_TIMEOUT": lambda: os.environ.get("XDIT_TP_SDMA_ON_TIMEOUT", "abort"),
     # For sdma: run on a GPU architecture it has not been validated on (see sdma_all_gather.py).
     "XDIT_TP_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_TP_SDMA_ALLOW_UNTESTED", "0"),
-    # For sdma: a prebuilt transport library (python -m xfuser.model_executor.layers.sdma_all_gather
-    # build); unset, it is built with hipcc on first use and cached.
+    # For sdma: a prebuilt TP all-gather library (python xfuser/model_executor/layers/sdma_build.py
+    # --out DIR); unset, it is built with hipcc on first use and cached. (XDIT_SDMA_LIB below is the
+    # Ulysses transport's library.)
+    "XDIT_TP_SDMA_LIB": lambda: os.environ.get("XDIT_TP_SDMA_LIB", ""),
+    # SDMA transport (xfuser/core/distributed/sdma): a prebuilt library to load instead of building
+    # transport.hip on first use; how long a flag wait may take before the process aborts with a log
+    # of what was missing; and whether to run on GPU architectures the transport is not validated on.
     "XDIT_SDMA_LIB": lambda: os.environ.get("XDIT_SDMA_LIB", ""),
+    "XDIT_SDMA_WAIT_S": lambda: os.environ.get("XDIT_SDMA_WAIT_S", "30"),
+    "XDIT_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_SDMA_ALLOW_UNTESTED", "0"),
 }
 
 
@@ -258,7 +265,7 @@ class PackagesEnvChecker:
         """
         if not torch.cuda.is_available():
             return False
-        if not self._on_mi3xx() and not self._on_rdna4():
+        if not self._on_mi3xx() and not self._on_rdna4() and not self._on_gfx1250():
             return False
         try:
             import aiter
@@ -427,39 +434,43 @@ class PackagesEnvChecker:
         gcn_arch_name = torch.cuda.get_device_properties(device).gcnArchName
         return any(arch in gcn_arch_name for arch in ["gfx1200", "gfx1201"])
 
+    def _on_gfx1250(self):
+        device = torch.cuda.current_device()
+        gcn_arch_name = torch.cuda.get_device_properties(device).gcnArchName
+        return "gfx1250" in gcn_arch_name
+
 
 PACKAGES_CHECKER = PackagesEnvChecker()
 _TORCH_GROUPNORM = torch.nn.GroupNorm
 
 
-def restore_torch_group_norm_for_distvae() -> bool:
-    """Restore torch GroupNorm when xDiT's ROCm setup replaced it with AITER's.
+def bind_group_norm(use_aiter: bool) -> None:
+    """Bind the GroupNorm class that the modules built after this one use.
 
-    DistVAE discovers norms to shard by their torch type. This must run before a VAE intended
-    for sharding is built, while xDiT is still validating its environment.
+    AITER's kernel is the faster of the two run eagerly, so a run takes it
+    unless it needs the torch class: DistVAE identifies the layers to shard by
+    that type, and AITER's is an opaque custom op that Inductor cannot fuse
+    across.  A caller settles this before it builds its model, because rebinding
+    the class leaves the modules that exist already on the implementation they
+    were built with.
+
+    Asking for AITER off ROCm, or without AITER installed, keeps torch's.
     """
-    if torch.nn.GroupNorm.__module__ != "aiter.ops.groupnorm":
-        return False
-    torch.nn.GroupNorm = _TORCH_GROUPNORM
-    return True
-
-
-def _setup_rocm_libraries():
-    if PACKAGES_CHECKER.packages_info.get("has_aiter", False):
-        try:
-            from aiter.ops.groupnorm import GroupNorm
-
-            torch.nn.GroupNorm = GroupNorm
-            logger.info("Using AITER GroupNorm as torch.nn.GroupNorm")
-        except ImportError:
-            logger.warning(
-                "Using AITER but AITER GroupNorm is not available, please update AITER. "
-                "Defaulting to torch GroupNorm implementation"
-            )
-
-
-if _is_hip():
-    _setup_rocm_libraries()
+    if not use_aiter:
+        torch.nn.GroupNorm = _TORCH_GROUPNORM
+        return
+    if not _is_hip() or not PACKAGES_CHECKER.packages_info.get("has_aiter", False):
+        return
+    try:
+        from aiter.ops.groupnorm import GroupNorm
+    except ImportError:
+        logger.warning(
+            "Using AITER but AITER GroupNorm is not available, please update AITER. "
+            "Defaulting to torch GroupNorm implementation"
+        )
+        return
+    torch.nn.GroupNorm = GroupNorm
+    logger.info("Using AITER GroupNorm as torch.nn.GroupNorm")
 
 
 def __getattr__(name):

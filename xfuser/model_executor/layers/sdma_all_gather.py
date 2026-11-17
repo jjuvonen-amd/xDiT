@@ -51,7 +51,7 @@ Any batch size: every batch item's piece c moves with the others, and each
 (piece, peer) flag waits for all of them.
 
 The transport (sdma_all_gather.hip) is a small library loaded with ctypes,
-from the first of: XDIT_SDMA_LIB; a library built into this package's directory
+from the first of: XDIT_TP_SDMA_LIB; a library built into this package's directory
 from the current source (`python xfuser/model_executor/layers/sdma_build.py
 --out <this directory>`, for image builds: no GPU and no xfuser import needed);
 a library built with hipcc for this GPU on first use and cached. The ops run on the GPU architectures in VALIDATED_ARCHS; others
@@ -118,11 +118,11 @@ def _arch() -> str:
 
 
 def _library_path() -> Path:
-    """XDIT_SDMA_LIB if set; else a library built for this GPU, cached by source, arch and HIP version."""
-    prebuilt = _env("XDIT_SDMA_LIB")
+    """XDIT_TP_SDMA_LIB if set; else a library built for this GPU, cached by source, arch and HIP version."""
+    prebuilt = _env("XDIT_TP_SDMA_LIB")
     if prebuilt:
         if not Path(prebuilt).is_file():
-            raise RuntimeError(f"XDIT_SDMA_LIB={prebuilt} is not a file")
+            raise RuntimeError(f"XDIT_TP_SDMA_LIB={prebuilt} is not a file")
         return Path(prebuilt)
     packaged = SOURCE.with_name(LIB_NAME)
     stamp = SOURCE.with_name(LIB_NAME + ".source-sha1")

@@ -1,3 +1,5 @@
+import math
+
 import torch
 from typing import Optional, Union, Dict, Any, Tuple
 
@@ -10,6 +12,15 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from xfuser.model_executor.layers.usp import (
     USP,
     attention,
+    usp_fused_a2a_input_k,
+    usp_fused_a2a_input_q,
+    usp_fused_a2a_input_v,
+)
+from xfuser.core.distributed.attention_a2a import (
+    fused_a2a_pad_multiple,
+    get_fused_a2a_hadamard_placement,
+    get_fused_a2a_mode,
+    use_fused_a2a_interleave,
 )
 from xfuser.model_executor.layers.tensor_parallel import (
     shard_linear_,
@@ -24,18 +35,24 @@ from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_module
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
+    get_ulysses_parallel_world_size,
+    get_ring_parallel_world_size,
     get_sp_group,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_runtime_state,
 )
 from xfuser.model_executor.layers.attention_processor import xFuserAttentionProcessorRegister
+from xfuser.model_executor.models.transformers.transformers_utils import local_sp_pad_rows, zero_sp_pad_rows_hook
 from xfuser.envs import PACKAGES_CHECKER
 from xfuser.core.vsa_attention import jenga_scheduled_drop_rate
 from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     fused_qk_norm_rope,
+    fused_qk_norm_rope_packed,
+    wan_flydsl_hadamard,
     _HAS_FLYDSL,
 )
+from xfuser.model_executor.layers import usp_sdma
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
@@ -58,7 +75,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         # attention_kwargs is the shared, mutable dict used by sparse backends
         # (SSTA / sparge) to receive layout info like `thw`. Cross-attention and
         # the I2V image-context sub-call below are dense, so they don't read it.
-        self.attention_kwargs = attention_kwargs
+        self.attention_kwargs = attention_kwargs if attention_kwargs is not None else {}
         # Set by xFuserWanTransformer3DWrapper.shard_for_tensor_parallel: the layer
         # holds 1/tp of the heads, and its Q/K norms span all of them. It is then
         # given this rank's rows and gathers them into its Q/K/V projections in
@@ -117,6 +134,28 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # The fused attention all-to-all projects full Q/K/V itself; TP's sharded projections take the standard path.
+        if get_fused_a2a_mode() > 0 and not self.is_cross_attention and not self.tensor_parallel:
+            return self._call_attention_a2a(
+                attn,
+                hidden_states,
+                encoder_hidden_states,
+                rotary_emb,
+            )
+        return self._call_standard(
+            attn,
+            hidden_states,
+            encoder_hidden_states,
+            rotary_emb,
+        )
+
+    def _call_standard(
+        self,
+        attn: "WanAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
         backend = None
         if self.is_cross_attention:
             # We allow specifying a different backend for cross-attention than the main attention backend
@@ -124,13 +163,10 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             backend = get_runtime_state().get_cross_attention_backend()
 
         activation_dtype = hidden_states.dtype
-
-        encoder_hidden_states_img = None
-        if attn.add_k_proj is not None:
-            # 512 is the context length of the text encoder, hardcoded for now
-            image_context_length = encoder_hidden_states.shape[1] - 512
-            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
-            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+        encoder_hidden_states, encoder_hidden_states_img = self._split_i2v_context(
+            attn,
+            encoder_hidden_states,
+        )
         if self.tensor_parallel:
             query, key, value = self._get_tp_qkv_projections(attn, hidden_states, encoder_hidden_states)
         else:
@@ -152,31 +188,25 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query, key, value = self._rope_reference(attn, query, key, value, rotary_emb)
         elif _HAS_FLYDSL and rotary_emb is not None:
             query, key = fused_qk_norm_rope(
-                query, key, attn.norm_q, attn.norm_k, rotary_emb[0], rotary_emb[1], attn.heads
+                query,
+                key,
+                attn.norm_q,
+                attn.norm_k,
+                rotary_emb[0],
+                rotary_emb[1],
+                attn.heads,
             )
             value = value.unflatten(2, (attn.heads, -1))
         else:
             query, key, value = self._qk_norm_rope_reference(attn, query, key, value, rotary_emb)
 
-        # I2V task
-        hidden_states_img = None
-        if encoder_hidden_states_img is not None:
-            key_img, value_img = self._get_added_kv_projections(attn, encoder_hidden_states_img)
-            key_img = attn.norm_added_k(key_img)
-
-            key_img = key_img.unflatten(2, (attn.heads, -1))
-            value_img = value_img.unflatten(2, (attn.heads, -1))
-
-            hidden_states_img = self.attention_function(
-                query.transpose(1, 2),
-                key_img.transpose(1, 2),
-                value_img.transpose(1, 2),
-                backend=backend,
-                attention_kwargs=self.attention_kwargs,
-            ).transpose(1, 2)
-            hidden_states_img = hidden_states_img.flatten(2, 3)
-            hidden_states_img = hidden_states_img.to(activation_dtype)
-
+        hidden_states_img = self._call_i2v_attention(
+            attn,
+            query,
+            encoder_hidden_states_img,
+            backend,
+            activation_dtype,
+        )
         hidden_states = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
@@ -187,6 +217,139 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             attn_layer=None if self.is_cross_attention else attn,
         ).transpose(1, 2)
 
+        return self._finish_attention(
+            attn,
+            hidden_states,
+            activation_dtype,
+            hidden_states_img,
+        )
+
+    def _call_attention_a2a(
+        self,
+        attn: "WanAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        if self.attention_function is not USP:
+            raise RuntimeError("Attention A2A requires USP")
+        if encoder_hidden_states is not None or attn.add_k_proj is not None:
+            raise RuntimeError("Attention A2A supports Wan self-attention only")
+        if rotary_emb is None or not _HAS_FLYDSL:
+            raise RuntimeError("Attention A2A requires the Wan FlyDSL preprocessing path")
+        if get_ulysses_parallel_world_size() <= 1 or get_ring_parallel_world_size() != 1:
+            raise RuntimeError("Attention A2A requires Ulysses-only sequence parallelism")
+        if get_runtime_state().runtime_config.use_sparseattn_head_balance:
+            raise RuntimeError("Attention A2A does not support sparse-attention head balancing")
+
+        activation_dtype = hidden_states.dtype
+        hadamard_placement = get_fused_a2a_hadamard_placement()
+        valid_kv_len = self.attention_kwargs.get("valid_kv_len")
+        pending = None
+        interleave = use_fused_a2a_interleave() and not attn.fused_projections
+
+        if interleave:
+            # Submit each role on the transport stream while the next
+            # projection is still running on the compute stream.
+            query = attn.to_q(hidden_states)
+            query, _ = fused_qk_norm_rope(
+                query,
+                query,
+                attn.norm_q,
+                attn.norm_q,
+                rotary_emb[0],
+                rotary_emb[1],
+                attn.heads,
+                single_role=True,
+                apply_hadamard=hadamard_placement == "preprocess",
+            )
+            if hadamard_placement == "epilogue":
+                query = wan_flydsl_hadamard(query)
+            pending = usp_fused_a2a_input_q(query, valid_kv_len)
+
+            key = attn.to_k(hidden_states)
+            key, _ = fused_qk_norm_rope(
+                key,
+                key,
+                attn.norm_k,
+                attn.norm_k,
+                rotary_emb[0],
+                rotary_emb[1],
+                attn.heads,
+                single_role=True,
+                apply_hadamard=hadamard_placement == "preprocess",
+            )
+            if hadamard_placement == "epilogue":
+                key = wan_flydsl_hadamard(key)
+            pending = usp_fused_a2a_input_k(key, pending, valid_kv_len)
+
+            value = attn.to_v(hidden_states).unflatten(2, (attn.heads, -1))
+            pending = usp_fused_a2a_input_v(value, pending, valid_kv_len)
+        else:
+            query, key, value = self._get_qkv_projections(attn, hidden_states, None)
+            query, key = fused_qk_norm_rope(
+                query,
+                key,
+                attn.norm_q,
+                attn.norm_k,
+                rotary_emb[0],
+                rotary_emb[1],
+                attn.heads,
+                apply_hadamard=hadamard_placement == "preprocess",
+            )
+            if hadamard_placement == "epilogue":
+                query = wan_flydsl_hadamard(query)
+                key = wan_flydsl_hadamard(key)
+            value = value.unflatten(2, (attn.heads, -1))
+
+        output = self.attention_function(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            backend=None,
+            attention_kwargs=self.attention_kwargs,
+            head_balance_layer=attn,
+            attn_layer=attn,
+            attention_a2a_enabled=True,
+            attention_a2a_pending=pending,
+        ).transpose(1, 2)
+        return self._finish_attention(attn, output, activation_dtype)
+
+    @staticmethod
+    def _split_i2v_context(attn, encoder_hidden_states):
+        if attn.add_k_proj is None:
+            return encoder_hidden_states, None
+        # 512 is the context length of the text encoder, hardcoded for now.
+        image_context_length = encoder_hidden_states.shape[1] - 512
+        return (
+            encoder_hidden_states[:, image_context_length:],
+            encoder_hidden_states[:, :image_context_length],
+        )
+
+    def _call_i2v_attention(
+        self,
+        attn,
+        query,
+        encoder_hidden_states_img,
+        backend,
+        activation_dtype,
+    ):
+        if encoder_hidden_states_img is None:
+            return None
+        key_img, value_img = self._get_added_kv_projections(attn, encoder_hidden_states_img)
+        key_img = attn.norm_added_k(key_img)
+        key_img = key_img.unflatten(2, (attn.heads, -1))
+        value_img = value_img.unflatten(2, (attn.heads, -1))
+        output = self.attention_function(
+            query.transpose(1, 2),
+            key_img.transpose(1, 2),
+            value_img.transpose(1, 2),
+            backend=backend,
+            attention_kwargs=self.attention_kwargs,
+        ).transpose(1, 2)
+        return output.flatten(2, 3).to(activation_dtype)
+
+    def _finish_attention(self, attn, hidden_states, activation_dtype, hidden_states_img=None):
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(activation_dtype)
 
@@ -249,44 +412,109 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         return query, key, value
 
 
-def _zero_sp_pad_rows_hook(sp_pad):
-    """Forward hook keeping the SP pad rows of a block's output at zero.
+@usp_sdma.sdma_processor(xFuserWanAttnProcessor)
+class xFuserWanSdmaAttnProcessor(xFuserWanAttnProcessor):
+    """xFuserWanAttnProcessor under --ulysses_a2a sdma --ulysses_sdma_overlap_qkv.
 
-    The pad rows never reach real tokens' attention once USP drops their keys,
-    but what a block writes there still enters statistics taken across the
-    rows of whole local tensors, which then apply to the real rows:
-    - FP8-comms calibration: pad rows set the per-tensor V scale in some layers
-      (measured up to 1.5x coarser for every real token);
-    - the step cache's residual difference;
-    - cross-attention kernels that share a quantization scale across query
-      rows: Sage (256-row Q blocks) and AITER FP8 (one Q scale per tensor).
-    The list spans features and backends, so the zeroing is not gated on them;
-    missing one would fail silently. It only runs on a rank holding pad rows,
-    and costs nothing measurable: under torch.compile it fuses into the block's
-    last pointwise op, eagerly it is ~5 us per block.
-
-    A hook rather than a line in forward's loop, so it also runs when a step
-    cache iterates the blocks itself. A VACE block returns its conditioning
-    states with its control states; both are zeroed, since the conditioning
-    states are added to the main stream as hints.
+    The QK norm spans every head, so Q/K/V cannot be projected one head group at a time.
+    Self-attention instead sends Q and K, normed, rotated and packed peer by peer in one
+    kernel, before V is projected, in one head group (usp_sdma.qk_first_attention). Calls
+    that path does not cover take the base path.
     """
 
-    def hook(module, args, output):
-        rows = sp_pad["local_rows"]
-        if rows:
-            for tensor in output if isinstance(output, tuple) else (output,):
-                if tensor is not None:
-                    tensor[:, -rows:] = 0
+    def sdma_qk_first(self, attn) -> bool:
+        """Whether `attn`'s self-attention can take the path, as far as its modules tell: plain
+        Ulysses self-attention with BF16 nn.Linear projections and nn.RMSNorm QK norms. The
+        call checks the rest (_qk_first_eligible)."""
+        if (
+            self.is_cross_attention
+            or self.attention_function is not USP
+            or attn.add_k_proj is not None
+            or getattr(attn, "fused_projections", False)
+        ):
+            return False
+        linears = (attn.to_q, attn.to_k, attn.to_v)
+        if not all(usp_sdma.plain_linear(m) and m.weight.dtype == torch.bfloat16 for m in linears):
+            return False
+        return all(
+            isinstance(norm, torch.nn.RMSNorm) and norm.weight is not None and norm.weight.dtype == torch.bfloat16
+            for norm in (attn.norm_q, attn.norm_k)
+        )
 
-    return hook
+    def _call_standard(
+        self,
+        attn: "WanAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        if usp_sdma.overlap_qkv() and self._qk_first_eligible(attn, hidden_states, encoder_hidden_states, rotary_emb):
+            output = self._call_qk_first(attn, hidden_states, rotary_emb)
+            if output is not None:
+                return self._finish_attention(attn, output.transpose(1, 2), hidden_states.dtype, None)
+        return super()._call_standard(attn, hidden_states, encoder_hidden_states, rotary_emb)
 
+    def _qk_first_eligible(self, attn, hidden_states, encoder_hidden_states, rotary_emb) -> bool:
+        """Whether this call can send Q/K before V: plain self-attention in inference, batch one and
+        BF16 (the packed norm/RoPE producer's layout), with resident unhooked nn.Linear
+        projections and nn.RMSNorm QK norms."""
+        if (
+            self.is_cross_attention
+            or self.attention_function is not USP
+            or encoder_hidden_states is not None
+            or attn.add_k_proj is not None
+            or rotary_emb is None
+            or torch.is_grad_enabled()
+            or getattr(attn, "fused_projections", False)
+        ):
+            return False
+        if hidden_states.device.type != "cuda" or hidden_states.dtype != torch.bfloat16 or hidden_states.shape[0] != 1:
+            return False
+        linears = (attn.to_q, attn.to_k, attn.to_v)
+        if len({m.weight.shape for m in linears}) != 1 or attn.to_q.weight.shape[0] % attn.heads:
+            return False
+        for module in linears:
+            if (
+                type(module) is not torch.nn.Linear
+                or hasattr(module.weight, "placements")
+                or module.weight.device != hidden_states.device
+                or module.weight.dtype != hidden_states.dtype
+                or module._forward_hooks
+                or module._forward_pre_hooks
+                or hasattr(module, "_hf_hook")
+            ):
+                return False
+        return all(
+            isinstance(norm, torch.nn.RMSNorm) and norm.weight is not None and norm.weight.dtype == hidden_states.dtype
+            for norm in (attn.norm_q, attn.norm_k)
+        )
 
-def _local_sp_pad_rows(seq_len: int, local_len: int, sp_rank: int) -> int:
-    """How many of this rank's `local_len` rows are SP pad, for a real length `seq_len`.
+    def _call_qk_first(self, attn, hidden_states, rotary_emb):
+        """Q/K normed, rotated and packed peer by peer in one kernel, sent; then V. USP's
+        [b, H, s, d], or None if the call cannot take the SDMA path."""
+        from yunchang.globals import PROCESS_GROUP
 
-    The pad trails the global sequence, so only the last ranks' chunks hold any.
-    """
-    return min(local_len, max(0, (sp_rank + 1) * local_len - seq_len))
+        group = PROCESS_GROUP.ULYSSES_PG
+        world = torch.distributed.get_world_size(group)
+
+        def project_qk():
+            query, key = attn.to_q(hidden_states), attn.to_k(hidden_states)
+            return fused_qk_norm_rope_packed(query, key, attn.norm_q, attn.norm_k, *rotary_emb, attn.heads, world)
+
+        def project_v(token):
+            value = torch.ops.xfuser.sdma_ulysses_linear(token, hidden_states, attn.to_v.weight, attn.to_v.bias)
+            return value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+        return usp_sdma.qk_first_attention(
+            hidden_states,
+            project_qk,
+            project_v,
+            heads=attn.heads,
+            head_dim=attn.to_q.weight.shape[0] // attn.heads,
+            backend=None,
+            attention_kwargs=self.attention_kwargs,
+            group=group,
+        )
 
 
 def _local_tp_pad_rows(seq_len: int, sp_rank: int, sp_len: int, tp_rank: int, tp_size: int, chunks: int) -> int:
@@ -430,7 +658,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         # Pad rows of this rank's chunk, set per forward; 0 leaves the blocks untouched.
         self._sp_pad = {"local_rows": 0}
         for block in self.blocks:
-            block.register_forward_hook(_zero_sp_pad_rows_hook(self._sp_pad))
+            block.register_forward_hook(zero_sp_pad_rows_hook(self._sp_pad))
         # Tensor parallelism is on once shard_for_tensor_parallel has split the weights.
         self._tp_size = 1
         self._tp_rank = 0
@@ -613,11 +841,20 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         rows_multiple = sp_world_size * self._tp_size * self._tp_chunks
 
         # Part of sequence parallel: given the resolution, we may need to pad the sequence length to match this prior to chunking
-        pad_amount = (rows_multiple - (hidden_states.shape[1] % rows_multiple)) % rows_multiple
-        # The pad rows' keys get a zero logit (the RoPE tables are zero-padded too)
-        # and would act as an attention sink; USP drops them given the real length.
-        self._self_attn_kwargs["valid_kv_len"] = hidden_states.shape[1] if pad_amount else None
         seq_len = hidden_states.shape[1]
+        attention_a2a_padding = (
+            get_fused_a2a_mode() > 0
+            and get_ulysses_parallel_world_size() > 1
+            and get_ring_parallel_world_size() == 1
+            and not get_runtime_state().runtime_config.use_sparseattn_head_balance
+        )
+        pad_multiple = fused_a2a_pad_multiple(sp_world_size) if attention_a2a_padding else sp_world_size
+        # Under TP the rows must also split into tp_size * tp_chunks blocks per SP rank.
+        pad_multiple = math.lcm(pad_multiple, rows_multiple)
+        pad_amount = (pad_multiple - (seq_len % pad_multiple)) % pad_multiple
+        # Padded keys would act as an attention sink. Publish the real global
+        # length for ordinary USP slicing or direct packed K/V output.
+        self._self_attn_kwargs["valid_kv_len"] = seq_len if pad_amount else None
 
         def split_rows(x):
             x = self._chunk_and_pad_sequence(x, sp_world_rank, sp_world_size, pad_amount, dim=1)
@@ -632,7 +869,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 seq_len, sp_world_rank, sp_len, self._tp_rank, self._tp_size, self._tp_chunks
             )
         else:
-            self._sp_pad["local_rows"] = _local_sp_pad_rows(seq_len, hidden_states.shape[1], sp_world_rank)
+            self._sp_pad["local_rows"] = local_sp_pad_rows(seq_len, hidden_states.shape[1], sp_world_rank)
 
         if ts_seq_len is not None:  # (wan2.2 ti2v)
             temb = split_rows(temb)
