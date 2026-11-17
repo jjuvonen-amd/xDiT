@@ -74,8 +74,10 @@ def _torch_sdma_worker(rank, world_size, init_method):
             gathered, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(a, [w], 0, group_name)
             ref = torch.empty(world_size * rows, 512, device="cuda", dtype=torch.bfloat16)
             dist.all_gather_into_tensor(ref, a)
+            # The rows move exactly; the op's per-piece GEMMs round like any bf16 GEMM.
             assert torch.equal(gathered, ref)
-            assert torch.equal(out, ref @ w)
+            want = ref.float() @ w.float()
+            assert float((out.float() - want).norm() / want.norm()) < 1e-2
         rocm_sdma.raise_if_failed()
         dist.barrier()
     finally:
