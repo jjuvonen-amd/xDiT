@@ -79,6 +79,8 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         os.environ["XDIT_TP_SDMA_REDUCE_SCATTER"] = "on"
     if options.get("fp8"):
         os.environ["XDIT_TP_FP8"] = "1"
+    if options.get("row_align"):
+        os.environ["XDIT_TP_ROW_ALIGN"] = str(options["row_align"])
     torch_sdma = options.get("torch_sdma", False)
     if torch_sdma:
         os.environ.update(
@@ -361,3 +363,18 @@ def test_tensor_parallel_fp8_with_patched_torch_symm_mem_is_close_to_one_gpu(
     error = _relative_error(actual, expected)
     print(f"FP8 TP relative error {error:.3e}")
     assert error <= FP8_TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+@pytest.mark.parametrize("mode", ["tp2", "tp4", "tp2-ulysses2"])
+def test_tensor_parallel_with_row_alignment_matches_one_gpu(tmp_path, one_gpu_output, mode, latent_shape):
+    """XDIT_TP_ROW_ALIGN=256 pads each TP rank's rows to whole 256-row tiles; on the test model that is mostly
+    pad, which must stay masked."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires an accelerator")
+    expected = one_gpu_output("wan", latent_shape)
+
+    actual = _run(tmp_path, mode, "wan", latent_shape, row_align=256)
+
+    error = _relative_error(actual, expected)
+    assert error <= TOLERANCE, f"relative error {error:.3e}"

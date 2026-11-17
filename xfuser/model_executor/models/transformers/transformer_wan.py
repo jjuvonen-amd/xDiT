@@ -854,6 +854,10 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         # blocks all-gather the TP group's rows back into this SP rank's chunk
         # before attention, which RoPE is chunked for.
         rows_multiple = sp_world_size * self._tp_size * self._tp_chunks
+        if self._tp_size > 1:
+            # XDIT_TP_ROW_ALIGN: each TP rank's rows a multiple of it (e.g. a GEMM tile height, for kernels that
+            # take whole tiles per rank); the extra rows are SP pad, masked like any other.
+            rows_multiple *= int(envs.environment_variables["XDIT_TP_ROW_ALIGN"]())
 
         # Part of sequence parallel: given the resolution, we may need to pad the sequence length to match this prior to chunking
         seq_len = hidden_states.shape[1]

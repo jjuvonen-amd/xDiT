@@ -95,6 +95,8 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # 1: with XDIT_TP_COMM_OVERLAP=symm_mem, every TP site runs row-wise FP8 (activations quantized per
     # call, weights per output channel at sharding): torch's fused scaled AG+GEMM / GEMM+RS ops.
     "XDIT_TP_FP8": lambda: os.environ.get("XDIT_TP_FP8", "0"),
+    # Pad the sequence so each TP rank holds a multiple of this many rows (1: no extra padding).
+    "XDIT_TP_ROW_ALIGN": lambda: os.environ.get("XDIT_TP_ROW_ALIGN", "1"),
     # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
     # thread logs what was missing and aborts the process (no wrong output is used); raise: the
     # stream moves on (that call's output is wrong) and the next SDMA call raises.
