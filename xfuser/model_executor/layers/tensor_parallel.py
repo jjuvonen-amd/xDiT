@@ -243,54 +243,76 @@ def tp_gather_apply_scatter(
 
 
 def _sdma_gather_apply_scatter(rs, tensors, fn, out_features, out_dtype, chunks):
+    """Schedule: fn on this rank's own rows of the first half of the chunks (no wait: hides the first
+    gathered piece), then on the peers' rows chunk by chunk as they land (their partial sums pushed
+    to their owners), then on the own rows of the second half (hides the last pushes in flight).
+    Chunk c of this rank's output is reduced once its own partial and the peers' partials are in."""
     group_name = get_tp_group().device_group.group_name
     g = rs._group(group_name)
     world, rank = g.world, g.rank
+    peers = list(g.peers)
     xs = [t.contiguous() for t in tensors]
     rows = xs[0].shape[0]
     block = rows // chunks
     N = out_features
     lib = rs._load()
     cur = torch.cuda.current_stream()
-    # one inbox: the gathered inputs [world, rows, f_i] each, then the partial sums [chunks, world, block, N];
-    # flag rows 0..chunks-1 for the gather pieces, chunks..2*chunks-1 for the scatter pieces
+    # one inbox: the gathered inputs [world, rows, f_i] each (this rank's slot unused), then the partial
+    # sums [chunks, world, block, N]; flag rows 0..chunks-1 gather pieces, chunks..2*chunks-1 scatter pieces
     regions = [((world, rows, t.shape[1]), t.dtype) for t in xs] + [((chunks, world, block, N), out_dtype)]
     ws, inboxes, offsets, flags, bases, flag_offset = rs._inbox(group_name, rank, world, regions, 2 * chunks)
     gathered, recv = inboxes[:-1], inboxes[-1]
     row_bytes = [t.shape[1] * t.element_size() for t in xs]
     block_bytes = block * N * recv.element_size()
+    # this rank's partial sums for the peers' rows, piece by piece, owner-major within a piece
     partials = torch.empty(chunks, world, block, N, dtype=out_dtype, device=xs[0].device)
     # Two plans: a plan's pushes must all carry the same number of copies per peer (its completion
     # signals are indexed by piece x peer x copy), and the gather moves len(xs) tensors, the scatter one.
     gather = rs._Plan(lib, g, chunks, len(xs))
     scatter = rs._Plan(lib, g, chunks, 1)
     for c in range(chunks):
-        at = [off + (rank * rows + c * block) * size for off, size in zip(offsets[:-1], row_bytes)]
+        # this rank's piece c straight from its own tensors into every peer's inbox slot for it
+        dst = [off + (rank * rows + c * block) * size for off, size in zip(offsets[:-1], row_bytes)]
+        src = [t.data_ptr() + c * block * size for t, size in zip(xs, row_bytes)]
         gather.push(
             0,
-            [bases[p] + a for p in g.peers for a in at],
-            [bases[rank] + a for _ in g.peers for a in at],
+            [bases[p] + a for p in peers for a in dst],
+            [a for _ in peers for a in src],
             [block * size for size in row_bytes],
-            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
+            [bases[p] + flag_offset + (c * world + rank) * 4 for p in peers],
         )
         scatter.push(
             c,
-            [bases[p] + offsets[-1] + (c * world + rank) * block_bytes for p in g.peers],
-            [partials[c, p].data_ptr() for p in g.peers],
+            [bases[p] + offsets[-1] + (c * world + rank) * block_bytes for p in peers],
+            [partials[c, p].data_ptr() for p in peers],
             [block_bytes],
-            [bases[p] + flag_offset + ((chunks + c) * world + rank) * 4 for p in g.peers],
+            [bases[p] + flag_offset + ((chunks + c) * world + rank) * 4 for p in peers],
         )
     flags.zero_()
     flags[:, rank] = 1
-    for inbox, t in zip(gathered, xs):
-        inbox[rank].copy_(t)
     out = torch.empty(rows, N, dtype=out_dtype, device=xs[0].device)
+    own = torch.empty(rows, N, dtype=out_dtype, device=xs[0].device)
     pieces = [inbox.view(world, chunks, block, -1) for inbox in gathered]
+    first = list(range((chunks + 1) // 2))
+    last = list(range((chunks + 1) // 2, chunks))
+    own_done = set()
+    reduced = []
 
-    def reduce(c):
-        scatter.wait(cur, flags[chunks + c], c)
-        recv[c, rank].copy_(partials[c, rank])
-        out[c * block : (c + 1) * block] = torch.sum(recv[c], dim=0, dtype=torch.float32)
+    def own_rows(cs):
+        if not cs:
+            return
+        lo, hi = cs[0] * block, (cs[-1] + 1) * block
+        own[lo:hi].copy_(fn(*[t[lo:hi] for t in xs]))
+        own_done.update(cs)
+
+    def reduce_ready(peers_done):
+        for c in range(chunks):
+            if c in reduced or c not in own_done or c >= peers_done:
+                continue
+            scatter.wait(cur, flags[chunks + c], c)
+            recv[c, rank].copy_(own[c * block : (c + 1) * block])
+            out[c * block : (c + 1) * block] = torch.sum(recv[c], dim=0, dtype=torch.float32)
+            reduced.append(c)
 
     rs._barrier(ws)
     in_last_barrier = False
@@ -298,14 +320,16 @@ def _sdma_gather_apply_scatter(rs, tensors, fn, out_features, out_dtype, chunks)
         gather.start(cur)
         scatter.start(cur)
         gather.release(0, cur)
+        own_rows(first)
         for c in range(chunks):
             gather.wait(cur, flags[c], c)
-            y = fn(*[p[:, c].reshape(world * block, -1) for p in pieces])
-            partials[c].copy_(y.view(world, block, N))
+            y = fn(*[p[peers, c].reshape(len(peers) * block, -1) for p in pieces]).view(len(peers), block, N)
+            for i, p in enumerate(peers):  # (advanced-index assignment would write into a copy)
+                partials[c, p].copy_(y[i])
             scatter.release(c, cur)
-            if c > 0:
-                reduce(c - 1)
-        reduce(chunks - 1)
+            reduce_ready(c)  # chunks whose peer partials were released one step earlier
+        own_rows(last)
+        reduce_ready(chunks)
         in_last_barrier = True
         rs._barrier(ws)
     except BaseException as e:
