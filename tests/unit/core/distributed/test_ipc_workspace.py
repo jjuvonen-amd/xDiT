@@ -45,7 +45,9 @@ def test_amdgpu_version_parses_the_module_version(monkeypatch, tmp_path):
     path = tmp_path / "version"
     path.write_text("7.1.3.31500000\n")
     real_open = open
-    monkeypatch.setattr("builtins.open", lambda p, *a, **k: real_open(path if p == "/sys/module/amdgpu/version" else p, *a, **k))
+    monkeypatch.setattr(
+        "builtins.open", lambda p, *a, **k: real_open(path if p == "/sys/module/amdgpu/version" else p, *a, **k)
+    )
     assert ipc_workspace.amdgpu_version() == (7, 1, 3)
     path.write_text("")
     assert ipc_workspace.amdgpu_version() is None
