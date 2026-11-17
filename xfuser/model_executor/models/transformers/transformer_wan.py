@@ -31,6 +31,7 @@ from xfuser.model_executor.layers.tensor_parallel import (
     tp_row_parallel,
     tp_split_rows,
 )
+from xfuser.core.distributed import ipc_workspace
 from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
@@ -691,6 +692,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             raise ValueError(f"fused_comm must be None, 'symm_mem' or 'sdma'; got {fused_comm!r}")
         if fused_comm == "symm_mem" and overlap_chunks != 1:
             raise ValueError("fused_comm='symm_mem' pipelines on its own; it takes no overlap_chunks")
+        if fused_comm == "symm_mem":
+            # On torch's patched ROCm SDMA ops: inboxes over hipIpc, not torch's rendezvoused workspace.
+            ipc_workspace.install_torch_sdma_inbox()
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size == 1 or self._tp_size > 1:
             return

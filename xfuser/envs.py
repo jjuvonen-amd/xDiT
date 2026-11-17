@@ -87,6 +87,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # For sdma: on, the reduce-scatters too push their partial sums on SDMA engines and reduce
     # them chunk by chunk; off, they run as with chunked.
     "XDIT_TP_SDMA_REDUCE_SCATTER": lambda: os.environ.get("XDIT_TP_SDMA_REDUCE_SCATTER", "off"),
+    # ROCm: the TP SDMA paths (sdma, and symm_mem on torch's patched ROCm SDMA ops) share their
+    # inboxes over hipIpc (core/distributed/ipc_workspace.py) instead of torch's symmetric-memory
+    # workspace, whose rendezvous moves the buffers to system memory on amdgpu 6.16.x.
+    # auto: on amdgpu < 7 or an unknown amdgpu version; 1: on any ROCm driver; 0: torch's workspace.
+    "XDIT_TP_IPC_WORKSPACE": lambda: os.environ.get("XDIT_TP_IPC_WORKSPACE", "auto"),
     # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
     # thread logs what was missing and aborts the process (no wrong output is used); raise: the
     # stream moves on (that call's output is wrong) and the next SDMA call raises.

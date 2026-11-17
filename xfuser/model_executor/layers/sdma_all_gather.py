@@ -70,9 +70,9 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 
 import xfuser.envs as envs
+from xfuser.core.distributed import ipc_workspace
 from xfuser.logger import init_logger
 from xfuser.model_executor.layers.sdma_build import LIB_NAME, SOURCE, build, source_hash
 
@@ -325,7 +325,7 @@ def _inbox(group_name: str, rank: int, world: int, shape, dtype, chunks: int):
         nbytes *= d
     flag_offset = -(-nbytes // 64) * 64
     size = flag_offset + chunks * world * 4
-    ws = symm_mem.get_symm_mem_workspace(group_name, min_size=size)
+    ws = ipc_workspace.get_workspace(group_name, min_size=size)
     inbox = ws.get_buffer(rank, tuple(shape), dtype)
     flags = ws.get_buffer(rank, (chunks, world), torch.int32, storage_offset=flag_offset // 4)
     bases = [ws.get_buffer(r, (size,), torch.uint8).data_ptr() for r in range(world)]
@@ -383,7 +383,7 @@ def sdma_all_gather_linear(
         gathered[:, :, rank] = x3.view(batch, chunks, block, features).transpose(0, 1)
         slot, call = _start(lib, g, chunks * n_peers * batch, chunks * n_peers)
     else:
-        ws = symm_mem.get_symm_mem_workspace(group_name, min_size=x3.numel() * elt)
+        ws = ipc_workspace.get_workspace(group_name, min_size=x3.numel() * elt)
         ws.get_buffer(rank, x3.shape, x3.dtype).copy_(x3)
         gathered = x3.new_empty(gathered_shape)
         flags = torch.zeros(chunks, 1, dtype=torch.int32, device=x.device)
