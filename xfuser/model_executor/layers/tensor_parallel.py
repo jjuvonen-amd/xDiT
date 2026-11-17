@@ -199,6 +199,119 @@ def tp_gather_rows(x: torch.Tensor, chunks: int) -> torch.Tensor:
     return blocks.transpose(1, 2).reshape(batch, rows, *rest)
 
 
+def _rocm_sdma_ops():
+    """torch's patched ROCm SDMA symm_mem module when it is enabled, else None."""
+    import os
+
+    if torch.version.hip is None or os.environ.get("TORCH_SYMM_MEM_ENABLE_ROCM_SDMA") != "1":
+        return None
+    try:
+        import torch.distributed._symmetric_memory._rocm_sdma as rocm_sdma
+    except ImportError:
+        return None
+    return rocm_sdma
+
+
+def tp_gather_apply_scatter(
+    tensors: Sequence[torch.Tensor], fn, out_features: int, out_dtype: torch.dtype, site: str, chunks: int = 4
+) -> torch.Tensor:
+    """reduce_scatter(fn(all_gather(tensors))) over the TP group, pipelined on SDMA engines.
+
+    For token-parallel functions such as an MoE whose experts are TP-sharded: every row's output
+    is a partial sum over the TP ranks. `tensors` are this rank's rows, (rows, features_i) each
+    (e.g. activations, or quantized activations and their scales); `fn(*pieces)` maps rows of
+    every tensor to (rows, out_features) partial sums. Returns this rank's (rows, out_features),
+    summed in fp32 and cast to out_dtype.
+
+    On torch's patched ROCm SDMA path one call pipelines both collectives: piece c of every rank's
+    rows lands, fn runs on it, and its partial sums are pushed to their owners while fn runs on
+    piece c + 1. Otherwise: RCCL all-gather, fn, RCCL reduce-scatter.
+    """
+    group = get_tp_group()
+    rows = tensors[0].shape[0]
+    rocm_sdma = _rocm_sdma_ops()
+    while chunks > 1 and rows % chunks:
+        chunks -= 1
+    if rocm_sdma is None or torch.cuda.is_current_stream_capturing():
+        with record_function(f"tp_ag:{site}"):
+            full = [group.all_gather(t.contiguous(), dim=0) for t in tensors]
+        partial = fn(*full)
+        with record_function(f"tp_rs:{site}"):
+            return group.reduce_scatter(partial.to(out_dtype), dim=0)
+    with record_function(f"tp_gas:{site}"):
+        return _sdma_gather_apply_scatter(rocm_sdma, tensors, fn, out_features, out_dtype, chunks)
+
+
+def _sdma_gather_apply_scatter(rs, tensors, fn, out_features, out_dtype, chunks):
+    group_name = get_tp_group().device_group.group_name
+    g = rs._group(group_name)
+    world, rank = g.world, g.rank
+    xs = [t.contiguous() for t in tensors]
+    rows = xs[0].shape[0]
+    block = rows // chunks
+    N = out_features
+    lib = rs._load()
+    cur = torch.cuda.current_stream()
+    # one inbox: the gathered inputs [world, rows, f_i] each, then the partial sums [chunks, world, block, N];
+    # flag rows 0..chunks-1 for the gather pieces, chunks..2*chunks-1 for the scatter pieces
+    regions = [((world, rows, t.shape[1]), t.dtype) for t in xs] + [((chunks, world, block, N), out_dtype)]
+    ws, inboxes, offsets, flags, bases, flag_offset = rs._inbox(group_name, rank, world, regions, 2 * chunks)
+    gathered, recv = inboxes[:-1], inboxes[-1]
+    row_bytes = [t.shape[1] * t.element_size() for t in xs]
+    block_bytes = block * N * recv.element_size()
+    partials = torch.empty(chunks, world, block, N, dtype=out_dtype, device=xs[0].device)
+    plan = rs._Plan(lib, g, 2 * chunks, max(len(xs), 1))
+    for c in range(chunks):
+        at = [off + (rank * rows + c * block) * size for off, size in zip(offsets[:-1], row_bytes)]
+        plan.push(
+            0,
+            [bases[p] + a for p in g.peers for a in at],
+            [bases[rank] + a for _ in g.peers for a in at],
+            [block * size for size in row_bytes],
+            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
+        )
+    for c in range(chunks):
+        plan.push(
+            1 + c,
+            [bases[p] + offsets[-1] + (c * world + rank) * block_bytes for p in g.peers],
+            [partials[c, p].data_ptr() for p in g.peers],
+            [block_bytes],
+            [bases[p] + flag_offset + ((chunks + c) * world + rank) * 4 for p in g.peers],
+        )
+    flags.zero_()
+    flags[:, rank] = 1
+    for inbox, t in zip(gathered, xs):
+        inbox[rank].copy_(t)
+    out = torch.empty(rows, N, dtype=out_dtype, device=xs[0].device)
+    pieces = [inbox.view(world, chunks, block, -1) for inbox in gathered]
+
+    def reduce(c):
+        plan.wait(cur, flags[chunks + c], chunks + c)
+        recv[c, rank].copy_(partials[c, rank])
+        out[c * block : (c + 1) * block] = torch.sum(recv[c], dim=0, dtype=torch.float32)
+
+    rs._barrier(ws)
+    in_last_barrier = False
+    try:
+        plan.start(cur)
+        plan.release(0, cur)
+        for c in range(chunks):
+            plan.wait(cur, flags[c], c)
+            y = fn(*[p[:, c].reshape(world * block, -1) for p in pieces])
+            partials[c].copy_(y.view(world, block, N))
+            plan.release(1 + c, cur)
+            if c > 0:
+                reduce(c - 1)
+        reduce(chunks - 1)
+        in_last_barrier = True
+        rs._barrier(ws)
+    except BaseException as e:
+        if not plan.capturing:
+            rs._abandon(e, ws, in_last_barrier)
+        raise
+    return out
+
+
 def tp_column_parallel(
     x: torch.Tensor, linear: nn.Linear, site: str, chunks: int, fused: Optional[str] = None
 ) -> torch.Tensor:
