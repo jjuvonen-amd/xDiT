@@ -58,8 +58,8 @@ Requirements:
 |---|---|---|
 | `TORCH_SYMM_MEM_ENABLE_ROCM_SDMA` | `0` | `1` turns the SDMA path on |
 | `TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS` | by size | pieces per rank (at most 16; see Pieces); fewer if they do not divide the rows |
-| `TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S` | `30` | how long a flag wait waits before it is reported |
-| `TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT` | `abort` | `abort`: hold the stream and abort the process, logging what was missing; `raise`: let the stream move on and raise on the next call |
+| `TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S` | `30` | how long a call waits for its flags, or for the copies of the call that last used its slot, before it is reported (see Failures) |
+| `TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT` | `abort` | what happens once a failure is reported. `abort`: abort the process within about 0.1 s, logging what was missing. `raise`: raise on the next eager call. Either way the stream moves on, and that call's output is wrong |
 | `TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED` | `0` | `1` also runs on GPU architectures other than gfx950 |
 
 The SDMA path is used for any dtype when the gather or scatter dimension is not the last one and
@@ -94,6 +94,39 @@ call so far and is kept:
   output dtype, plus as much again for this rank's own partial sums before they are pushed. That is
   twice the unreduced product, against once for the default path.
 
+## Failures
+
+No wait on the GPU or the host is unbounded:
+- A flag wait reports flags that did not land within the timeout. A call's later waits then
+  return at once, so a call spends at most one timeout in its waits.
+- Waiting for the copies of a slot's previous call is bounded by the timeout too.
+- The call's symmetric-memory barriers are bounded at three times the timeout.
+
+A process does not leave copies waiting on its GPU's SDMA engines. The transport drains:
+- when an exception, including `KeyboardInterrupt`, stops an eager call after its copies were
+  issued;
+- before the watchdog aborts the process;
+- at exit;
+- on `SIGTERM`. The transport installs a handler when it is set up. The handler drains, then
+  runs the previous disposition.
+
+A drain does three things:
+1. It releases every copy that is still waiting for its turn.
+2. It gives the copies 5 s to finish.
+3. It makes the flag writes still to come carry a value that marks the call as abandoned. A peer
+   waiting for one of those flags reports it at once instead of at the timeout.
+
+After an exception, the rank still passes the call's last barrier, so its peers do not wait there
+until the barrier times out (a timed-out symm_mem barrier faults the GPU). Then it raises. If the
+copies did not finish within the drain, every later call on this path raises.
+
+The transport is built under a name derived from its source, and it checks the version of the
+library it loads. A build of another version of the patch is never picked up.
+
+`SIGKILL` can still leave copies waiting. So can `SIGTERM` if the application replaces the
+`SIGTERM` handler after the transport is set up, unless it exits through Python's normal exit
+path.
+
 ## CUDA graphs
 
 Captured calls are supported. A captured call issues its copies from a host-function node, so
@@ -113,7 +146,10 @@ it will be captured with.
 - bitwise-equal reruns of all four ops;
 - graph capture with replays on new inputs, bf16 and fp8;
 - two process groups;
-- a lost flag that is reported instead of hanging.
+- a lost flag that is reported instead of hanging;
+- an exception on one rank in the middle of a call, for both ops: the rank raises, its peers
+  report the abandoned call without waiting for the timeout, and the next calls are right;
+- the version of the loaded transport.
 
 `benchmarks/wan_tp/collect_torch_sdma.sh` in this repository runs those tests and the existing
 `AsyncTPTest`, with the path off and on, on an installed torch. It also runs:

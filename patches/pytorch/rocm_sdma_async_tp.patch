@@ -1,4 +1,4 @@
-From 2f530bad3dbc20c425d34cba8aaec97273cfd663 Mon Sep 17 00:00:00 2001
+From 82efe03fd703df177a1d9e68584af0276e5d6b2e Mon Sep 17 00:00:00 2001
 From: jjuvonen-amd <joni.juvonen@amd.com>
 Date: Mon, 2 Nov 2026 12:54:29 +0000
 Subject: [PATCH] [ROCm] symm_mem: fused all-gather + matmul and matmul +
@@ -45,16 +45,16 @@ Test plan:
 python test/distributed/test_symmetric_memory.py -k "AsyncTPTest or AsyncTPRocmSdmaTest"
 TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 python test/distributed/test_symmetric_memory.py -k AsyncTPTest
 ---
- test/distributed/test_symmetric_memory.py     | 556 +++++++++++
+ test/distributed/test_symmetric_memory.py     | 644 ++++++++++++
  .../distributed/_symmetric_memory/__init__.py |  81 ++
- .../_symmetric_memory/_rocm_sdma.hip          | 542 +++++++++++
- .../_symmetric_memory/_rocm_sdma.py           | 865 ++++++++++++++++++
- 4 files changed, 2044 insertions(+)
+ .../_symmetric_memory/_rocm_sdma.hip          | 680 +++++++++++++
+ .../_symmetric_memory/_rocm_sdma.py           | 928 ++++++++++++++++++
+ 4 files changed, 2333 insertions(+)
  create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.hip
  create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.py
 
 diff --git a/test/distributed/test_symmetric_memory.py b/test/distributed/test_symmetric_memory.py
-index 2ded4493e8..d0e631a593 100644
+index 2ded4493e8..dee269455e 100644
 --- a/test/distributed/test_symmetric_memory.py
 +++ b/test/distributed/test_symmetric_memory.py
 @@ -35,6 +35,7 @@ from torch.distributed._symmetric_memory import (
@@ -65,7 +65,7 @@ index 2ded4493e8..d0e631a593 100644
      _test_mode,
      restride_A_for_fused_matmul_reduce_scatter,
      restride_A_shard_for_fused_all_gather_matmul,
-@@ -2000,6 +2001,561 @@ class AsyncTPTest(MultiProcContinuousTest):
+@@ -2000,6 +2001,649 @@ class AsyncTPTest(MultiProcContinuousTest):
          self.assertTrue(torch.allclose(x, t))
  
  
@@ -337,6 +337,94 @@ index 2ded4493e8..d0e631a593 100644
 +                _rocm_sdma.raise_if_failed()
 +        else:
 +            _rocm_sdma.raise_if_failed()
++
++    def test_transport_version(self) -> None:
++        """The loaded transport is the one this module was written for."""
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        self.assertEqual(_rocm_sdma._load().rsdma_abi_version(), _rocm_sdma.ABI_VERSION)
++
++    def _raise_in_bmm(self, call: int):
++        """On rank 0, torch.bmm raises on its `call`-th call (from 0); other ranks run it."""
++        bmm, calls = torch.bmm, [0]
++
++        def fail(*args, **kwargs):
++            calls[0] += 1
++            if self.rank == 0 and calls[0] == call + 1:
++                raise RuntimeError("injected")
++            return bmm(*args, **kwargs)
++
++        return mock.patch.object(torch, "bmm", fail)
++
++    @skip_if_lt_x_gpu(2)
++    @parametrize("op", ["all_gather", "reduce_scatter"])
++    @mock.patch.dict(
++        os.environ,
++        {
++            **_ROCM_SDMA_ENV,
++            "TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT": "raise",
++            "TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S": "2",
++            "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": "2",
++        },
++    )
++    def test_exception_mid_call(self, op: str) -> None:
++        """An exception on one rank between its pushes leaves no copy waiting: the rank raises,
++        its peers' waits for what it never sent end at once and are reported, and the next calls
++        are right."""
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        A_shard = torch.randn(256, 128, device=device_type, dtype=torch.bfloat16)
++        A = torch.randn(256 * self.world_size, 128, device=device_type, dtype=torch.bfloat16)
++        B = torch.randn(128, 64, device=device_type, dtype=torch.bfloat16)
++
++        def call():
++            if op == "all_gather":
++                return torch.ops.symm_mem.fused_all_gather_matmul(
++                    A_shard, [B], 0, group_name, return_A=False
++                )[1][0]
++            return torch.ops.symm_mem.fused_matmul_reduce_scatter(A, B, "sum", 0, group_name)
++
++        call()
++        device_module.synchronize()
++        _rocm_sdma.raise_if_failed()
++        # Rank 0 raises before its second piece's matmul: for the reduce-scatter, before it
++        # releases that piece's pushes.
++        start = time.monotonic()
++        with self._raise_in_bmm(1):
++            if self.rank == 0:
++                with self.assertRaisesRegex(RuntimeError, "injected"):
++                    call()
++            else:
++                call()
++        device_module.synchronize()
++        self.assertLess(time.monotonic() - start, 2.0)
++        dist.barrier()
++        self.assertIsNone(_rocm_sdma._broken)
++        if self.rank != 0 and op == "reduce_scatter":
++            with self.assertRaisesRegex(
++                RuntimeError, r"flag words \[0\] came from ranks that abandoned the call"
++            ):
++                _rocm_sdma.raise_if_failed()
++        else:
++            # The all-gather's pushes were all released before the exception.
++            try:
++                _rocm_sdma.raise_if_failed()
++            except RuntimeError as e:
++                self.assertIn("abandoned", str(e))
++        for _ in range(2):
++            out_1 = call()
++            if op == "all_gather":
++                _, (out_0,) = _fused_all_gather_matmul_fallback(
++                    A_shard.float(), [B.float()], gather_dim=0, group_name=group_name
++                )
++            else:
++                out_0 = _fused_matmul_reduce_scatter_fallback(
++                    A.float(), B.float(), "sum", scatter_dim=0, group_name=group_name
++                )
++            self._assert_close_to_fp32(out_1, out_0)
++        _rocm_sdma.raise_if_failed()
 +
 +    def _assert_close_scaled(self, actual, expected) -> None:
 +        # Each piece's _scaled_mm against one over the whole input: the same
@@ -749,10 +837,10 @@ index c1630628ad..672b46ad86 100644
              mm_out_op=torch.ops.aten._scaled_mm.out,
 diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.hip b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
 new file mode 100644
-index 0000000000..4c912436e2
+index 0000000000..29052c70f2
 --- /dev/null
 +++ b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
-@@ -0,0 +1,542 @@
+@@ -0,0 +1,680 @@
 +// SDMA transport for the ROCm path of
 +// torch.ops.symm_mem.fused_all_gather_matmul and fused_matmul_reduce_scatter
 +// (see _rocm_sdma.py). Built on first use with torch.utils.cpp_extension and
@@ -778,17 +866,26 @@ index 0000000000..4c912436e2
 +//
 +// The compute stream waits for a piece's flags with a one-thread kernel whose
 +// wait is bounded: flags that never land are recorded in host-mapped memory
-+// (rsdma_peek_error / rsdma_take_error), and the stream either moves on or
-+// stays held for the host to abort the process. A plan that fails inside a
-+// host-function node is recorded the same way.
++// (rsdma_peek_error / rsdma_take_error), and the stream moves on. A plan that
++// fails inside a host-function node is recorded the same way.
++//
++// No copy is left waiting when a call is abandoned or the process ends:
++// rsdma_drain (on an exception in a call, before the watchdog aborts, at exit,
++// and on SIGTERM) sets the word every flag write copies to 2, releases every
++// trigger and waits, bounded, for the copies. Peers' waits see 2 and fail at
++// once instead of timing out.
 +//
 +// Functions return 0 on success and a negative code otherwise.
 +#include <hip/hip_runtime.h>
 +#include <hsa/hsa.h>
 +#include <hsa/hsa_ext_amd.h>
 +
++#include <semaphore.h>
++#include <signal.h>
++
 +#include <chrono>
 +#include <cstdint>
++#include <thread>
 +#include <vector>
 +
 +// A bounded flag wait that ran out of time, or a captured plan that failed,
@@ -799,8 +896,13 @@ index 0000000000..4c912436e2
 +  unsigned long long missing;
 +  int piece; // first one: piece (-1 for a plan) and call id
 +  int call;
-+  int status; // first one: 0 for a wait, else the failed plan's return code
++  // First one: 0 for a wait that ran out of time, 1 for one whose flags came
++  // from senders that abandoned the call (`missing` is those words), else the
++  // failed plan's return code.
++  int status;
 +};
++
++extern "C" int rsdma_drain(double seconds, int reset);
 +
 +namespace {
 +
@@ -822,17 +924,17 @@ index 0000000000..4c912436e2
 +
 +// Copy j to peer i is dst[i * m + j] <- src[i * m + j], bytes[j] bytes, on
 +// engines[i] once trigger k is released; then, once peer i's m copies have
-+// landed, the 4 bytes at `one` go to flag_dst[i] on the spare engine
++// landed, the word at g_one goes to flag_dst[i] on the spare engine
 +// engines[n].
 +struct Push {
 +  int k, n, m;
-+  uint64_t one;
 +  std::vector<uint64_t> bytes, dst, src, flag_dst;
 +  std::vector<int> engines;
 +};
 +
 +struct Plan {
 +  int slot, n_data, n_flags, call;
++  double seconds; // how long to wait for the slot's previous copies
 +  std::vector<Push> pushes; // push p is piece p of the call
 +};
 +
@@ -841,6 +943,14 @@ index 0000000000..4c912436e2
 +hsa_agent_t g_local;
 +RsdmaError* g_error = nullptr; // host-mapped
 +int* g_scratch = nullptr; // device word that a dropped flag write goes to
++// Device word every flag write copies: 1, or 2 once drained.
++int* g_one = nullptr;
++// Device array of every slot's trigger value pointers, for set_one.
++hsa_signal_value_t** g_trigger_values = nullptr;
++hipStream_t g_drain_stream = nullptr;
++sem_t g_term;
++struct sigaction g_old_term;
++constexpr double kDrainSeconds = 5.0;
 +int g_drop_piece = -1, g_drop_index = -1;
 +unsigned long long g_ticks_per_s = 0;
 +
@@ -867,15 +977,19 @@ index 0000000000..4c912436e2
 +  return -2;
 +}
 +
-+// Waits until `s` drops below 1 (its copy finished); false after kWaitSeconds,
-+// so a copy that never runs fails the call instead of hanging it.
-+constexpr double kWaitSeconds = 60.0;
++using Clock = std::chrono::steady_clock;
 +
-+bool wait_done(hsa_signal_t s) {
-+  auto deadline = std::chrono::steady_clock::now() +
-+      std::chrono::duration<double>(kWaitSeconds);
++Clock::time_point deadline_in(double seconds) {
++  return Clock::now() +
++      std::chrono::duration_cast<Clock::duration>(
++             std::chrono::duration<double>(seconds));
++}
++
++// Waits until `s` drops below 1 (its copy finished); false after `deadline`,
++// so a copy that never runs fails the call instead of hanging it.
++bool wait_done(hsa_signal_t s, Clock::time_point deadline) {
 +  while (hsa_signal_load_scacquire(s) >= 1) {
-+    if (std::chrono::steady_clock::now() > deadline)
++    if (Clock::now() > deadline)
 +      return false;
 +    hsa_signal_wait_scacquire(
 +        s, HSA_SIGNAL_CONDITION_LT, 1, 1000000, HSA_WAIT_STATE_ACTIVE);
@@ -898,42 +1012,63 @@ index 0000000000..4c912436e2
 +      __HIP_MEMORY_SCOPE_SYSTEM);
 +}
 +
-+// Waits until all `count` words at `words` read 1 (acquire, system scope). Once
-+// `budget` wall-clock ticks have passed it records which words were missing;
-+// then it returns, or with `block` keeps waiting, holding the stream so no work
-+// after it runs on data that never came (the host's watchdog aborts the
-+// process).
++// Sets *one to `value`; with `count` triggers, then releases them all.
++__global__ void set_one_and_release(
++    int* one,
++    int value,
++    hsa_signal_value_t** triggers,
++    int count) {
++  __hip_atomic_store(one, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
++  for (int i = 0; i < count; ++i)
++    __hip_atomic_store(
++        triggers[i],
++        (hsa_signal_value_t)0,
++        __ATOMIC_RELEASE,
++        __HIP_MEMORY_SCOPE_SYSTEM);
++}
++
++// Waits until all `count` words at `words` read 1 (acquire, system scope). A
++// word that reads 2 came from a sender that abandoned the call: the wait
++// records those words and returns at once. Otherwise, once `budget` wall-clock
++// ticks have passed, it records the words still missing and returns. Either
++// way the stream moves on; the host raises or aborts. Once one wait of a call
++// has failed, the call's later waits return at once, so a call spends at most
++// one timeout in its waits.
 +__global__ void wait_flags(
 +    const int* words,
 +    int count,
 +    unsigned long long budget,
 +    RsdmaError* err,
 +    int piece,
-+    int call,
-+    int block) {
++    int call) {
 +  unsigned long long start = wall_clock64();
-+  bool recorded = false;
++  if (__hip_atomic_load(&err->count, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) &&
++      __hip_atomic_load(&err->call, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) ==
++          call)
++    return;
 +  while (true) {
-+    unsigned long long missing = 0;
-+    for (int i = 0; i < count; ++i)
-+      if (__hip_atomic_load(
-+              words + i, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1)
++    unsigned long long missing = 0, abandoned = 0;
++    for (int i = 0; i < count; ++i) {
++      int v = __hip_atomic_load(
++          words + i, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
++      if (v == 2)
++        abandoned |= 1ull << i;
++      else if (v != 1)
 +        missing |= 1ull << i;
-+    if (!missing)
++    }
++    if (!missing && !abandoned)
 +      return;
-+    if (!recorded && wall_clock64() - start > budget) {
++    if (abandoned || wall_clock64() - start > budget) {
 +      if (__hip_atomic_fetch_add(
 +              &err->count, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) ==
 +          0) {
-+        err->missing = missing;
++        err->missing = abandoned ? abandoned : missing;
 +        err->piece = piece;
 +        err->call = call;
-+        err->status = 0;
++        err->status = abandoned ? 1 : 0;
 +      }
 +      __threadfence_system();
-+      if (!block)
-+        return;
-+      recorded = true;
++      return;
 +    }
 +    __builtin_amdgcn_s_sleep(2);
 +  }
@@ -956,25 +1091,23 @@ index 0000000000..4c912436e2
 +  return true;
 +}
 +
-+// Waits for the copies of `slot`'s previous use to finish, then sets its
-+// triggers and the signals the next call uses to 1.
-+int arm(int slot, int n_data, int n_flags) {
++// Waits, up to `seconds` in all, for the copies of `slot`'s previous use to
++// finish, then sets its triggers to 1. Each data and flag signal is set to 1
++// only as its copy is issued, so one that was never issued is not waited for.
++int arm(int slot, int n_data, int n_flags, double seconds) {
 +  Slot& s = g_slots[slot];
++  auto deadline = deadline_in(seconds);
 +  for (int i = 0; i < s.armed_data; ++i)
-+    if (!wait_done(s.data[i]))
++    if (!wait_done(s.data[i], deadline))
 +      return -1000 - i; // data copy i never landed
 +  for (int i = 0; i < s.armed_flags; ++i)
-+    if (!wait_done(s.flag[i]))
++    if (!wait_done(s.flag[i], deadline))
 +      return -2000 - i; // flag write i never landed
 +  // The slot is idle now, so it can grow for a call larger than any before.
 +  if (!grow(s.data, n_data) || !grow(s.flag, n_flags))
 +    return -1;
 +  for (int k = 0; k < kTriggers; ++k)
 +    hsa_signal_store_relaxed(s.trigger[k], 1);
-+  for (int i = 0; i < n_data; ++i)
-+    hsa_signal_store_relaxed(s.data[i], 1);
-+  for (int i = 0; i < n_flags; ++i)
-+    hsa_signal_store_relaxed(s.flag[i], 1);
 +  s.armed_data = n_data;
 +  s.armed_flags = n_flags;
 +  return 0;
@@ -990,6 +1123,7 @@ index 0000000000..4c912436e2
 +  for (int c = 0; c < p.n * p.m; ++c) {
 +    hsa_amd_sdma_engine_id_t engine =
 +        (hsa_amd_sdma_engine_id_t)(1u << p.engines[c / p.m]);
++    hsa_signal_store_relaxed(s.data[first + c], 1);
 +    hsa_status_t st = hsa_amd_memory_async_copy_on_engine(
 +        (void*)p.dst[c],
 +        g_local,
@@ -1001,8 +1135,10 @@ index 0000000000..4c912436e2
 +        s.data[first + c],
 +        engine,
 +        true);
-+    if (st != HSA_STATUS_SUCCESS)
++    if (st != HSA_STATUS_SUCCESS) {
++      hsa_signal_store_relaxed(s.data[first + c], 0);
 +      return -100 - (int)st;
++    }
 +  }
 +  hsa_amd_sdma_engine_id_t spare =
 +      (hsa_amd_sdma_engine_id_t)(1u << p.engines[p.n]);
@@ -1013,10 +1149,11 @@ index 0000000000..4c912436e2
 +      flag = g_scratch;
 +      g_drop_piece = g_drop_index = -1;
 +    }
++    hsa_signal_store_relaxed(s.flag[piece * p.n + i], 1);
 +    hsa_status_t st = hsa_amd_memory_async_copy_on_engine(
 +        flag,
 +        g_local,
-+        (const void*)p.one,
++        g_one,
 +        g_local,
 +        4,
 +        p.m,
@@ -1024,14 +1161,16 @@ index 0000000000..4c912436e2
 +        s.flag[piece * p.n + i],
 +        spare,
 +        true);
-+    if (st != HSA_STATUS_SUCCESS)
++    if (st != HSA_STATUS_SUCCESS) {
++      hsa_signal_store_relaxed(s.flag[piece * p.n + i], 0);
 +      return -200 - (int)st;
++    }
 +  }
 +  return 0;
 +}
 +
 +int run(const Plan& plan) {
-+  int rc = arm(plan.slot, plan.n_data, plan.n_flags);
++  int rc = arm(plan.slot, plan.n_data, plan.n_flags, plan.seconds);
 +  for (int i = 0; rc == 0 && i < (int)plan.pushes.size(); ++i)
 +    rc = issue(plan.slot, i, plan.pushes[i]);
 +  return rc;
@@ -1052,9 +1191,53 @@ index 0000000000..4c912436e2
 +  }
 +}
 +
++// Sets *g_one to `one`, releasing every trigger with it if `release`, on the
++// drain stream; false if that is not done within `deadline`.
++bool set_one(int one, bool release, Clock::time_point deadline) {
++  int count = release ? (int)g_slots.size() * kTriggers : 0;
++  hipLaunchKernelGGL(
++      set_one_and_release,
++      dim3(1),
++      dim3(1),
++      0,
++      g_drain_stream,
++      g_one,
++      one,
++      g_trigger_values,
++      count);
++  if (hipGetLastError() != hipSuccess)
++    return false;
++  while (hipStreamQuery(g_drain_stream) == hipErrorNotReady) {
++    if (Clock::now() > deadline)
++      return false;
++    std::this_thread::yield();
++  }
++  return true;
++}
++
++// SIGTERM: drain (on a thread, as the handler may only post), then let the
++// previous disposition run.
++void on_term(int, siginfo_t*, void*) {
++  sem_post(&g_term);
++}
++
++void drain_on_term() {
++  while (sem_wait(&g_term) != 0) {
++  }
++  rsdma_drain(kDrainSeconds, 0);
++  sigaction(SIGTERM, &g_old_term, nullptr);
++  raise(SIGTERM);
++}
++
 +} // namespace
 +
 +extern "C" {
++
++// Bumped whenever an exported signature or the meaning of a result changes;
++// _rocm_sdma.py refuses a library built from another version.
++int rsdma_abi_version() {
++  return 2;
++}
 +
 +// `slots` calls may be in flight at once; a slot is reused only after its
 +// copies finished.
@@ -1075,6 +1258,7 @@ index 0000000000..4c912436e2
 +  *g_error = RsdmaError{};
 +  if (hipMalloc((void**)&g_scratch, 64) != hipSuccess)
 +    return -9;
++  g_one = g_scratch + 1;
 +  hipLaunchKernelGGL(probe, dim3(1), dim3(1), 0, 0, g_scratch);
 +  if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess)
 +    return -11; // no code for this GPU
@@ -1084,7 +1268,11 @@ index 0000000000..4c912436e2
 +      khz <= 0)
 +    return -10;
 +  g_ticks_per_s = (unsigned long long)khz * 1000ull;
++  if (hipStreamCreateWithFlags(&g_drain_stream, hipStreamNonBlocking) !=
++      hipSuccess)
++    return -12;
 +  g_slots.resize(slots);
++  std::vector<hsa_signal_value_t*> values;
 +  for (Slot& s : g_slots) {
 +    // Triggers are written by a kernel, so their values must be addressable:
 +    // GPU-only signals.
@@ -1096,9 +1284,50 @@ index 0000000000..4c912436e2
 +      if (hsa_amd_signal_value_pointer(s.trigger[k], &s.trigger_value[k]) !=
 +          HSA_STATUS_SUCCESS)
 +        return -5;
++      values.push_back(const_cast<hsa_signal_value_t*>(s.trigger_value[k]));
 +    }
 +  }
++  size_t bytes = values.size() * sizeof(hsa_signal_value_t*);
++  if (hipMalloc((void**)&g_trigger_values, bytes) != hipSuccess ||
++      hipMemcpy(g_trigger_values, values.data(), bytes, hipMemcpyHostToDevice) !=
++          hipSuccess)
++    return -13;
++  if (!set_one(1, false, deadline_in(kDrainSeconds)))
++    return -14;
++  if (sem_init(&g_term, 0, 0) != 0)
++    return -15;
++  std::thread(drain_on_term).detach();
++  struct sigaction sa = {};
++  sa.sa_sigaction = on_term;
++  sa.sa_flags = SA_SIGINFO | SA_RESTART;
++  sigemptyset(&sa.sa_mask);
++  if (sigaction(SIGTERM, &sa, &g_old_term) != 0)
++    return -16;
 +  return 0;
++}
++
++// Stops this process's copies from waiting on anything: sets the word every
++// flag write copies to 2, so peers' waits for them fail at once, releases
++// every trigger of every slot, then waits up to `seconds` in all for every
++// armed copy and flag write. With `reset`, once they have all finished, sets
++// the word back to 1 for later calls. Returns how many copies are still
++// pending (0 if none) or a negative code.
++int rsdma_drain(double seconds, int reset) {
++  if (g_slots.empty())
++    return 0;
++  auto deadline = deadline_in(seconds);
++  if (!set_one(2, true, deadline))
++    return -1;
++  int pending = 0;
++  for (Slot& s : g_slots) {
++    for (int i = 0; i < s.armed_data; ++i)
++      pending += !wait_done(s.data[i], deadline);
++    for (int i = 0; i < s.armed_flags; ++i)
++      pending += !wait_done(s.flag[i], deadline);
++  }
++  if (pending == 0 && reset && !set_one(1, false, deadline))
++    return -2;
++  return pending;
 +}
 +
 +// One SDMA engine (bit index) per peer, in engines[0..n-1]: ROCr's preferred
@@ -1161,11 +1390,12 @@ index 0000000000..4c912436e2
 +}
 +
 +// A plan for a call on `slot` of up to `n_data` data copies and `n_flags` flag
-+// writes; null if the slot does not exist.
-+void* rsdma_plan_new(int slot, int n_data, int n_flags, int call) {
++// writes; null if the slot does not exist. Running it first waits up to
++// `seconds` for the slot's previous copies.
++void* rsdma_plan_new(int slot, int n_data, int n_flags, int call, double seconds) {
 +  if (slot < 0 || slot >= (int)g_slots.size())
 +    return nullptr;
-+  return new Plan{slot, n_data, n_flags, call, {}};
++  return new Plan{slot, n_data, n_flags, call, seconds, {}};
 +}
 +
 +// Adds the call's next piece (see Push).
@@ -1178,8 +1408,7 @@ index 0000000000..4c912436e2
 +    const int* engines,
 +    int n,
 +    int m,
-+    const uint64_t* flag_dst,
-+    uint64_t one) {
++    const uint64_t* flag_dst) {
 +  Plan& plan = *static_cast<Plan*>(handle);
 +  int piece = (int)plan.pushes.size();
 +  if ((piece + 1) * n * m > plan.n_data || (piece + 1) * n > plan.n_flags ||
@@ -1190,7 +1419,6 @@ index 0000000000..4c912436e2
 +          k,
 +          n,
 +          m,
-+          one,
 +          std::vector<uint64_t>(bytes, bytes + m),
 +          std::vector<uint64_t>(dst, dst + n * m),
 +          std::vector<uint64_t>(src, src + n * m),
@@ -1231,17 +1459,16 @@ index 0000000000..4c912436e2
 +}
 +
 +// Enqueues on `stream` a wait until the `count` 32-bit flags at `words` all
-+// read 1. After `seconds` a wait that is still missing flags is recorded
-+// (rsdma_peek_error, rsdma_take_error); then the stream moves on, or with
-+// `block` stays held (for the host to abort the process).
++// read 1. A wait that finds a flag from a sender that abandoned the call, or
++// is still missing flags after `seconds`, is recorded (rsdma_peek_error,
++// rsdma_take_error); then the stream moves on.
 +int rsdma_wait_flags(
 +    hipStream_t stream,
 +    uint64_t words,
 +    int count,
 +    double seconds,
 +    int piece,
-+    int call,
-+    int block) {
++    int call) {
 +  if (count > 64)
 +    return -1;
 +  unsigned long long budget =
@@ -1257,8 +1484,7 @@ index 0000000000..4c912436e2
 +      budget,
 +      g_error,
 +      piece,
-+      call,
-+      block);
++      call);
 +  return hipGetLastError() == hipSuccess ? 0 : -2;
 +}
 +
@@ -1297,10 +1523,10 @@ index 0000000000..4c912436e2
 +}
 diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.py b/torch/distributed/_symmetric_memory/_rocm_sdma.py
 new file mode 100644
-index 0000000000..a80dc76329
+index 0000000000..9da90111ca
 --- /dev/null
 +++ b/torch/distributed/_symmetric_memory/_rocm_sdma.py
-@@ -0,0 +1,865 @@
+@@ -0,0 +1,928 @@
 +"""SDMA copy engines for symm_mem's fused all-gather + matmul and matmul + reduce-scatter on ROCm,
 +and their scaled (_scaled_mm) variants.
 +
@@ -1334,12 +1560,27 @@ index 0000000000..a80dc76329
 +
 +Each call zeroes its flags and puts this rank's own data in place on the compute
 +stream, then passes a symmetric-memory barrier; a one-thread kernel then releases
-+the copies, which wait for it on the SDMA engines. Flag waits are bounded: after
-+TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S seconds (default 30) a wait records which
-+flags never landed. With TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT=abort (default) the
-+wait keeps the stream held, so nothing runs on data that never came, and a
-+watchdog thread logs what was missing and aborts the process. With =raise the
-+stream moves on (that call's output is wrong) and the next eager call raises.
++the copies, which wait for it on the SDMA engines.
++
++Failures: no wait, on the GPU or the host, is unbounded. A flag wait records
++which flags did not land within TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S seconds
++(default 30), and the stream moves on (that call's output is wrong; the call's
++later waits return at once). Waiting for a slot's previous copies before reusing
++it is bounded by the same timeout, and a barrier by three times it. With
++TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT=abort (default) a watchdog thread logs the
++failure and aborts the process within about 0.1 s; with =raise the next eager
++call raises.
++
++A process never leaves copies waiting on its GPU's SDMA engines: when an
++exception (including KeyboardInterrupt) stops an eager call after its copies
++were issued, before the watchdog aborts, at exit, and on SIGTERM (a handler set
++up with the transport, which then runs the previous disposition), the transport
++drains: every copy is released and given DRAIN_S seconds to finish, and the
++flag writes still to come carry a value that tells peers the call was abandoned,
++so their waits fail at once rather than at the timeout. After an exception the
++rank still passes the call's last barrier, so peers are not left to time out
++there, and the error is raised; if the copies did not finish, later calls raise
++too.
 +
 +CUDA graphs: a call captured into a graph enqueues its host side (arming its
 +signals and issuing its copies) as a host-function node, so every replay issues
@@ -1362,7 +1603,9 @@ index 0000000000..a80dc76329
 +work per launch.
 +"""
 +
++import atexit
 +import ctypes
++import hashlib
 +import logging
 +import math
 +import os
@@ -1385,6 +1628,8 @@ index 0000000000..a80dc76329
 +AUTO_MAX_CHUNKS = 8
 +AUTO_MIN_PIECE_BYTES = 16 << 20
 +MAX_WORLD = 64  # flag words one wait kernel checks
++ABI_VERSION = 2  # rsdma_abi_version of the transport this module calls
++DRAIN_S = 5.0  # how long an abandoned call's copies get to finish
 +_EAGER_SLOTS = 4
 +_CAPTURE_SLOTS = 8
 +
@@ -1393,7 +1638,7 @@ index 0000000000..a80dc76329
 +_next_eager_slot = 0
 +_next_capture_slot = 0
 +_last_call = 0
-+_ones: dict[torch.device, torch.Tensor] = {}
++_broken: str | None = None  # why the transport can no longer be used
 +_watchdog = None
 +_warned_archs: set[str] = set()
 +
@@ -1542,9 +1787,12 @@ index 0000000000..a80dc76329
 +        return _lib
 +    from torch.utils import cpp_extension
 +
++    source = Path(__file__).with_name("_rocm_sdma.hip")
++    # Named after the source, so a build of another version is never picked up.
++    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
 +    path = cpp_extension.load(
-+        name="torch_symm_mem_rocm_sdma",
-+        sources=[str(Path(__file__).with_name("_rocm_sdma.hip"))],
++        name=f"torch_symm_mem_rocm_sdma_{digest}",
++        sources=[str(source)],
 +        # In extra_cflags, where cpp_extension sees an explicit arch (else it builds for every visible GPU's).
 +        extra_cflags=[
 +            "-O2",
@@ -1554,17 +1802,23 @@ index 0000000000..a80dc76329
 +        is_python_module=False,
 +    )
 +    lib = ctypes.CDLL(path)
++    lib.rsdma_abi_version.restype = ctypes.c_int
++    if lib.rsdma_abi_version() != ABI_VERSION:
++        raise RuntimeError(
++            f"{path} is SDMA transport version {lib.rsdma_abi_version()}, not {ABI_VERSION}"
++        )
 +    i, u64, vp, dbl = ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_double
 +    ip, u64p = ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint64)
 +    for name, argtypes, restype in [
 +        ("rsdma_init", [i, i], i),
++        ("rsdma_drain", [dbl, i], i),
 +        ("rsdma_engine_plan", [i, ip, i, ip], i),
-+        ("rsdma_plan_new", [i, i, i, i], vp),
-+        ("rsdma_plan_push", [vp, i, u64p, u64p, u64p, ip, i, i, u64p, u64], i),
++        ("rsdma_plan_new", [i, i, i, i, dbl], vp),
++        ("rsdma_plan_push", [vp, i, u64p, u64p, u64p, ip, i, i, u64p], i),
 +        ("rsdma_plan_run", [vp], i),
 +        ("rsdma_plan_enqueue", [vp, vp], i),
 +        ("rsdma_release", [i, i, vp], i),
-+        ("rsdma_wait_flags", [vp, u64, i, dbl, i, i, i], i),
++        ("rsdma_wait_flags", [vp, u64, i, dbl, i, i], i),
 +        ("rsdma_peek_error", [ip, ip, ip, u64p], i),
 +        ("rsdma_take_error", [ip, ip, ip, u64p], i),
 +        ("rsdma_debug_drop_flag", [i, i], i),
@@ -1572,6 +1826,7 @@ index 0000000000..a80dc76329
 +        getattr(lib, name).argtypes = argtypes
 +        getattr(lib, name).restype = restype
 +    _lib = lib
++    atexit.register(lib.rsdma_drain, DRAIN_S, 0)
 +    return lib
 +
 +
@@ -1625,11 +1880,25 @@ index 0000000000..a80dc76329
 +    _load().rsdma_debug_drop_flag(piece, peer_index)
 +
 +
-+def _one(device: torch.device) -> torch.Tensor:
-+    """A device int32 1, the value every flag write copies."""
-+    if device not in _ones:
-+        _ones[device] = torch.ones(1, dtype=torch.int32, device=device)
-+    return _ones[device]
++def _abandon(error: BaseException, ws, in_last_barrier: bool) -> None:
++    """After `error` stopped an eager call past its first barrier: let every copy of this process
++    finish now, so none is left waiting on a release that never comes, and peers waiting for this
++    call's flags see that it was abandoned and fail at once. Then, unless the call had reached it,
++    pass its last barrier, so peers waiting there are not held until it times out (a timed-out
++    barrier faults their GPU)."""
++    global _broken
++    pending = _load().rsdma_drain(DRAIN_S, 1)
++    if pending != 0:
++        _broken = (
++            f"an earlier call was abandoned ({type(error).__name__}) and its SDMA copies did not "
++            f"finish within {DRAIN_S:g} s ({pending})"
++        )
++        logger.error("symm_mem's SDMA path: %s", _broken)
++    if not in_last_barrier:
++        try:
++            _barrier(ws)
++        except Exception:
++            logger.exception("symm_mem's SDMA path: the abandoned call's last barrier failed")
 +
 +
 +def _failure_message(
@@ -1637,7 +1906,13 @@ index 0000000000..a80dc76329
 +) -> str:
 +    rank = dist.get_rank() if dist.is_initialized() else "?"
 +    plans = {name: dict(zip(g.peers, g.engines)) for name, g in _groups.items()}
-+    if status:
++    if status == 1:
++        words = [i for i in range(MAX_WORLD) if missing >> i & 1]
++        first = (
++            f"call {call}, piece {piece}: flag words {words} came from ranks that abandoned the "
++            "call (word r is group rank r's)"
++        )
++    elif status:
 +        first = f"the host-function node of captured call {call} failed with {status}"
 +    else:
 +        words = [i for i in range(MAX_WORLD) if missing >> i & 1]
@@ -1675,6 +1950,8 @@ index 0000000000..a80dc76329
 +                )
 +                logger.error("%s; aborting", message)
 +                print(f"{message}; aborting", file=sys.stderr, flush=True)
++                # No copy of this process is left waiting on the GPU once it is gone.
++                lib.rsdma_drain(DRAIN_S, 0)
 +                os.abort()
 +            time.sleep(0.1)
 +
@@ -1711,6 +1988,8 @@ index 0000000000..a80dc76329
 +
 +    def __init__(self, lib, g: _Group, pieces: int, copies_per_peer: int):
 +        global _next_eager_slot, _next_capture_slot, _last_call
++        if _broken:
++            raise RuntimeError(f"symm_mem's SDMA path is unusable: {_broken}")
 +        self.lib, self.g = lib, g
 +        self.capturing = torch.cuda.is_current_stream_capturing()
 +        if self.capturing:
@@ -1725,7 +2004,7 @@ index 0000000000..a80dc76329
 +        self.call = _last_call
 +        n = len(g.peers)
 +        self.handle = lib.rsdma_plan_new(
-+            self.slot, pieces * n * copies_per_peer, pieces * n, self.call
++            self.slot, pieces * n * copies_per_peer, pieces * n, self.call, _timeout_s()
 +        )
 +        if not self.handle:
 +            raise RuntimeError("rsdma_plan_new failed")
@@ -1737,7 +2016,6 @@ index 0000000000..a80dc76329
 +        src: list[int],
 +        nbytes: list[int],
 +        flag_dst: list[int],
-+        one: int,
 +    ) -> None:
 +        """Add the next piece: for peer i (in g.peers order) and copy j, dst[i * m + j] <- src[i * m + j]
 +        of nbytes[j] bytes, m = len(nbytes), released by trigger k; peer i's flag is written once
@@ -1754,7 +2032,6 @@ index 0000000000..a80dc76329
 +            n,
 +            m,
 +            (u64 * n)(*flag_dst),
-+            one,
 +        )
 +        _check(rc, "rsdma_plan_push")
 +
@@ -1772,13 +2049,14 @@ index 0000000000..a80dc76329
 +        n = len(self.g.peers)
 +        if rc <= -2000:
 +            raise RuntimeError(
-+                f"flag write {-rc - 2000} of an earlier call on slot {self.slot} never landed"
++                f"flag write {-rc - 2000} of an earlier call on slot {self.slot} did not land "
++                f"within {_timeout_s():g} s"
 +            )
 +        if rc <= -1000:
 +            i = -rc - 1000
 +            raise RuntimeError(
 +                f"a copy to peer rank {self.g.peers[i % n]} (SDMA engine {self.g.engines[i % n]}) of an earlier "
-+                f"call on slot {self.slot} never landed"
++                f"call on slot {self.slot} did not land within {_timeout_s():g} s"
 +            )
 +        _check(rc, "rsdma_plan_run")
 +
@@ -1790,9 +2068,8 @@ index 0000000000..a80dc76329
 +        )
 +
 +    def wait(self, stream: torch.cuda.Stream, flags: torch.Tensor, piece: int) -> None:
-+        """Make `stream` wait (bounded) until every int32 in `flags` reads 1."""
-+        # In raise mode the stream moves on after the timeout; a captured wait keeps the mode
-+        # it was captured in.
++        """Make `stream` wait (bounded) until every int32 in `flags` reads 1. After a failure the
++        stream moves on; the watchdog aborts (abort mode) or the next eager call raises."""
 +        rc = self.lib.rsdma_wait_flags(
 +            ctypes.c_void_p(stream.cuda_stream),
 +            flags.data_ptr(),
@@ -1800,7 +2077,6 @@ index 0000000000..a80dc76329
 +            _timeout_s(),
 +            piece,
 +            self.call,
-+            int(_on_timeout() == "abort"),
 +        )
 +        _check(rc, "rsdma_wait_flags")
 +
@@ -1829,8 +2105,9 @@ index 0000000000..a80dc76329
 +
 +
 +def _barrier(ws) -> None:
-+    # A peer may reach the barrier only after all of its own bounded waits gave up, one per piece.
-+    ws.barrier(channel=0, timeout_ms=int(_timeout_s() * (MAX_CHUNKS + 2) * 1000))
++    # A peer may reach the barrier only after waiting for its slot's previous copies and for its
++    # flags, each bounded by the timeout.
++    ws.barrier(channel=0, timeout_ms=int(_timeout_s() * 3 * 1000))
 +
 +
 +def _chunks(rows: int, row_bytes: int) -> int:
@@ -1887,7 +2164,6 @@ index 0000000000..a80dc76329
 +    )
 +    row_bytes = [t.shape[1] * t.element_size() for t in tensors]
 +    plan = _Plan(lib, g, chunks, len(tensors))
-+    one = _one(tensors[0].device).data_ptr()
 +    for c in range(chunks):
 +        # Piece c of this rank's rows, at the same offsets in every rank's inbox; the copies'
 +        # source is this rank's own inbox.
@@ -1901,7 +2177,6 @@ index 0000000000..a80dc76329
 +            [bases[rank] + a for _ in g.peers for a in at],
 +            [block * size for size in row_bytes],
 +            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
-+            one,
 +        )
 +    flags.zero_()
 +    flags[:, rank] = 1
@@ -1912,16 +2187,23 @@ index 0000000000..a80dc76329
 +    _barrier(ws)
 +    # Issued after the kernels above are enqueued, so the GPU runs them meanwhile; the copies
 +    # wait for the release.
-+    plan.start(stream)
-+    plan.release(0, stream)
-+    pieces = [inbox.view(world, chunks, block, -1) for inbox in inboxes]
-+    for c in range(chunks):
-+        plan.wait(stream, flags[c], c)
-+        consume(c, [p[:, c] for p in pieces])
-+    A = inboxes[0].reshape(world * rows, -1).clone() if return_A else None
-+    # Every rank waited for every piece before its last matmul, so past this barrier no copy reads
-+    # or writes this call's inboxes.
-+    _barrier(ws)
++    in_last_barrier = False
++    try:
++        plan.start(stream)
++        plan.release(0, stream)
++        pieces = [inbox.view(world, chunks, block, -1) for inbox in inboxes]
++        for c in range(chunks):
++            plan.wait(stream, flags[c], c)
++            consume(c, [p[:, c] for p in pieces])
++        A = inboxes[0].reshape(world * rows, -1).clone() if return_A else None
++        # Every rank waited for every piece before its last matmul, so past this barrier no copy
++        # reads or writes this call's inboxes.
++        in_last_barrier = True
++        _barrier(ws)
++    except BaseException as e:
++        if not plan.capturing:
++            _abandon(e, ws, in_last_barrier)
++        raise
 +    return A
 +
 +
@@ -1953,7 +2235,6 @@ index 0000000000..a80dc76329
 +    # partials[c, r] = this rank's partial sums for piece c of owner r's rows.
 +    partials = torch.empty(shape, dtype=dtype, device=inbox.device)
 +    plan = _Plan(lib, g, chunks, 1)
-+    one = _one(inbox.device).data_ptr()
 +    for c in range(chunks):
 +        # Piece c is pushed once its matmul is done: trigger c.
 +        plan.push(
@@ -1962,15 +2243,12 @@ index 0000000000..a80dc76329
 +            [partials[c, p].data_ptr() for p in g.peers],
 +            [block_bytes],
 +            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
-+            one,
 +        )
 +    flags.zero_()
 +    flags[:, rank] = 1
 +    out = inbox.new_empty(rows, out_features)
 +    # Every rank's inbox is free and its flags cleared past this barrier.
 +    _barrier(ws)
-+    # As for the all-gather: issued while the GPU runs the kernels above; each piece waits for its release.
-+    plan.start(stream)
 +
 +    def reduce(c: int) -> None:
 +        plan.wait(stream, flags[c], c)
@@ -1979,16 +2257,27 @@ index 0000000000..a80dc76329
 +            total /= world
 +        out[c * block : (c + 1) * block] = total
 +
-+    for c in range(chunks):
-+        produce(c, partials[c])
-+        inbox[c, rank].copy_(partials[c, rank])
-+        plan.release(c, stream)
-+        if c > 0:
-+            reduce(c - 1)
-+    reduce(chunks - 1)
-+    # Every rank waited for every piece from every peer, so past this barrier no copy reads
-+    # `partials` or writes an inbox.
-+    _barrier(ws)
++    in_last_barrier = False
++    try:
++        # As for the all-gather: issued while the GPU runs the kernels above; each piece waits for
++        # its release.
++        plan.start(stream)
++        for c in range(chunks):
++            produce(c, partials[c])
++            inbox[c, rank].copy_(partials[c, rank])
++            plan.release(c, stream)
++            if c > 0:
++                reduce(c - 1)
++        reduce(chunks - 1)
++        # Every rank waited for every piece from every peer, so past this barrier no copy reads
++        # `partials` or writes an inbox.
++        in_last_barrier = True
++        _barrier(ws)
++    except BaseException as e:
++        if not plan.capturing:
++            # Before `partials` goes: the copies still to run read it.
++            _abandon(e, ws, in_last_barrier)
++        raise
 +    return out
 +
 +
