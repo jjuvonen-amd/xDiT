@@ -1,0 +1,47 @@
+diff --git a/xfuser/core/attention/backends/aiter_sol/kernel.py b/xfuser/core/attention/backends/aiter_sol/kernel.py
+index c36a056..1eced3d 100644
+--- a/xfuser/core/attention/backends/aiter_sol/kernel.py
++++ b/xfuser/core/attention/backends/aiter_sol/kernel.py
+@@ -104,6 +104,7 @@ def sol(query, key, value, call: AttnCall, *, recipe: str):
+     """
+     kwargs = call.attention_kwargs
+     valid_q_len = kwargs.get("valid_q_len") if call.varlen is not None else None
++    _dump(query, key, value, call)
+     cost_sink = kwargs.get(COST_SINK_KEY)
+     output, head_cost = sol_attn_bhsd(
+         query,
+@@ -122,3 +123,34 @@ def sol(query, key, value, call: AttnCall, *, recipe: str):
+     if cost_sink is not None:
+         cost_sink.copy_(head_cost)
+     return output, None
++
++
++# Experiment only: XFUSER_SOL_DUMP=<dir> XFUSER_SOL_DUMP_CALLS=110,1275 saves rank 0's operands of
++# those Sol calls (eager runs only).
++import os  # noqa: E402
++
++_DUMP_DIR = os.environ.get("XFUSER_SOL_DUMP")
++_DUMP_CALLS = {int(c) for c in os.environ.get("XFUSER_SOL_DUMP_CALLS", "").split(",") if c}
++_DUMP_COUNT = [0]
++
++
++def _dump(query, key, value, call):
++    if not _DUMP_DIR or torch.compiler.is_compiling():
++        return
++    index = _DUMP_COUNT[0]
++    _DUMP_COUNT[0] += 1
++    if index not in _DUMP_CALLS or (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0):
++        return
++    kwargs = call.attention_kwargs
++    torch.save(
++        {
++            "query": query.cpu(),
++            "key": key.cpu(),
++            "value": value.cpu(),
++            "valid_kv_len": kwargs.get("valid_kv_len"),
++            "valid_q_len": kwargs.get("valid_q_len"),
++            "exact_tokens": None if kwargs.get(EXACT_TOKENS_KEY) is None else kwargs[EXACT_TOKENS_KEY].cpu(),
++            "step": None if call.step is None else int(call.step),
++        },
++        os.path.join(_DUMP_DIR, f"call{index}.pt"),
++    )
