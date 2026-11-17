@@ -92,6 +92,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # workspace, whose rendezvous moves the buffers to system memory on amdgpu 6.16.x.
     # auto: on amdgpu < 7 or an unknown amdgpu version; 1: on any ROCm driver; 0: torch's workspace.
     "XDIT_TP_IPC_WORKSPACE": lambda: os.environ.get("XDIT_TP_IPC_WORKSPACE", "auto"),
+    # 1: with XDIT_TP_COMM_OVERLAP=symm_mem, every TP site runs row-wise FP8 (activations quantized per
+    # call, weights per output channel at sharding): torch's fused scaled AG+GEMM / GEMM+RS ops.
+    "XDIT_TP_FP8": lambda: os.environ.get("XDIT_TP_FP8", "0"),
     # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
     # thread logs what was missing and aborts the process (no wrong output is used); raise: the
     # stream moves on (that call's output is wrong) and the next SDMA call raises.

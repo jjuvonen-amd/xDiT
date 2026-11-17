@@ -43,6 +43,8 @@ MODES = {"tp2": (2, 1, 1), "tp4": (4, 1, 1), "tp2-ulysses2": (2, 2, 1), "tp2-rin
 WIDE_MODES = {"tp4-ring2": (4, 1, 2)}
 # Largest relative L2 error against one GPU, measured <= 3.2e-7 on MI350X. Q/K normalized over one
 # rank's heads errs by 2.5e-3 at TP 2, a dropped row-parallel FFN bias by 4.3e-3.
+# Row-wise FP8 E4M3 at every TP site: measured 3.9e-3..4.4e-3 against the one-GPU bf16 output.
+FP8_TOLERANCE = 2e-2
 TOLERANCE = 1e-5
 
 
@@ -75,6 +77,8 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
 
     if options.get("sdma_reduce_scatter"):
         os.environ["XDIT_TP_SDMA_REDUCE_SCATTER"] = "on"
+    if options.get("fp8"):
+        os.environ["XDIT_TP_FP8"] = "1"
     torch_sdma = options.get("torch_sdma", False)
     if torch_sdma:
         os.environ.update(
@@ -139,9 +143,13 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         if torch_sdma:
             from torch.distributed._symmetric_memory import _rocm_sdma
 
-            bf16_ops = ("fused_all_gather_matmul", "fused_matmul_reduce_scatter")
+            ops = ("fused_all_gather_matmul", "fused_matmul_reduce_scatter")
+            if options.get("fp8"):
+                ops = ("fused_all_gather_scaled_matmul", "fused_scaled_matmul_reduce_scatter")
             calls = _rocm_sdma.num_calls
-            assert min(calls[op] for op in bf16_ops) > 0, f"the SDMA path did not run: {calls}"
+            assert min(calls[op] for op in ops) > 0, f"the SDMA path did not run: {calls}"
+            if rank == 0:
+                print(f"SDMA op calls: {dict(calls)}", flush=True)
         if rank == 0:
             torch.save(output.cpu(), output_path)
     finally:
@@ -334,3 +342,22 @@ def test_tensor_parallel_with_patched_torch_symm_mem_matches_one_gpu(
 
     error = _relative_error(actual, expected)
     assert error <= TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+@pytest.mark.parametrize("mode, batch", [("tp2", 1), ("tp4", 1), ("tp2-ulysses2", 1), ("tp2", 2)])
+def test_tensor_parallel_fp8_with_patched_torch_symm_mem_is_close_to_one_gpu(
+    tmp_path, one_gpu_output, mode, batch, latent_shape
+):
+    """XDIT_TP_FP8=1: every TP site as torch's row-wise FP8 fused ops on their SDMA path; close to the
+    one-GPU bf16 output within FP8 rounding."""
+    if not torch.cuda.is_available() or torch.version.hip is None or not _torch_has_sdma_patch():
+        pytest.skip("needs ROCm and a torch patched with patches/pytorch")
+    expected = one_gpu_output("wan", latent_shape, batch=batch)
+
+    actual = _run(tmp_path, mode, "wan", latent_shape, batch=batch, fused="symm_mem", torch_sdma=True, fp8=True)
+
+    error = _relative_error(actual, expected)
+    print(f"FP8 TP relative error {error:.3e}")
+    assert error <= FP8_TOLERANCE, f"relative error {error:.3e}"

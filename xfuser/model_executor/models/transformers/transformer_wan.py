@@ -23,6 +23,7 @@ from xfuser.core.distributed.attention_a2a import (
     use_fused_a2a_interleave,
 )
 from xfuser.model_executor.layers.tensor_parallel import (
+    quantize_linear_fp8_,
     shard_linear_,
     shard_rms_norm_,
     tp_column_parallel,
@@ -45,6 +46,7 @@ from xfuser.core.distributed import (
 )
 from xfuser.model_executor.layers.attention_processor import xFuserAttentionProcessorRegister
 from xfuser.model_executor.models.transformers.transformers_utils import local_sp_pad_rows, zero_sp_pad_rows_hook
+import xfuser.envs as envs
 from xfuser.envs import PACKAGES_CHECKER
 from xfuser.core.vsa_attention import jenga_scheduled_drop_rate
 from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
@@ -735,6 +737,15 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             out_bias = shard_linear_(block.ffn.net[2], 1, tp_rank, tp_size)
             block.register_parameter("ffn_out_bias", torch.nn.Parameter(out_bias, requires_grad=False))
             block.__class__ = xFuserWanTPTransformerBlock
+            if fused_comm == "symm_mem" and envs.environment_variables["XDIT_TP_FP8"]().strip() == "1":
+                # Row-wise FP8 GEMMs at every TP site (the linears tp_column/row_parallel take).
+                for name in ("attn1", "attn2") if shard_cross_attention else ("attn1",):
+                    attn = getattr(block, name)
+                    # Cross-attention's K/V come from the text context on each rank, not through a TP site.
+                    quantize_linear_fp8_(attn.to_q if attn.is_cross_attention else attn.to_qkv)
+                    quantize_linear_fp8_(attn.to_out[0])
+                quantize_linear_fp8_(block.ffn.net[0].proj)
+                quantize_linear_fp8_(block.ffn.net[2])
         self._tp_size = tp_size
         self._tp_rank = tp_rank
         self._tp_chunks = overlap_chunks

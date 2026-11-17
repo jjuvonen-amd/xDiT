@@ -30,6 +30,11 @@ as it lands
 (layers/sdma_all_gather.py); reduce-scatters run as with `fused` unset, or with
 XDIT_TP_SDMA_REDUCE_SCATTER=on push their partial sums on SDMA engines and reduce
 them chunk by chunk.
+
+With `fused="symm_mem"`, a linear given a row-wise FP8 weight by `quantize_linear_fp8_`
+(XDIT_TP_FP8=1) runs the FP8 ops instead (`fused_all_gather_scaled_matmul` /
+`fused_scaled_matmul_reduce_scatter`): activations are quantized row-wise per call, the
+gathered rows move as FP8 (half the bytes), and the GEMMs are scaled FP8.
 """
 
 from typing import List, Optional, Sequence
@@ -78,6 +83,69 @@ def shard_rms_norm_(norm: nn.RMSNorm, tp_rank: int, tp_size: int) -> None:
     norm.normalized_shape = (*norm.normalized_shape[:-1], full // tp_size)
     if norm.weight is not None:
         norm.weight.data = norm.weight.data.chunk(tp_size)[tp_rank].contiguous()
+
+
+FP8 = torch.float8_e4m3fn
+
+
+def _rowwise_fp8(x: torch.Tensor):
+    """Row-wise FP8 E4M3 over the last dim: values and fp32 scales [..., 1]."""
+    amax = x.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-12)
+    scale = amax / torch.finfo(FP8).max
+    return (x.float() / scale).to(FP8), scale
+
+
+def quantize_linear_fp8_(linear: nn.Linear) -> None:
+    """Give a (sharded) linear a row-wise FP8 copy of its weight for the FP8 fused TP ops: per output
+    channel scales, stored as [in, out] column-major (the B layout of torch's scaled matmuls). The bf16
+    weight stays for the paths that do not use it."""
+    w_q, w_s = _rowwise_fp8(linear.weight.data)
+    linear.tp_fp8_weight = w_q.t()  # [in, out], column-major
+    linear.tp_fp8_scale = w_s.view(1, -1)  # [1, out]
+
+
+def _seq_rows(x: torch.Tensor) -> torch.Tensor:
+    """(batch, rows, features) -> (rows * batch, features), sequence-major (a view when batch is 1)."""
+    return x.transpose(0, 1).reshape(-1, x.shape[-1])
+
+
+def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
+    batch, rows, _ = x.shape
+    xq, xs = _rowwise_fp8(_seq_rows(x))
+    _, (out,) = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
+        xq,
+        [linear.tp_fp8_weight],
+        xs,
+        [linear.tp_fp8_scale],
+        gather_dim=0,
+        biases=[None],
+        result_scales=[None],
+        # hipBLASLt's row-wise scaled GEMM writes bf16 only
+        out_dtypes=[torch.bfloat16],
+        use_fast_accum=[False],
+        group_name=get_tp_group().device_group.group_name,
+    )
+    out = out.view(-1, batch, out.shape[-1]).transpose(0, 1).to(x.dtype)
+    return out if linear.bias is None else out + linear.bias
+
+
+def _fp8_row_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
+    batch = x.shape[0]
+    xq, xs = _rowwise_fp8(_seq_rows(x))
+    n = linear.tp_fp8_weight.shape[1]
+    out = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
+        xq,
+        linear.tp_fp8_weight,
+        xs,
+        linear.tp_fp8_scale,
+        "sum",
+        0,
+        0,
+        get_tp_group().device_group.group_name,
+        [xq.shape[0], n],
+        out_dtype=torch.bfloat16,
+    )
+    return out.view(-1, batch, n).transpose(0, 1).to(x.dtype)
 
 
 def tp_all_gather_seq(x: torch.Tensor, site: str) -> torch.Tensor:
@@ -146,6 +214,9 @@ def tp_column_parallel(
                 envs.environment_variables["XDIT_TP_SDMA_TRIGGER"]().strip().lower(),
                 envs.environment_variables["XDIT_TP_SDMA_DIRECTION"]().strip().lower(),
             )
+    if fused == "symm_mem" and getattr(linear, "tp_fp8_weight", None) is not None:
+        with record_function(f"tp_ag_fp8:{site}"):
+            return _fp8_column_parallel(x, linear)
     if fused:
         with record_function(f"tp_ag:{site}"):
             _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(
@@ -170,7 +241,10 @@ def tp_row_parallel(
     fused: Optional[str] = None,
 ) -> torch.Tensor:
     """Row-parallel `linear` over all rows of `x`, reduce-scattered to this rank's rows, plus `bias` once."""
-    if fused == "symm_mem":
+    if fused == "symm_mem" and getattr(linear, "tp_fp8_weight", None) is not None:
+        with record_function(f"tp_rs_fp8:{site}"):
+            out = _fp8_row_parallel(x, linear)
+    elif fused == "symm_mem":
         with record_function(f"tp_rs:{site}"):
             out = torch.ops.symm_mem.fused_matmul_reduce_scatter(
                 x, linear.weight.t(), "sum", 1, get_tp_group().device_group.group_name
