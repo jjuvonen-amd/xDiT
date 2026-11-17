@@ -260,19 +260,21 @@ def _sdma_gather_apply_scatter(rs, tensors, fn, out_features, out_dtype, chunks)
     row_bytes = [t.shape[1] * t.element_size() for t in xs]
     block_bytes = block * N * recv.element_size()
     partials = torch.empty(chunks, world, block, N, dtype=out_dtype, device=xs[0].device)
-    plan = rs._Plan(lib, g, 2 * chunks, max(len(xs), 1))
+    # Two plans: a plan's pushes must all carry the same number of copies per peer (its completion
+    # signals are indexed by piece x peer x copy), and the gather moves len(xs) tensors, the scatter one.
+    gather = rs._Plan(lib, g, chunks, len(xs))
+    scatter = rs._Plan(lib, g, chunks, 1)
     for c in range(chunks):
         at = [off + (rank * rows + c * block) * size for off, size in zip(offsets[:-1], row_bytes)]
-        plan.push(
+        gather.push(
             0,
             [bases[p] + a for p in g.peers for a in at],
             [bases[rank] + a for _ in g.peers for a in at],
             [block * size for size in row_bytes],
             [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
         )
-    for c in range(chunks):
-        plan.push(
-            1 + c,
+        scatter.push(
+            c,
             [bases[p] + offsets[-1] + (c * world + rank) * block_bytes for p in g.peers],
             [partials[c, p].data_ptr() for p in g.peers],
             [block_bytes],
@@ -286,27 +288,28 @@ def _sdma_gather_apply_scatter(rs, tensors, fn, out_features, out_dtype, chunks)
     pieces = [inbox.view(world, chunks, block, -1) for inbox in gathered]
 
     def reduce(c):
-        plan.wait(cur, flags[chunks + c], chunks + c)
+        scatter.wait(cur, flags[chunks + c], c)
         recv[c, rank].copy_(partials[c, rank])
         out[c * block : (c + 1) * block] = torch.sum(recv[c], dim=0, dtype=torch.float32)
 
     rs._barrier(ws)
     in_last_barrier = False
     try:
-        plan.start(cur)
-        plan.release(0, cur)
+        gather.start(cur)
+        scatter.start(cur)
+        gather.release(0, cur)
         for c in range(chunks):
-            plan.wait(cur, flags[c], c)
+            gather.wait(cur, flags[c], c)
             y = fn(*[p[:, c].reshape(world * block, -1) for p in pieces])
             partials[c].copy_(y.view(world, block, N))
-            plan.release(1 + c, cur)
+            scatter.release(c, cur)
             if c > 0:
                 reduce(c - 1)
         reduce(chunks - 1)
         in_last_barrier = True
         rs._barrier(ws)
     except BaseException as e:
-        if not plan.capturing:
+        if not (gather.capturing or scatter.capturing):
             rs._abandon(e, ws, in_last_barrier)
         raise
     return out
