@@ -14,7 +14,8 @@ transport use, which maps the peers' VRAM directly on every driver.
   layers/sdma_all_gather.py (XDIT_TP_COMM_OVERLAP=sdma).
 - `install_torch_sdma_inbox()`: points the inbox of torch's patched ROCm SDMA ops
   (`torch.distributed._symmetric_memory._rocm_sdma`, patches/pytorch; XDIT_TP_COMM_OVERLAP=symm_mem)
-  at this workspace.
+  at this workspace. A patch with transport ABI 3 or later shares its inbox over hipIpc itself,
+  and keeps it unless TORCH_SYMM_MEM_ROCM_SDMA_INBOX=symm_mem.
 
 XDIT_TP_IPC_WORKSPACE=auto (default) uses them on amdgpu < 7 or an unknown amdgpu version, 1 on
 any ROCm driver, 0 never (torch's workspace).
@@ -221,6 +222,10 @@ def install_torch_sdma_inbox() -> bool:
         import torch.distributed._symmetric_memory._rocm_sdma as rocm_sdma
     except ImportError:
         return False
+    if getattr(rocm_sdma, "ABI_VERSION", 0) >= 3 and rocm_sdma._inbox_mode() == "ipc":
+        # The patch's own hipIpc inbox, with its GPU barrier (this workspace's barrier is an RCCL
+        # all_reduce).
+        return True
     if getattr(rocm_sdma, "_xfuser_orig_inbox", None) is None:
         rocm_sdma._xfuser_orig_inbox = rocm_sdma._inbox
         rocm_sdma._inbox = _torch_sdma_inbox
