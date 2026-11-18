@@ -40,7 +40,8 @@ BLOCK_M = 256
 _ALIGN = 256
 _VALUES = 1 << 22  # call numbers available as flag values before the counters wrap
 _relays: Dict[str, "TPRelay"] = {}
-_side: Dict[int, torch.cuda.Stream] = {}
+_side: Dict[int, torch.cuda.Stream] = {}  # helper forwards
+_post: Dict[int, torch.cuda.Stream] = {}  # GEMM + reduce-scatter: this rank's chunks, once their tiles are counted
 calls = {"all_gather_gemm": 0, "gemm_reduce_scatter": 0}
 
 
@@ -63,6 +64,29 @@ def _wait_kernel():
                 v = tl.atomic_add(F + w, 0, sem="acquire", scope="sys")
 
     return wait_words
+
+
+@functools.lru_cache(maxsize=None)
+def _reduce_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def reduce_chunk(RECV, OWN, OUT, sender_stride, me, n, W: tl.constexpr, BLOCK: tl.constexpr):
+        """OUT[i] = bf16(sum over r < W in rank order of part_r[i]) in fp32: part_r = RECV + r * sender_stride
+        (this chunk of sender r's partials), or OWN for r == me."""
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for r in tl.static_range(W):
+            if r == me:
+                v = tl.load(OWN + offs, mask=m, other=0.0)
+            else:
+                v = tl.load(RECV + r * sender_stride + offs, mask=m, other=0.0)
+            acc += v.to(tl.float32)
+        tl.store(OUT + offs, acc.to(tl.bfloat16), mask=m)
+
+    return reduce_chunk
 
 
 def _pieces(nbytes: int, helpers: int, direct_frac: float):
@@ -427,7 +451,21 @@ class TPRelay:
         out = torch.empty(rows, N, dtype=torch.bfloat16, device=dev)
         cnt.zero_()
         call = self.w.begin()
-        side.wait_stream(cur)  # counters zeroed before the side stream reads them
+        post = _post.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
+        post.wait_stream(cur)  # counters zeroed before the poster reads them
+        side.wait_stream(cur)
+        wait = _wait_kernel()
+        # Each engine runs its copies in issue (host) order, so issue in expected-ready order: this rank's chunk
+        # c (poster stream, once its tiles are counted), then the other group's staged pieces of chunk c (forwarder
+        # stream). Separate streams: a forwarder's wait never holds back the next post's release, nor vice versa.
+        for c in range(C):
+            with torch.cuda.stream(post):
+                wait[(1,)](cnt, e["cnt_idx"][c], e["cnt_idx"][c].numel(), e["tiles"])
+                call.send(pp["chunks"][c], partials, post, flag_src)
+            with torch.cuda.stream(side):
+                for i in range(Wt):
+                    wait[(1,)](flags, e["stage_idx"][c * Wt + i], 1, n)
+                    call.send(pp["fwd"][c][i], stage_all, side, flag_src)
         exe = compile_persistent_ag_gemm_fp8(K=K, BLOCK_M=BLOCK_M, BLOCK_N=256, mode="rs")
         progs = torch.cuda.get_device_properties(dev).multi_processor_count * 7 // 8
         _run_compiled(
@@ -451,27 +489,20 @@ class TPRelay:
             progs,
             fx.Stream(cur),
         )
-        wait = _wait_kernel()
-        # one side stream, in a fixed order per chunk: post this rank's chunk once its tiles are counted (the
-        # GEMM depends on nothing remote), then forward the other group's staged pieces of that chunk
-        with torch.cuda.stream(side):
-            for c in range(C):
-                wait[(1,)](cnt, e["cnt_idx"][c], e["cnt_idx"][c].numel(), e["tiles"])
-                call.send(pp["chunks"][c], partials, side, flag_src)
-                for i in range(Wt):
-                    wait[(1,)](flags, e["stage_idx"][c * Wt + i], 1, n)
-                    call.send(pp["fwd"][c][i], stage_all, side, flag_src)
-        own = partials.view(Wt, C, block, N)[self.me]
+        own = partials.view(Wt, C, block * N)[self.me]
+        recv_flat = recv.view(Wt, C, block * N)
+        reduce = _reduce_kernel()
+        RB = 4096
+        nel = block * N
         for c in range(C):
             wait[(1,)](flags, e["data_idx"][c], e["data_idx"][c].numel(), n)
-            total = own[c].float()
-            for s_ in range(Wt):
-                if s_ != self.me:
-                    total += recv[s_, c].float()
-            out[c * block : (c + 1) * block] = total
+            reduce[((nel + RB - 1) // RB,)](
+                recv_flat[0, c], own[c], out[c * block :], C * nel, self.me, nel, W=Wt, BLOCK=RB
+            )
+        cur.wait_stream(post)
         cur.wait_stream(side)
         call.end()
-        partials.record_stream(side)
+        partials.record_stream(post)
         calls["gemm_reduce_scatter"] += 1
         return out
 
