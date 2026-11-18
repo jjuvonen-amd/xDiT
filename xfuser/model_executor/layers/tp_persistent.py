@@ -29,7 +29,7 @@ BLOCK_K = 128
 _warned = set()
 _rs_state = {}
 # calls that ran the persistent kernels (tests check these)
-calls = {"all_gather_gemm": 0, "gemm_reduce_scatter": 0}
+calls = {"all_gather_gemm": 0, "gemm_reduce_scatter": 0, "all_gather_gemm_bf16": 0}
 
 
 def _fallback(kind: str, why: str) -> None:
@@ -235,4 +235,53 @@ def gemm_reduce_scatter_fp8(rs, xq, xs, w_t, w_s, group_name: str) -> Optional[t
         raise
     partials.record_stream(post)
     calls["gemm_reduce_scatter"] += 1
+    return out
+
+
+def all_gather_gemm_bf16(rs, x, w_t, group_name: str) -> Optional[torch.Tensor]:
+    """all_gather(x rows) @ w_t in bf16: x [rows, K], w_t [K, N] (e.g. weight.t()) -> [world * rows, N], with one
+    flag-gated FlyDSL GEMM over the gathered inbox (layers/flydsl_tp_gemm_bf16.py); None if the call does not fit."""
+    from xfuser.model_executor.layers.flydsl_tp_gemm_bf16 import ag_gemm_bf16
+
+    g = rs._group(group_name)
+    world, rank = g.world, g.rank
+    rows, K = x.shape
+    chunks = rs._chunks(rows, K * x.element_size())
+    if x.dtype != torch.bfloat16 or w_t.dtype != x.dtype or rows % chunks or K % 64:
+        _fallback("bf16 all-gather + GEMM", f"rows {rows}, K {K}, dtype {x.dtype}")
+        return None
+    block = rows // chunks
+    lib = rs._load()
+    stream = torch.cuda.current_stream()
+    ws, (inbox,), offsets, flags, bases, flag_offset = rs._inbox(
+        group_name, rank, world, [((world, rows, K), x.dtype)], chunks
+    )
+    row_bytes = K * x.element_size()
+    plan = rs._Plan(lib, g, chunks, 1)
+    for c in range(chunks):
+        at = offsets[0] + (rank * rows + c * block) * row_bytes
+        plan.push(
+            0,
+            [bases[p] + at for p in g.peers],
+            [bases[rank] + at for _ in g.peers],
+            [block * row_bytes],
+            [bases[p] + flag_offset + (c * world + rank) * 4 for p in g.peers],
+        )
+    flags.zero_()
+    flags[:, rank] = 1
+    inbox[rank].copy_(x)
+    out = x.new_empty(world * rows, w_t.shape[1])
+    rs._barrier(ws)
+    in_last_barrier = False
+    try:
+        plan.start(stream)
+        plan.release(0, stream)
+        ag_gemm_bf16(inbox.view(world * rows, K), w_t, out, flags.data_ptr(), world, rank, rows, block, stream=stream)
+        in_last_barrier = True
+        rs._barrier(ws)
+    except BaseException as err:
+        if not plan.capturing:
+            rs._abandon(err, ws, in_last_barrier)
+        raise
+    calls["all_gather_gemm_bf16"] = calls.get("all_gather_gemm_bf16", 0) + 1
     return out

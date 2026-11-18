@@ -383,6 +383,17 @@ def tp_column_parallel(
     if fused == "symm_mem" and getattr(linear, "tp_fp8_weight", None) is not None:
         with record_function(f"tp_ag_fp8:{site}"):
             return _fp8_column_parallel(x, linear)
+    if fused == "symm_mem" and (rs := _persistent_ops()) is not None:
+        from xfuser.model_executor.layers import tp_persistent
+
+        with record_function(f"tp_ag_persistent:{site}"):
+            batch = x.shape[0]
+            out = tp_persistent.all_gather_gemm_bf16(
+                rs, _seq_rows(x).contiguous(), linear.weight.t(), get_tp_group().device_group.group_name
+            )
+        if out is not None:
+            out = out.view(-1, batch, out.shape[-1]).transpose(0, 1)
+            return out if linear.bias is None else out + linear.bias
     if fused:
         with record_function(f"tp_ag:{site}"):
             _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(

@@ -157,7 +157,8 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         if options.get("persistent"):
             from xfuser.model_executor.layers import tp_persistent
 
-            assert min(tp_persistent.calls.values()) > 0, f"the persistent kernels did not run: {tp_persistent.calls}"
+            ran = [tp_persistent.calls[k] for k in ("all_gather_gemm", "gemm_reduce_scatter")]
+            assert min(ran) > 0, f"the persistent FP8 kernels did not run: {tp_persistent.calls}"
         if rank == 0:
             torch.save(output.cpu(), output_path)
     finally:
