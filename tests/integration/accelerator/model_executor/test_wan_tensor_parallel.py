@@ -79,6 +79,8 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         os.environ["XDIT_TP_SDMA_REDUCE_SCATTER"] = "on"
     if options.get("fp8"):
         os.environ["XDIT_TP_FP8"] = "1"
+    if options.get("persistent"):
+        os.environ["XDIT_TP_PERSISTENT"] = "1"
     if options.get("row_align"):
         os.environ["XDIT_TP_ROW_ALIGN"] = str(options["row_align"])
     torch_sdma = options.get("torch_sdma", False)
@@ -142,7 +144,7 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         fused_kernels = symm_mem._test_mode() if fallback else contextlib.nullcontext()
         with torch.no_grad(), fused_kernels:
             output = model(**inputs, return_dict=False)[0]
-        if torch_sdma:
+        if torch_sdma and not options.get("persistent"):  # the persistent path bypasses torch's ops
             from torch.distributed._symmetric_memory import _rocm_sdma
 
             ops = ("fused_all_gather_matmul", "fused_matmul_reduce_scatter")
@@ -152,6 +154,10 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
             assert min(calls[op] for op in ops) > 0, f"the SDMA path did not run: {calls}"
             if rank == 0:
                 print(f"SDMA op calls: {dict(calls)}", flush=True)
+        if options.get("persistent"):
+            from xfuser.model_executor.layers import tp_persistent
+
+            assert min(tp_persistent.calls.values()) > 0, f"the persistent kernels did not run: {tp_persistent.calls}"
         if rank == 0:
             torch.save(output.cpu(), output_path)
     finally:
@@ -378,3 +384,32 @@ def test_tensor_parallel_with_row_alignment_matches_one_gpu(tmp_path, one_gpu_ou
 
     error = _relative_error(actual, expected)
     assert error <= TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+# TP 2: every site's K (hidden 512, FFN 256, split two ways) has the two 128-wide K blocks the kernel needs.
+@pytest.mark.parametrize("mode, batch", [("tp2", 1), ("tp2-ulysses2", 1), ("tp2", 2)])
+def test_tensor_parallel_fp8_persistent_is_close_to_one_gpu(tmp_path, one_gpu_output, mode, batch, latent_shape):
+    """XDIT_TP_PERSISTENT=1: the FP8 TP sites as persistent FlyDSL GEMMs on the SDMA transport (rows padded to whole
+    256-row tiles); close to the one-GPU bf16 output within FP8 rounding."""
+    if not torch.cuda.is_available() or torch.version.hip is None or not _torch_has_sdma_patch():
+        pytest.skip("needs ROCm and a torch patched with patches/pytorch")
+    pytest.importorskip("flydsl")
+    expected = one_gpu_output("wan", latent_shape, batch=batch)
+
+    actual = _run(
+        tmp_path,
+        mode,
+        "wan",
+        latent_shape,
+        batch=batch,
+        fused="symm_mem",
+        torch_sdma=True,
+        fp8=True,
+        persistent=True,
+        row_align=256,
+    )
+
+    error = _relative_error(actual, expected)
+    assert error <= FP8_TOLERANCE, f"relative error {error:.3e}"

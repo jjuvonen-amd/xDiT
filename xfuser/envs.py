@@ -97,6 +97,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_TP_FP8": lambda: os.environ.get("XDIT_TP_FP8", "0"),
     # Pad the sequence so each TP rank holds a multiple of this many rows (1: no extra padding).
     "XDIT_TP_ROW_ALIGN": lambda: os.environ.get("XDIT_TP_ROW_ALIGN", "1"),
+    # 1: the FP8 TP sites run persistent FlyDSL GEMMs on the SDMA transport (layers/tp_persistent.py): one launch
+    # per all-gather + GEMM / GEMM + reduce-scatter, waiting on piece flags in-kernel. Needs XDIT_TP_FP8=1.
+    "XDIT_TP_PERSISTENT": lambda: os.environ.get("XDIT_TP_PERSISTENT", "0"),
     # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
     # thread logs what was missing and aborts the process (no wrong output is used); raise: the
     # stream moves on (that call's output is wrong) and the next SDMA call raises.

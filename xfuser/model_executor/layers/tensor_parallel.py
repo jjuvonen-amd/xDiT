@@ -109,9 +109,26 @@ def _seq_rows(x: torch.Tensor) -> torch.Tensor:
     return x.transpose(0, 1).reshape(-1, x.shape[-1])
 
 
+def _persistent_ops():
+    """torch's patched ROCm SDMA module when XDIT_TP_PERSISTENT=1 can use it (eager calls), else None."""
+    if envs.environment_variables["XDIT_TP_PERSISTENT"]().strip() != "1" or torch.cuda.is_current_stream_capturing():
+        return None
+    return _rocm_sdma_ops()
+
+
 def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
     batch, rows, _ = x.shape
     xq, xs = _rowwise_fp8(_seq_rows(x))
+    rs = _persistent_ops()
+    if rs is not None:
+        from xfuser.model_executor.layers import tp_persistent
+
+        out = tp_persistent.all_gather_gemm_fp8(
+            rs, xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, get_tp_group().device_group.group_name
+        )
+        if out is not None:
+            out = out.view(-1, batch, out.shape[-1]).transpose(0, 1).to(x.dtype)
+            return out if linear.bias is None else out + linear.bias
     _, (out,) = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
         xq,
         [linear.tp_fp8_weight],
@@ -133,6 +150,15 @@ def _fp8_row_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
     batch = x.shape[0]
     xq, xs = _rowwise_fp8(_seq_rows(x))
     n = linear.tp_fp8_weight.shape[1]
+    rs = _persistent_ops()
+    if rs is not None:
+        from xfuser.model_executor.layers import tp_persistent
+
+        out = tp_persistent.gemm_reduce_scatter_fp8(
+            rs, xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, get_tp_group().device_group.group_name
+        )
+        if out is not None:
+            return out.view(-1, batch, n).transpose(0, 1).to(x.dtype)
     out = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
         xq,
         linear.tp_fp8_weight,
