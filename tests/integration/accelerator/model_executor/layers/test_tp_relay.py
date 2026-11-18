@@ -1,4 +1,5 @@
-"""The relayed FP8 TP all-gather + GEMM (XDIT_TP_RELAY=1, two TP4 groups on 8 GPUs) against the direct FP8 path."""
+"""The relayed FP8 TP all-gather + GEMM and GEMM + reduce-scatter (XDIT_TP_RELAY=1, two TP4 groups on 8 GPUs)
+against the direct FP8 paths."""
 
 import pytest
 
@@ -17,7 +18,7 @@ def _worker(rank, world_size, init_method):
     from xfuser.core.distributed import init_distributed_environment, initialize_model_parallel, ipc_workspace
     from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
     from xfuser.model_executor.layers import tp_relay
-    from xfuser.model_executor.layers.tensor_parallel import quantize_linear_fp8_, tp_column_parallel
+    from xfuser.model_executor.layers.tensor_parallel import quantize_linear_fp8_, tp_column_parallel, tp_row_parallel
 
     try:
         torch.cuda.set_device(rank)
@@ -44,11 +45,25 @@ def _worker(rank, world_size, init_method):
                 assert tp_relay.calls["all_gather_gemm"] == before + 1, "the relayed path did not run"
             error = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
             assert error < 1e-2, f"rows {rows} k {k} n {n}: relative error {error:.3e} vs the direct FP8 path"
+            # GEMM + reduce-scatter: all of the group's rows, this rank's K shard
+            row_linear = torch.nn.Linear(k, n, bias=False, device="cuda", dtype=torch.bfloat16)
+            torch.nn.init.normal_(row_linear.weight, std=k**-0.5, generator=gen)
+            quantize_linear_fp8_(row_linear)
+            xr = torch.randn(1, 4 * rows, k, device="cuda", dtype=torch.bfloat16, generator=gen)
+            with torch.inference_mode():
+                os.environ["XDIT_TP_RELAY"] = "0"
+                ref = tp_row_parallel(xr, row_linear, None, "test", 1, "symm_mem")
+                os.environ["XDIT_TP_RELAY"] = "1"
+                before = tp_relay.calls["gemm_reduce_scatter"]
+                out = tp_row_parallel(xr, row_linear, None, "test", 1, "symm_mem")
+                assert tp_relay.calls["gemm_reduce_scatter"] == before + 1, "the relayed RS path did not run"
+            error = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+            assert error < 1e-2, f"RS rows {rows} k {k} n {n}: relative error {error:.3e} vs the direct FP8 path"
         dist.barrier()
     finally:
         destroy_model_parallel()
         destroy_distributed_environment()
 
 
-def test_relayed_fp8_all_gather_gemm_matches_direct(accelerator_ranks):
+def test_relayed_fp8_tp_ops_match_direct(accelerator_ranks):
     accelerator_ranks(_worker, world_size=8, timeout=900)

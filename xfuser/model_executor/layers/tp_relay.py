@@ -39,6 +39,23 @@ def enabled() -> bool:
 
 
 @functools.lru_cache(maxsize=None)
+def _wait_count_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def wait_counts(CNT, IDX, n, target):
+        """Spin (system-scope acquire) until CNT[IDX[i]] >= target for every i < n."""
+        for i in range(n):
+            w = tl.load(IDX + i)
+            v = tl.atomic_add(CNT + w, 0, sem="acquire", scope="sys")
+            while v < target:
+                v = tl.atomic_add(CNT + w, 0, sem="acquire", scope="sys")
+
+    return wait_counts
+
+
+@functools.lru_cache(maxsize=None)
 def _wait_kernel():
     import triton
     import triton.language as tl
@@ -291,6 +308,190 @@ class TPRelay:
         # every copy into or out of this call's buffers is done past this barrier
         dist.all_reduce(self._one(dev), group=self.w.process_group)
         calls["all_gather_gemm"] += 1
+        return out
+
+    # -- GEMM + reduce-scatter ------------------------------------------------------------------------------
+    def _rs_plans(self, rows: int, N: int, C: int, partials_ptr_unused=None) -> dict:
+        key = ("rs", rows, N, C)
+        cached = self._plans.get(key)
+        w, T = self.w, self.transport
+        Wt, H, P = self.Wt, self.H, self.P
+        block = rows // C
+        cb = block * N * 2  # bytes of a chunk of bf16 partial sums
+        pieces = _pieces(cb, H, self.direct_frac)
+        stage_slot = max(sz for _, sz in pieces[1:])
+        recv = w.buffer("tp_relay_rs_recv", Wt * C * cb)  # [sender][c] at each destination
+        st_buf = w.buffer("tp_relay_rs_stage", Wt * Wt * C * stage_slot)  # [client sender][client dest][c]
+        nwords = self.flag_words(C)[-1]
+        f_buf = w.buffer("tp_relay_flags_rs", nwords * 4)
+        bufs = (recv, st_buf, f_buf)
+        if cached is not None and all(b.live for b in bufs) and cached["bufs"] == [id(b) for b in bufs]:
+            return cached
+        data, _, stage, scratch, _ = self.flag_words(C)
+        me, ranks, helpers, peers = self.me, self.ranks, self.helpers, w.peers
+
+        def flag(rank, word):
+            return self.base(f_buf, rank) + word * 4
+
+        def stage_addr(helper_rank, sender, dest, c):
+            return self.base(st_buf, helper_rank) + ((sender * Wt + dest) * C + c) * stage_slot
+
+        def src(dest, c):  # this rank's partials for dest's chunk c: rows dest * rows + c * block of [S, N]
+            return (dest * rows + c * block) * N * 2
+
+        # chunk c: to each TP peer its direct piece; to each helper, its piece of every peer's chunk c
+        chunk_plans = []
+        for c in range(C):
+            copies, flags = [], []
+            for q in peers:
+                if q in ranks:
+                    p_idx = ranks.index(q)
+                    off, size = pieces[0]
+                    copies.append([(src(p_idx, c) + off, self.base(recv, q) + (me * C + c) * cb + off, size)])
+                    flags.append(flag(q, data + (c * Wt + me) * P + 0))
+                else:
+                    j = helpers.index(q)
+                    off, size = pieces[1 + j]
+                    copies.append(
+                        [(src(p_idx, c) + off, stage_addr(q, me, p_idx, c), size) for p_idx in range(Wt) if p_idx != me]
+                    )
+                    flags.append(flag(q, stage + c * Wt + me))
+            chunk_plans.append(T.Plan(w, copies, flags))
+        # as a helper of the other group: forward client sender i's pieces of chunk c to every client dest
+        clients, hidx = helpers, me
+        off, size = pieces[1 + hidx]
+        fwd_plans = []
+        for c in range(C):
+            per_sender = []
+            for i in range(Wt):
+                copies, flags = [], []
+                for q in peers:
+                    if q in clients and clients.index(q) != i:
+                        d = clients.index(q)
+                        copies.append(
+                            [
+                                (
+                                    stage_addr(w.rank, i, d, c) - st_buf.ptr,
+                                    self.base(recv, q) + (i * C + c) * cb + off,
+                                    size,
+                                )
+                            ]
+                        )
+                        flags.append(flag(q, data + (c * Wt + i) * P + 1 + hidx))
+                    else:
+                        copies.append([])
+                        flags.append(flag(q, scratch))
+                per_sender.append(T.Plan(w, copies, flags))
+            fwd_plans.append(per_sender)
+        if cached is not None:
+            for plan in [*cached["chunks"], *(p for row in cached["fwd"] for p in row)]:
+                plan.free()
+        plans = {
+            "chunks": chunk_plans,
+            "fwd": fwd_plans,
+            "bufs": [id(b) for b in bufs],
+            "recv": recv,
+            "stage": st_buf,
+            "flags": f_buf,
+        }
+        self._plans[key] = plans
+        return plans
+
+    def gemm_reduce_scatter_fp8(self, xq, xs, w_t, w_s, chunks: int) -> torch.Tensor:
+        """xq [S, K] fp8 (all rows of the group, this rank's K shard), xs [S, 1], w_t [K, N] column-major,
+        w_s [1, N] -> this rank's [S / Wt, N] bf16, partial sums relayed through the other group."""
+        import flydsl.expr as fx
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+        from xfuser.model_executor.layers.flydsl_tp_gemm import compile_persistent_ag_gemm_fp8
+
+        S, K = xq.shape
+        N = w_t.shape[1]
+        C, Wt, P = chunks, self.Wt, self.P
+        rows = S // Wt
+        block = rows // C
+        pl = self._rs_plans(rows, N, C)
+        data, _, stage, _, nwords = self.flag_words(C)
+        dev = xq.device
+        cur = torch.cuda.current_stream()
+        side = _side.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
+        flags = pl["flags"].local.view(torch.int32)[:nwords]
+        recv = pl["recv"].local[: Wt * C * block * N * 2].view(torch.bfloat16).view(Wt, C, block, N)
+        key = ("rs_state", dev.index, rows, N, C)
+        if key not in self._plans:
+            tiles = (block // BLOCK_M) * ((N + 255) // 256)  # GEMM tiles per (chunk, peer)
+            peers_of = [i for i in range(Wt) if i != self.me]
+            self._plans[key] = (
+                torch.zeros(C * Wt, dtype=torch.int32, device=dev),  # tile counters [c][dest]
+                tiles,
+                [torch.tensor([c * Wt + p for p in peers_of], dtype=torch.int32, device=dev) for c in range(C)],
+                [
+                    torch.tensor([stage + c * Wt + i], dtype=torch.int32, device=dev)
+                    for c in range(C)
+                    for i in range(Wt)
+                ],
+                [
+                    torch.tensor(
+                        [data + (c * Wt + s) * P + k for s in peers_of for k in range(P)], dtype=torch.int32, device=dev
+                    )
+                    for c in range(C)
+                ],
+            )
+        cnt, tiles, cnt_idx, stage_idx, data_idx = self._plans[key]
+        partials = torch.empty(S, N, dtype=torch.bfloat16, device=dev)
+        out = torch.empty(rows, N, dtype=torch.bfloat16, device=dev)
+        flags.zero_()
+        cnt.zero_()
+        dist.all_reduce(self._one(dev), group=self.w.process_group)  # flags zeroed, buffers free everywhere
+        call = self.w.begin()
+        side.wait_stream(cur)
+        exe = compile_persistent_ag_gemm_fp8(K=K, BLOCK_M=BLOCK_M, BLOCK_N=256, mode="rs")
+        progs = torch.cuda.get_device_properties(dev).multi_processor_count * 7 // 8
+        _run_compiled(
+            exe,
+            xq.contiguous().view(torch.int8).view(-1)[: rows * K],
+            w_t.t().view(torch.int8).reshape(-1),
+            partials.view(-1)[: rows * N],
+            xs.reshape(-1).float().contiguous()[:rows],
+            w_s.reshape(-1).float().contiguous(),
+            cnt.data_ptr(),
+            1,
+            self.me,
+            Wt,
+            rows,
+            block,
+            rows,
+            rows,
+            0,
+            1,
+            N,
+            progs,
+            fx.Stream(cur),
+        )
+        wait_counts = _wait_count_kernel()
+        wait = _wait_kernel()
+        # one side stream, in a fixed order per chunk: post this rank's chunk once its tiles are counted (the
+        # GEMM depends on nothing remote), then forward the other group's staged pieces of that chunk
+        with torch.cuda.stream(side):
+            for c in range(C):
+                wait_counts[(1,)](cnt, cnt_idx[c], cnt_idx[c].numel(), tiles)
+                call.send(pl["chunks"][c], partials, side)
+                for i in range(Wt):
+                    wait[(1,)](flags, stage_idx[c * Wt + i], 1)
+                    call.send(pl["fwd"][c][i], pl["stage"].local, side)
+        own = partials.view(Wt, C, block, N)[self.me]
+        for c in range(C):
+            wait[(1,)](flags, data_idx[c], data_idx[c].numel())
+            total = own[c].float()
+            for s_ in range(Wt):
+                if s_ != self.me:
+                    total += recv[s_, c].float()
+            out[c * block : (c + 1) * block] = total
+        cur.wait_stream(side)
+        call.end()
+        dist.all_reduce(self._one(dev), group=self.w.process_group)  # every copy of this call is done
+        partials.record_stream(side)
+        calls["gemm_reduce_scatter"] += 1
         return out
 
 

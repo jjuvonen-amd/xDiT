@@ -168,10 +168,31 @@ def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
     return out if linear.bias is None else out + linear.bias
 
 
+def _relay_reduce_scatter_fp8(xq, xs, linear):
+    """The relayed persistent FP8 GEMM + reduce-scatter (XDIT_TP_RELAY=1, two TP groups on the node), or None."""
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    from xfuser.model_executor.layers import tp_relay
+
+    relay = tp_relay.relay_for(get_tp_group().device_group.group_name)
+    if relay is None:
+        return None
+    from xfuser.model_executor.layers.tp_persistent import _tile_chunks
+
+    S, K = xq.shape
+    chunks = _tile_chunks(4, S // relay.Wt) if S % relay.Wt == 0 else None
+    if chunks is None or K % 128 or K < 256:
+        return None
+    return relay.gemm_reduce_scatter_fp8(xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, chunks)
+
+
 def _fp8_row_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
     batch = x.shape[0]
     xq, xs = _rowwise_fp8(_seq_rows(x))
     n = linear.tp_fp8_weight.shape[1]
+    relayed = _relay_reduce_scatter_fp8(xq, xs, linear)
+    if relayed is not None:
+        return relayed.view(-1, batch, n).transpose(0, 1).to(x.dtype)
     rs = _persistent_ops()
     if rs is not None:
         from xfuser.model_executor.layers import tp_persistent
