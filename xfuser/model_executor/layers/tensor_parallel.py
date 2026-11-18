@@ -116,9 +116,31 @@ def _persistent_ops():
     return _rocm_sdma_ops()
 
 
+def _relay_all_gather_fp8(xq, xs, linear):
+    """The relayed persistent FP8 all-gather + GEMM (XDIT_TP_RELAY=1, two TP groups on the node), or None."""
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    from xfuser.model_executor.layers import tp_relay
+
+    relay = tp_relay.relay_for(get_tp_group().device_group.group_name)
+    if relay is None:
+        return None
+    from xfuser.model_executor.layers.tp_persistent import _tile_chunks
+
+    rows, K = xq.shape
+    chunks = _tile_chunks(4, rows)
+    if chunks is None or K % 128 or K < 256:
+        return None
+    return relay.all_gather_gemm_fp8(xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, chunks)
+
+
 def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
     batch, rows, _ = x.shape
     xq, xs = _rowwise_fp8(_seq_rows(x))
+    relayed = _relay_all_gather_fp8(xq, xs, linear)
+    if relayed is not None:
+        out = relayed.view(-1, batch, relayed.shape[-1]).transpose(0, 1).to(x.dtype)
+        return out if linear.bias is None else out + linear.bias
     rs = _persistent_ops()
     if rs is not None:
         from xfuser.model_executor.layers import tp_persistent
