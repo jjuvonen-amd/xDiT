@@ -116,103 +116,131 @@ def _persistent_ops():
     return _rocm_sdma_ops()
 
 
-def _relay_all_gather_fp8(xq, xs, linear):
-    """The relayed persistent FP8 all-gather + GEMM (XDIT_TP_RELAY=1, two TP groups on the node), or None."""
+def _relay(group_name: str):
+    """The TP relay of the group (XDIT_TP_RELAY=1, two TP groups on the node), or None."""
     if torch.cuda.is_current_stream_capturing():
         return None
     from xfuser.model_executor.layers import tp_relay
 
-    relay = tp_relay.relay_for(get_tp_group().device_group.group_name)
-    if relay is None:
-        return None
+    return tp_relay.relay_for(group_name)
+
+
+def _group_size(group_name: str) -> int:
+    return dist.distributed_c10d._resolve_process_group(group_name).size()
+
+
+# The persistent / relayed paths run Python around their transfers (plans, side streams, collectives at
+# first use), so the TP sites call them through custom ops: opaque to torch.compile, like torch's fused ops.
+@torch.library.custom_op("xfuser::tp_fp8_all_gather_gemm", mutates_args=())
+def _tp_fp8_all_gather_gemm(
+    xq: torch.Tensor, xs: torch.Tensor, w_t: torch.Tensor, w_s: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    """all_gather(xq rows) @ w_t, row-wise FP8 (xq [rows, K], xs [rows, 1]) -> [world * rows, N] bf16:
+    relayed (XDIT_TP_RELAY), persistent (XDIT_TP_PERSISTENT) or torch's fused op, whichever applies."""
     from xfuser.model_executor.layers.tp_persistent import _tile_chunks
 
     rows, K = xq.shape
-    chunks = _tile_chunks(4, rows)
-    if chunks is None or K % 128 or K < 256:
-        return None
-    return relay.all_gather_gemm_fp8(xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, chunks)
-
-
-def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
-    batch, rows, _ = x.shape
-    xq, xs = _rowwise_fp8(_seq_rows(x))
-    relayed = _relay_all_gather_fp8(xq, xs, linear)
-    if relayed is not None:
-        out = relayed.view(-1, batch, relayed.shape[-1]).transpose(0, 1).to(x.dtype)
-        return out if linear.bias is None else out + linear.bias
+    relay = _relay(group_name)
+    if relay is not None:
+        chunks = _tile_chunks(4, rows)
+        if chunks is not None and K % 128 == 0 and K >= 256:
+            return relay.all_gather_gemm_fp8(xq, xs, w_t, w_s, chunks)
     rs = _persistent_ops()
     if rs is not None:
         from xfuser.model_executor.layers import tp_persistent
 
-        out = tp_persistent.all_gather_gemm_fp8(
-            rs, xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, get_tp_group().device_group.group_name
-        )
+        out = tp_persistent.all_gather_gemm_fp8(rs, xq, xs, w_t, w_s, group_name)
         if out is not None:
-            out = out.view(-1, batch, out.shape[-1]).transpose(0, 1).to(x.dtype)
-            return out if linear.bias is None else out + linear.bias
+            return out
     _, (out,) = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
         xq,
-        [linear.tp_fp8_weight],
+        [w_t],
         xs,
-        [linear.tp_fp8_scale],
+        [w_s],
         gather_dim=0,
         biases=[None],
         result_scales=[None],
         # hipBLASLt's row-wise scaled GEMM writes bf16 only
         out_dtypes=[torch.bfloat16],
         use_fast_accum=[False],
-        group_name=get_tp_group().device_group.group_name,
+        group_name=group_name,
     )
-    out = out.view(-1, batch, out.shape[-1]).transpose(0, 1).to(x.dtype)
-    return out if linear.bias is None else out + linear.bias
+    return out
 
 
-def _relay_reduce_scatter_fp8(xq, xs, linear):
-    """The relayed persistent FP8 GEMM + reduce-scatter (XDIT_TP_RELAY=1, two TP groups on the node), or None."""
-    if torch.cuda.is_current_stream_capturing():
-        return None
-    from xfuser.model_executor.layers import tp_relay
+@_tp_fp8_all_gather_gemm.register_fake
+def _(xq, xs, w_t, w_s, group_name):
+    return xq.new_empty(_group_size(group_name) * xq.shape[0], w_t.shape[1], dtype=torch.bfloat16)
 
-    relay = tp_relay.relay_for(get_tp_group().device_group.group_name)
-    if relay is None:
-        return None
+
+@torch.library.custom_op("xfuser::tp_fp8_gemm_reduce_scatter", mutates_args=())
+def _tp_fp8_gemm_reduce_scatter(
+    xq: torch.Tensor, xs: torch.Tensor, w_t: torch.Tensor, w_s: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    """reduce_scatter(xq @ w_t), row-wise FP8 (xq [S, K], xs [S, 1]) -> this rank's [S / world, N] bf16:
+    relayed, persistent or torch's fused op, whichever applies."""
     from xfuser.model_executor.layers.tp_persistent import _tile_chunks
 
     S, K = xq.shape
-    chunks = _tile_chunks(4, S // relay.Wt) if S % relay.Wt == 0 else None
-    if chunks is None or K % 128 or K < 256:
-        return None
-    return relay.gemm_reduce_scatter_fp8(xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, chunks)
+    n = w_t.shape[1]
+    relay = _relay(group_name)
+    if relay is not None and S % relay.Wt == 0:
+        chunks = _tile_chunks(4, S // relay.Wt)
+        if chunks is not None and K % 128 == 0 and K >= 256:
+            return relay.gemm_reduce_scatter_fp8(xq, xs, w_t, w_s, chunks)
+    rs = _persistent_ops()
+    if rs is not None:
+        from xfuser.model_executor.layers import tp_persistent
+
+        out = tp_persistent.gemm_reduce_scatter_fp8(rs, xq, xs, w_t, w_s, group_name)
+        if out is not None:
+            return out
+    return torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
+        xq, w_t, xs, w_s, "sum", 0, 0, group_name, [S, n], out_dtype=torch.bfloat16
+    )
+
+
+@_tp_fp8_gemm_reduce_scatter.register_fake
+def _(xq, xs, w_t, w_s, group_name):
+    return xq.new_empty(xq.shape[0] // _group_size(group_name), w_t.shape[1], dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("xfuser::tp_bf16_all_gather_gemm", mutates_args=())
+def _tp_bf16_all_gather_gemm(x: torch.Tensor, w_t: torch.Tensor, group_name: str) -> torch.Tensor:
+    """all_gather(x rows) @ w_t (x [rows, K]) -> [world * rows, N]: the persistent bf16 kernel
+    (XDIT_TP_PERSISTENT) or torch's fused op."""
+    rs = _persistent_ops()
+    if rs is not None:
+        from xfuser.model_executor.layers import tp_persistent
+
+        out = tp_persistent.all_gather_gemm_bf16(rs, x.contiguous(), w_t, group_name)
+        if out is not None:
+            return out
+    _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(x, [w_t], 0, group_name, return_A=False)
+    return out
+
+
+@_tp_bf16_all_gather_gemm.register_fake
+def _(x, w_t, group_name):
+    return x.new_empty(_group_size(group_name) * x.shape[0], w_t.shape[1])
+
+
+def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
+    batch = x.shape[0]
+    xq, xs = _rowwise_fp8(_seq_rows(x))
+    out = torch.ops.xfuser.tp_fp8_all_gather_gemm(
+        xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, get_tp_group().device_group.group_name
+    )
+    out = out.view(-1, batch, out.shape[-1]).transpose(0, 1).to(x.dtype)
+    return out if linear.bias is None else out + linear.bias
 
 
 def _fp8_row_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
     batch = x.shape[0]
     xq, xs = _rowwise_fp8(_seq_rows(x))
     n = linear.tp_fp8_weight.shape[1]
-    relayed = _relay_reduce_scatter_fp8(xq, xs, linear)
-    if relayed is not None:
-        return relayed.view(-1, batch, n).transpose(0, 1).to(x.dtype)
-    rs = _persistent_ops()
-    if rs is not None:
-        from xfuser.model_executor.layers import tp_persistent
-
-        out = tp_persistent.gemm_reduce_scatter_fp8(
-            rs, xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, get_tp_group().device_group.group_name
-        )
-        if out is not None:
-            return out.view(-1, batch, n).transpose(0, 1).to(x.dtype)
-    out = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
-        xq,
-        linear.tp_fp8_weight,
-        xs,
-        linear.tp_fp8_scale,
-        "sum",
-        0,
-        0,
-        get_tp_group().device_group.group_name,
-        [xq.shape[0], n],
-        out_dtype=torch.bfloat16,
+    out = torch.ops.xfuser.tp_fp8_gemm_reduce_scatter(
+        xq, xs, linear.tp_fp8_weight, linear.tp_fp8_scale, get_tp_group().device_group.group_name
     )
     return out.view(-1, batch, n).transpose(0, 1).to(x.dtype)
 
@@ -426,17 +454,14 @@ def tp_column_parallel(
     if fused == "symm_mem" and getattr(linear, "tp_fp8_weight", None) is not None:
         with record_function(f"tp_ag_fp8:{site}"):
             return _fp8_column_parallel(x, linear)
-    if fused == "symm_mem" and (rs := _persistent_ops()) is not None:
-        from xfuser.model_executor.layers import tp_persistent
-
+    if fused == "symm_mem" and envs.environment_variables["XDIT_TP_PERSISTENT"]().strip() == "1":
         with record_function(f"tp_ag_persistent:{site}"):
             batch = x.shape[0]
-            out = tp_persistent.all_gather_gemm_bf16(
-                rs, _seq_rows(x).contiguous(), linear.weight.t(), get_tp_group().device_group.group_name
+            out = torch.ops.xfuser.tp_bf16_all_gather_gemm(
+                _seq_rows(x), linear.weight.t(), get_tp_group().device_group.group_name
             )
-        if out is not None:
-            out = out.view(-1, batch, out.shape[-1]).transpose(0, 1)
-            return out if linear.bias is None else out + linear.bias
+        out = out.view(-1, batch, out.shape[-1]).transpose(0, 1)
+        return out if linear.bias is None else out + linear.bias
     if fused:
         with record_function(f"tp_ag:{site}"):
             _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(
