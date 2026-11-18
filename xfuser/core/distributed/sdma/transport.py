@@ -450,13 +450,15 @@ class Call:
         self._sends = 0
         self._waits = 0
 
-    def send(self, route: "Plan", src: torch.Tensor, stream: torch.cuda.Stream) -> None:
+    def send(self, route: "Plan", src: torch.Tensor, stream: torch.cuda.Stream, flag_src: int = 0) -> None:
+        """`flag_src`: device address of the int32 the plan's flag writes copy (default: the value 1)."""
         if self._sends >= _TRIGGERS:
             raise ValueError(f"at most {_TRIGGERS} sends per call")
         k = self._sends
         lib = load()
         # Queued before the trigger is released, so the host issues them while the stream finishes.
-        _check(lib.sx_plan_issue(self.slot, k, route.id, src.data_ptr(), self._g.one.data_ptr()), "sx_plan_issue")
+        flag_src = flag_src or self._g.one.data_ptr()
+        _check(lib.sx_plan_issue(self.slot, k, route.id, src.data_ptr(), flag_src), "sx_plan_issue")
         _check(lib.sx_release(self.slot, k, ctypes.c_void_p(stream.cuda_stream)), "sx_release")
         self._sends += 1
 
