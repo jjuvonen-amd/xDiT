@@ -1,4 +1,4 @@
-From 82efe03fd703df177a1d9e68584af0276e5d6b2e Mon Sep 17 00:00:00 2001
+From b0c5821b14dadf1afc85c8c34ef1dda05bd7b60c Mon Sep 17 00:00:00 2001
 From: jjuvonen-amd <joni.juvonen@amd.com>
 Date: Mon, 2 Nov 2026 12:54:29 +0000
 Subject: [PATCH] [ROCm] symm_mem: fused all-gather + matmul and matmul +
@@ -11,14 +11,21 @@ moves at about one link's rate, and the copies compete with the matmuls for
 compute units.
 
 This adds an opt-in ROCm path (TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1). Every rank
-pushes its data into each peer's symmetric-memory inbox with ROCr's
+pushes its data into each peer's inbox with ROCr's
 hsa_amd_memory_async_copy_on_engine: one SDMA engine per peer (the engine ROCr
 prefers for writing to that peer), all peers at once, in pieces, each piece's
 matmul starting as soon as it has landed. A spare engine writes a per-sender
 flag once a peer's piece has landed; a one-thread kernel waits for the flags,
-bounded by a timeout, and another releases the copies after the
-symmetric-memory barrier. Rows land in natural order, so results, return_A and
-output strides match the default path.
+bounded by a timeout, and another releases the copies after a barrier. Rows
+land in natural order, so results, return_A and output strides match the
+default path.
+
+By default (TORCH_SYMM_MEM_ROCM_SDMA_INBOX=ipc) each rank's inbox is plain
+device memory that peers map with hipIpc handles, and the barrier is a
+one-thread kernel on arrival words mapped the same way, bounded like the flag
+waits; the path never rendezvouses symmetric memory, which on some amdgpu 6.x
+drivers moves the memory to the host. TORCH_SYMM_MEM_ROCM_SDMA_INBOX=symm_mem
+uses the group's symmetric-memory workspace and its barrier instead.
 
 The fp8 variants, fused_all_gather_scaled_matmul and
 fused_scaled_matmul_reduce_scatter, take the same path with tensor-wise or
@@ -45,19 +52,26 @@ Test plan:
 python test/distributed/test_symmetric_memory.py -k "AsyncTPTest or AsyncTPRocmSdmaTest"
 TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1 python test/distributed/test_symmetric_memory.py -k AsyncTPTest
 ---
- test/distributed/test_symmetric_memory.py     | 644 ++++++++++++
- .../distributed/_symmetric_memory/__init__.py |  81 ++
- .../_symmetric_memory/_rocm_sdma.hip          | 680 +++++++++++++
- .../_symmetric_memory/_rocm_sdma.py           | 928 ++++++++++++++++++
- 4 files changed, 2333 insertions(+)
+ test/distributed/test_symmetric_memory.py     |  817 +++++++++++++
+ .../distributed/_symmetric_memory/__init__.py |   85 ++
+ .../_symmetric_memory/_rocm_sdma.hip          |  797 ++++++++++++
+ .../_symmetric_memory/_rocm_sdma.py           | 1076 +++++++++++++++++
+ 4 files changed, 2775 insertions(+)
  create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.hip
  create mode 100644 torch/distributed/_symmetric_memory/_rocm_sdma.py
 
 diff --git a/test/distributed/test_symmetric_memory.py b/test/distributed/test_symmetric_memory.py
-index 2ded4493e8..dee269455e 100644
+index 2ded4493e84..6cc324859fb 100644
 --- a/test/distributed/test_symmetric_memory.py
 +++ b/test/distributed/test_symmetric_memory.py
-@@ -35,6 +35,7 @@ from torch.distributed._symmetric_memory import (
+@@ -1,5 +1,6 @@
+ # Owner(s): ["module: c10d"]
+ 
++import functools
+ import itertools
+ import json
+ import os
+@@ -35,6 +36,7 @@ from torch.distributed._symmetric_memory import (
      _fused_all_gather_matmul_fallback,
      _fused_all_gather_scaled_matmul_fallback,
      _fused_matmul_reduce_scatter_fallback,
@@ -65,7 +79,7 @@ index 2ded4493e8..dee269455e 100644
      _test_mode,
      restride_A_for_fused_matmul_reduce_scatter,
      restride_A_shard_for_fused_all_gather_matmul,
-@@ -2000,6 +2001,649 @@ class AsyncTPTest(MultiProcContinuousTest):
+@@ -2000,6 +2002,821 @@ class AsyncTPTest(MultiProcContinuousTest):
          self.assertTrue(torch.allclose(x, t))
  
  
@@ -74,6 +88,23 @@ index 2ded4493e8..dee269455e 100644
 +    "TORCH_SYMM_MEM_ENABLE_ROCM_SDMA": "1",
 +    "TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED": "1",
 +}
++
++
++def _each_inbox(test):
++    """Runs `test` with each inbox of the SDMA path (TORCH_SYMM_MEM_ROCM_SDMA_INBOX)."""
++
++    @functools.wraps(test)
++    def run(self, *args, inbox: str, **kwargs):
++        with mock.patch.dict(os.environ, {"TORCH_SYMM_MEM_ROCM_SDMA_INBOX": inbox}):
++            return test(self, *args, **kwargs)
++
++    return parametrize("inbox", ["ipc", "symm_mem"])(run)
++
++
++def _rocm_sdma_num_calls() -> dict[str, int]:
++    from torch.distributed._symmetric_memory import _rocm_sdma
++
++    return _rocm_sdma.num_calls
 +
 +
 +@skipIf(not TEST_WITH_ROCM, "the SDMA path of the fused ops is ROCm only")
@@ -110,6 +141,7 @@ index 2ded4493e8..dee269455e 100644
 +    @skip_if_lt_x_gpu(2)
 +    @parametrize("gather_dim", [0, 1, 2])
 +    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    @_each_inbox
 +    def test_fused_all_gather_matmul(self, gather_dim: int) -> None:
 +        self._init_process()
 +        BATCH, M, N, K = 8, 64, 16, 32
@@ -141,6 +173,7 @@ index 2ded4493e8..dee269455e 100644
 +    @skip_if_lt_x_gpu(2)
 +    @parametrize("scatter_dim", [0, 1, 2])
 +    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    @_each_inbox
 +    def test_fused_matmul_reduce_scatter(self, scatter_dim: int) -> None:
 +        self._init_process()
 +        BATCH, M, N, K = 8, 64, 16, 1024
@@ -237,6 +270,7 @@ index 2ded4493e8..dee269455e 100644
 +
 +    @skip_if_lt_x_gpu(2)
 +    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    @_each_inbox
 +    def test_graph_capture(self) -> None:
 +        """Captured calls issue their copies from a host-function node on every
 +        replay."""
@@ -279,6 +313,7 @@ index 2ded4493e8..dee269455e 100644
 +
 +    @skip_if_lt_x_gpu(4)
 +    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    @_each_inbox
 +    def test_two_process_groups(self) -> None:
 +        """Calls alternate between the whole group and halves of it."""
 +        self._init_process()
@@ -337,6 +372,153 @@ index 2ded4493e8..dee269455e 100644
 +                _rocm_sdma.raise_if_failed()
 +        else:
 +            _rocm_sdma.raise_if_failed()
++
++    def _all_four_ops(self, group) -> None:
++        """One call of each op that takes the SDMA path, checked against the fallbacks."""
++        rows, N, K = 256, 64, 128
++        group_name, world = group.group_name, group.size()
++        x = torch.randn(rows, K, device=device_type, dtype=torch.bfloat16)
++        X = torch.randn(rows * world, K, device=device_type, dtype=torch.bfloat16)
++        W = torch.randn(K, N, device=device_type, dtype=torch.bfloat16)
++        xq, xs = self._fp8(rows, K), self._scales(rows, 1)
++        Xq, Xs = self._fp8(rows * world, K), self._scales(rows * world, 1)
++        Wq, Ws = self._fp8(N, K).T, self._scales(1, N)
++        scaled = dict(
++            group_name=group_name,
++            biases=[None],
++            result_scales=[None],
++            out_dtypes=[torch.bfloat16],
++            use_fast_accum=[False],
++        )
++
++        _, (ag,) = torch.ops.symm_mem.fused_all_gather_matmul(x, [W], 0, group_name)
++        _, (ag_ref,) = _fused_all_gather_matmul_fallback(
++            x.float(), [W.float()], gather_dim=0, group_name=group_name
++        )
++        self._assert_close_to_fp32(ag, ag_ref)
++        rs = torch.ops.symm_mem.fused_matmul_reduce_scatter(X, W, "sum", 0, group_name)
++        rs_ref = _fused_matmul_reduce_scatter_fallback(
++            X.float(), W.float(), "sum", scatter_dim=0, group_name=group_name
++        )
++        self._assert_close_to_fp32(rs, rs_ref)
++        _, (ag8,) = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
++            xq, [Wq], xs, [Ws], gather_dim=0, **scaled
++        )
++        _, (ag8_ref,) = _fused_all_gather_scaled_matmul_fallback(
++            xq, [Wq], xs, [Ws], gather_dim=0, **scaled
++        )
++        self._assert_close_scaled(ag8, ag8_ref)
++        rs8 = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
++            Xq, Wq, Xs, Ws, "sum", 0, 0, group_name, [rows * world, N],
++            out_dtype=torch.bfloat16,
++        )
++        rs8_ref = _fused_scaled_matmul_reduce_scatter_fallback(
++            Xq, Wq, Xs, Ws, "sum", 0, 0, group_name, [rows * world, N],
++            out_dtype=torch.bfloat16,
++        )
++        self._assert_close_to_fp32(rs8, rs8_ref)
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(
++        os.environ, {**_ROCM_SDMA_ENV, "TORCH_SYMM_MEM_ROCM_SDMA_INBOX": "ipc"}
++    )
++    def test_ipc_inbox_never_rendezvous(self) -> None:
++        """With the ipc inbox, the SDMA path (setting up a new group included) allocates no
++        symmetric memory."""
++        self._init_process()
++        group = dist.new_group(list(range(self.world_size)))
++        calls = dict(_rocm_sdma_num_calls())
++
++        def refuse(*args, **kwargs):
++            raise AssertionError("the SDMA path rendezvoused symmetric memory")
++
++        # The fallbacks the results are checked against allocate no symmetric memory either.
++        with (
++            mock.patch.object(symm_mem, "rendezvous", refuse),
++            mock.patch.object(symm_mem, "get_symm_mem_workspace", refuse),
++        ):
++            self._all_four_ops(group)
++            device_module.synchronize()
++        for op, n in _rocm_sdma_num_calls().items():
++            self.assertEqual(n - calls[op], 1, op)
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(
++        os.environ, {**_ROCM_SDMA_ENV, "TORCH_SYMM_MEM_ROCM_SDMA_INBOX": "ipc"}
++    )
++    def test_ipc_inbox_grows(self) -> None:
++        """A call larger than the inbox grows it; calls of either size stay right after."""
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        self._init_process()
++        group_name = dist.new_group(list(range(self.world_size))).group_name
++        sizes = []
++        for rows in [128, 1024, 128, 1024]:
++            A_shard = torch.randn(rows, 256, device=device_type, dtype=torch.bfloat16)
++            B = torch.randn(256, 64, device=device_type, dtype=torch.bfloat16)
++            ag_1, (mm_1,) = torch.ops.symm_mem.fused_all_gather_matmul(
++                A_shard, [B], 0, group_name
++            )
++            ag_0, (mm_0,) = _fused_all_gather_matmul_fallback(
++                A_shard.float(), [B.float()], gather_dim=0, group_name=group_name
++            )
++            torch.testing.assert_close(ag_1.float(), ag_0, rtol=0, atol=0)
++            self._assert_close_to_fp32(mm_1, mm_0)
++            sizes.append(_rocm_sdma._ipc_workspaces[group_name].size)
++        self.assertLess(sizes[0], sizes[1])
++        self.assertEqual(sizes[1:], [sizes[1]] * 3)
++
++    @skip_if_lt_x_gpu(2)
++    @mock.patch.dict(
++        os.environ,
++        {
++            **_ROCM_SDMA_ENV,
++            "TORCH_SYMM_MEM_ROCM_SDMA_INBOX": "ipc",
++            "TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT": "raise",
++            "TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S": "1",
++        },
++    )
++    def test_barrier_timeout_is_reported(self) -> None:
++        """A rank that does not reach a call's barrier in time is reported; once it makes the call,
++        the ranks' barriers agree again."""
++        from torch.distributed._symmetric_memory import _rocm_sdma
++
++        self._init_process()
++        group_name = dist.group.WORLD.group_name
++        A_shard = torch.randn(256, 128, device=device_type, dtype=torch.bfloat16)
++        B = torch.randn(128, 64, device=device_type, dtype=torch.bfloat16)
++
++        def call():
++            out = torch.ops.symm_mem.fused_all_gather_matmul(
++                A_shard, [B], 0, group_name, return_A=False
++            )[1][0]
++            device_module.synchronize()
++            return out
++
++        call()
++        _rocm_sdma.raise_if_failed()
++        if self.rank != 1:
++            call()
++        dist.barrier()
++        if self.rank == 1:
++            # Late: its peers' pieces of the call were cleared from its inbox, so its own flag
++            # waits time out.
++            call()
++            with self.assertRaisesRegex(RuntimeError, "never set"):
++                _rocm_sdma.raise_if_failed()
++        else:
++            with self.assertRaisesRegex(
++                RuntimeError, r"group ranks \[1\] did not reach its barrier within 3 s"
++            ):
++                _rocm_sdma.raise_if_failed()
++        dist.barrier()
++        for _ in range(2):
++            out_1 = call()
++            _, (out_0,) = _fused_all_gather_matmul_fallback(
++                A_shard.float(), [B.float()], gather_dim=0, group_name=group_name
++            )
++            self._assert_close_to_fp32(out_1, out_0)
++        _rocm_sdma.raise_if_failed()
 +
 +    def test_transport_version(self) -> None:
 +        """The loaded transport is the one this module was written for."""
@@ -463,6 +645,7 @@ index 2ded4493e8..dee269455e 100644
 +        "scale_mode", ["tensor-wise", "row-wise-replicated", "row-wise-sharded"]
 +    )
 +    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    @_each_inbox
 +    def test_fused_all_gather_scaled_matmul(
 +        self, gather_dim: int, scale_mode: str
 +    ) -> None:
@@ -548,6 +731,7 @@ index 2ded4493e8..dee269455e 100644
 +    @parametrize("scatter_dim", [0, 1])
 +    @parametrize("rowwise", [True, False])
 +    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    @_each_inbox
 +    def test_fused_scaled_matmul_reduce_scatter(
 +        self, scatter_dim: int, rowwise: bool
 +    ) -> None:
@@ -624,6 +808,7 @@ index 2ded4493e8..dee269455e 100644
 +    @mock.patch.dict(
 +        os.environ, {**_ROCM_SDMA_ENV, "TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS": "4"}
 +    )
++    @_each_inbox
 +    def test_deterministic(self) -> None:
 +        """Reruns of all four ops are bitwise equal."""
 +        self._init_process()
@@ -661,6 +846,7 @@ index 2ded4493e8..dee269455e 100644
 +
 +    @skip_if_lt_x_gpu(2)
 +    @mock.patch.dict(os.environ, _ROCM_SDMA_ENV)
++    @_each_inbox
 +    def test_graph_capture_scaled(self) -> None:
 +        """The scaled ops captured and replayed, row-wise scales gathered with A."""
 +        self._init_process()
@@ -716,10 +902,10 @@ index 2ded4493e8..dee269455e 100644
  # The `SymmMemEmptySetDeviceTest` suite parameterizes whether user sets the
  # device before calling symm_mem.empty.  Either way should work.
 diff --git a/torch/distributed/_symmetric_memory/__init__.py b/torch/distributed/_symmetric_memory/__init__.py
-index c1630628ad..672b46ad86 100644
+index c1630628adb..778d3d796a7 100644
 --- a/torch/distributed/_symmetric_memory/__init__.py
 +++ b/torch/distributed/_symmetric_memory/__init__.py
-@@ -981,6 +981,15 @@ def _fused_all_gather_matmul(
+@@ -981,6 +981,16 @@ def _fused_all_gather_matmul(
          )
          return A.view(*leading_dims, -1), [out.view(*leading_dims, -1)]
  
@@ -731,11 +917,12 @@ index c1630628ad..672b46ad86 100644
 +                return _rocm_sdma.fused_all_gather_matmul(
 +                    A_shard, Bs, gather_dim, group_name, return_A=return_A
 +                )
++        _rocm_sdma.warn_default_path("fused_all_gather_matmul")
 +
      if _should_use_multimem_all_gather_matmul(
          A_shard, gather_dim, group_name, return_A
      ):
-@@ -1000,6 +1009,16 @@ def _fused_all_gather_matmul(
+@@ -1000,6 +1010,16 @@ def _fused_all_gather_matmul(
          )
  
  
@@ -752,7 +939,7 @@ index c1630628ad..672b46ad86 100644
  # Each 256-row M tile of the ROCm _async_input_mm waits on one chunk's signal,
  # so each rank's chunk must be a whole number of tiles.
  _ROCM_ASYNC_MM_TILE_M = 256
-@@ -1335,6 +1354,26 @@ def _fused_all_gather_scaled_matmul(
+@@ -1335,6 +1355,27 @@ def _fused_all_gather_scaled_matmul(
              use_fast_accum,
          )
  
@@ -775,11 +962,12 @@ index c1630628ad..672b46ad86 100644
 +                    out_dtypes,
 +                    use_fast_accum,
 +                )
++        _rocm_sdma.warn_default_path("fused_all_gather_scaled_matmul")
 +
      with torch.profiler.record_function("fused_all_gather_scaled_matmul"):
          A, res = _fused_all_gather_matmul_impl(
              torch.ops.aten._scaled_mm.out,
-@@ -1413,6 +1452,17 @@ def _fused_matmul_reduce_scatter(
+@@ -1413,6 +1454,18 @@ def _fused_matmul_reduce_scatter(
              A, B, reduce_op, scatter_dim, group_name
          )
  
@@ -793,11 +981,12 @@ index c1630628ad..672b46ad86 100644
 +                return _rocm_sdma.fused_matmul_reduce_scatter(
 +                    A, B, reduce_op, scatter_dim, group_name
 +                )
++        _rocm_sdma.warn_default_path("fused_matmul_reduce_scatter")
 +
      with torch.profiler.record_function("fused_matmul_reduce_scatter"):
          return _fused_matmul_reduce_scatter_impl(
              mm_out_op=torch.ops.aten.mm.out,
-@@ -1560,6 +1610,37 @@ def _fused_scaled_matmul_reduce_scatter(
+@@ -1560,6 +1613,38 @@ def _fused_scaled_matmul_reduce_scatter(
              out_dtype,
              use_fast_accum,
          )
@@ -831,29 +1020,30 @@ index c1630628ad..672b46ad86 100644
 +                    out_dtype,
 +                    use_fast_accum,
 +                )
++        _rocm_sdma.warn_default_path("fused_scaled_matmul_reduce_scatter")
 +
      with torch.profiler.record_function("fused_scaled_matmul_reduce_scatter"):
          return _fused_scaled_matmul_reduce_scatter_impl(
              mm_out_op=torch.ops.aten._scaled_mm.out,
 diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.hip b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
 new file mode 100644
-index 0000000000..29052c70f2
+index 00000000000..29e5f758ad6
 --- /dev/null
 +++ b/torch/distributed/_symmetric_memory/_rocm_sdma.hip
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,797 @@
 +// SDMA transport for the ROCm path of
 +// torch.ops.symm_mem.fused_all_gather_matmul and fused_matmul_reduce_scatter
 +// (see _rocm_sdma.py). Built on first use with torch.utils.cpp_extension and
 +// called through ctypes.
 +//
 +// Every copy is issued by the sending rank on its own SDMA engines and names
-+// the local GPU on both sides: peers' symmetric-memory buffers are mapped in
-+// this process for the local GPU. A call's pieces are pushed into every peer's
-+// symmetric-memory inbox, one engine per peer, all peers at once, queued in
-+// order on each engine. Once a peer's copies of a piece land, a 4-byte write on
-+// a spare engine sets this rank's own flag word for that piece at the peer (one
-+// word per sender, so no two engines write the same word); on the data engines,
-+// a flag write that waits for its piece would stall the next piece behind it.
++// the local GPU on both sides: peers' inboxes are mapped in this process for
++// the local GPU. A call's pieces are pushed into every peer's inbox, one engine
++// per peer, all peers at once, queued in order on each engine. Once a peer's
++// copies of a piece land, a 4-byte write on a spare engine sets this rank's own
++// flag word for that piece at the peer (one word per sender, so no two engines
++// write the same word); on the data engines, a flag write that waits for its
++// piece would stall the next piece behind it.
 +// Every data copy also waits for a trigger signal that a one-thread kernel
 +// releases on the compute stream, so no copy starts before the stream reaches
 +// that point.
@@ -868,6 +1058,13 @@ index 0000000000..29052c70f2
 +// wait is bounded: flags that never land are recorded in host-mapped memory
 +// (rsdma_peek_error / rsdma_take_error), and the stream moves on. A plan that
 +// fails inside a host-function node is recorded the same way.
++//
++// Inboxes and barrier words are plain device memory, mapped in peers' processes
++// with hipIpc handles (rsdma_ipc_alloc, rsdma_ipc_open), so the transport never
++// needs a symmetric-memory rendezvous. A barrier (rsdma_barrier) is a one-thread
++// kernel: it writes the barrier's epoch into every rank's arrival word for this
++// rank, then waits, bounded like a flag wait, until every rank's word at this
++// rank reaches it.
 +//
 +// No copy is left waiting when a call is abandoned or the process ends:
 +// rsdma_drain (on an exception in a call, before the watchdog aborts, at exit,
@@ -885,6 +1082,7 @@ index 0000000000..29052c70f2
 +
 +#include <chrono>
 +#include <cstdint>
++#include <cstring>
 +#include <thread>
 +#include <vector>
 +
@@ -894,11 +1092,12 @@ index 0000000000..29052c70f2
 +  unsigned long long count; // failures since the last rsdma_take_error
 +  // First one, a wait: bit i set if flag word i never read 1.
 +  unsigned long long missing;
-+  int piece; // first one: piece (-1 for a plan) and call id
++  int piece; // first one: piece (-1 for a plan, -2 for a barrier) and call id
 +  int call;
-+  // First one: 0 for a wait that ran out of time, 1 for one whose flags came
-+  // from senders that abandoned the call (`missing` is those words), else the
-+  // failed plan's return code.
++  // First one: 0 for a wait that ran out of time (`missing` is the flag words,
++  // or for a barrier the ranks, never set), 1 for one whose flags came from
++  // senders that abandoned the call (`missing` is those words), else the failed
++  // plan's return code.
 +  int status;
 +};
 +
@@ -1074,6 +1273,53 @@ index 0000000000..29052c70f2
 +  }
 +}
 +
++// Barrier of `world` ranks: increments the epoch at *epoch, writes it to word
++// `rank` of every rank's arrival words (peers[q] is rank q's, mapped here), then
++// waits until every word of its own, own[q], has reached it. A rank that is
++// ahead has written a later epoch, which counts too. Bounded as wait_flags: once
++// `budget` ticks have passed, the ranks still missing are recorded and the
++// stream moves on.
++__global__ void barrier(
++    unsigned long long* const* peers,
++    const unsigned long long* own,
++    int world,
++    int rank,
++    unsigned long long* epoch,
++    unsigned long long budget,
++    RsdmaError* err,
++    int call) {
++  unsigned long long start = wall_clock64();
++  unsigned long long e = *epoch + 1;
++  *epoch = e;
++  for (int q = 0; q < world; ++q)
++    __hip_atomic_store(
++        peers[q] + rank, e, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
++  while (true) {
++    unsigned long long missing = 0;
++    for (int q = 0; q < world; ++q) {
++      unsigned long long v = __hip_atomic_load(
++          own + q, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
++      if ((long long)(v - e) < 0)
++        missing |= 1ull << q;
++    }
++    if (!missing)
++      return;
++    if (wall_clock64() - start > budget) {
++      if (__hip_atomic_fetch_add(
++              &err->count, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) ==
++          0) {
++        err->missing = missing;
++        err->piece = -2;
++        err->call = call;
++        err->status = 0;
++      }
++      __threadfence_system();
++      return;
++    }
++    __builtin_amdgcn_s_sleep(2);
++  }
++}
++
 +// Launched once at init: fails to launch if the library has no code object for
 +// this GPU.
 +__global__ void probe(int* word) {
@@ -1236,7 +1482,7 @@ index 0000000000..29052c70f2
 +// Bumped whenever an exported signature or the meaning of a result changes;
 +// _rocm_sdma.py refuses a library built from another version.
 +int rsdma_abi_version() {
-+  return 2;
++  return 3;
 +}
 +
 +// `slots` calls may be in flight at once; a slot is reused only after its
@@ -1488,6 +1734,67 @@ index 0000000000..29052c70f2
 +  return hipGetLastError() == hipSuccess ? 0 : -2;
 +}
 +
++// Enqueues on `stream` a barrier of `world` ranks (see barrier): `peers` is a
++// device array of every rank's arrival words, mapped here, `own` this rank's,
++// `epoch` a device word only this rank's barriers on them use. A barrier still
++// missing ranks after `seconds` is recorded as a failure with piece -2.
++int rsdma_barrier(
++    hipStream_t stream,
++    uint64_t peers,
++    uint64_t own,
++    int world,
++    int rank,
++    uint64_t epoch,
++    double seconds,
++    int call) {
++  if (world > 64 || rank < 0 || rank >= world)
++    return -1;
++  unsigned long long budget =
++      (unsigned long long)(seconds * (double)g_ticks_per_s);
++  hipLaunchKernelGGL(
++      barrier,
++      dim3(1),
++      dim3(1),
++      0,
++      stream,
++      (unsigned long long* const*)peers,
++      (const unsigned long long*)own,
++      world,
++      rank,
++      (unsigned long long*)epoch,
++      budget,
++      g_error,
++      call);
++  return hipGetLastError() == hipSuccess ? 0 : -2;
++}
++
++static_assert(sizeof(hipIpcMemHandle_t) == 64, "rsdma_ipc_* pass 64-byte handles");
++
++// `size` bytes of zeroed device memory at *ptr, and the hipIpc handle (64
++// bytes) that maps them in another process.
++int rsdma_ipc_alloc(uint64_t size, void** ptr, char* handle) {
++  if (hipMalloc(ptr, size) != hipSuccess)
++    return -1;
++  if (hipMemset(*ptr, 0, size) != hipSuccess ||
++      hipDeviceSynchronize() != hipSuccess)
++    return -2;
++  hipIpcMemHandle_t h;
++  if (hipIpcGetMemHandle(&h, *ptr) != hipSuccess)
++    return -3;
++  memcpy(handle, &h, sizeof(h));
++  return 0;
++}
++
++// Maps another process's rsdma_ipc_alloc memory at *ptr.
++int rsdma_ipc_open(const char* handle, void** ptr) {
++  hipIpcMemHandle_t h;
++  memcpy(&h, handle, sizeof(h));
++  return hipIpcOpenMemHandle(ptr, h, hipIpcMemLazyEnablePeerAccess) ==
++          hipSuccess
++      ? 0
++      : -1;
++}
++
 +// How many failures were recorded (0 if none) and the first one's piece, call
 +// id, status and missing-flag mask, without clearing the record: for a watchdog
 +// that polls it.
@@ -1523,10 +1830,10 @@ index 0000000000..29052c70f2
 +}
 diff --git a/torch/distributed/_symmetric_memory/_rocm_sdma.py b/torch/distributed/_symmetric_memory/_rocm_sdma.py
 new file mode 100644
-index 0000000000..9da90111ca
+index 00000000000..35746505926
 --- /dev/null
 +++ b/torch/distributed/_symmetric_memory/_rocm_sdma.py
-@@ -0,0 +1,928 @@
+@@ -0,0 +1,1076 @@
 +"""SDMA copy engines for symm_mem's fused all-gather + matmul and matmul + reduce-scatter on ROCm,
 +and their scaled (_scaled_mm) variants.
 +
@@ -1535,7 +1842,7 @@ index 0000000000..9da90111ca
 +_pipelined_produce_and_all2all). On ROCm, HIP runs concurrent copies out of those
 +buffers one at a time, so the all-gather moves at about one link's rate, and the
 +copies compete with the matmuls for compute units. Here every rank pushes its
-+data into each peer's symmetric-memory inbox with ROCr's
++data into each peer's inbox with ROCr's
 +hsa_amd_memory_async_copy_on_engine, one SDMA engine per peer (the engine ROCr
 +prefers for writing to that peer), all peers at once. The copies use no compute
 +units.
@@ -1559,14 +1866,25 @@ index 0000000000..9da90111ca
 +reproducible from run to run.
 +
 +Each call zeroes its flags and puts this rank's own data in place on the compute
-+stream, then passes a symmetric-memory barrier; a one-thread kernel then releases
-+the copies, which wait for it on the SDMA engines.
++stream, then passes a barrier; a one-thread kernel then releases the copies,
++which wait for it on the SDMA engines.
++
++Inbox (TORCH_SYMM_MEM_ROCM_SDMA_INBOX): with ipc (default), each rank's inbox is
++device memory that the other ranks' processes map with hipIpc handles, and the
++barrier is a one-thread kernel on arrival words mapped the same way, bounded
++like a flag wait; this path never rendezvouses symmetric memory. With symm_mem,
++the inbox is the group's symmetric-memory workspace (get_symm_mem_workspace) and
++the barrier its signal-pad barrier. An ipc inbox grows like the workspace, and
++the memory it outgrew stays mapped for as long as the process runs, as graphs
++captured earlier may still use it.
 +
 +Failures: no wait, on the GPU or the host, is unbounded. A flag wait records
 +which flags did not land within TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S seconds
 +(default 30), and the stream moves on (that call's output is wrong; the call's
 +later waits return at once). Waiting for a slot's previous copies before reusing
-+it is bounded by the same timeout, and a barrier by three times it. With
++it is bounded by the same timeout, and a barrier by three times it (an ipc
++barrier that runs out of time is reported like a flag wait; a symm_mem one
++faults the GPU). With
 +TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT=abort (default) a watchdog thread logs the
 +failure and aborts the process within about 0.1 s; with =raise the next eager
 +call raises.
@@ -1586,10 +1904,9 @@ index 0000000000..9da90111ca
 +signals and issuing its copies) as a host-function node, so every replay issues
 +the copies when the stream reaches the call. Captured calls take their signals
 +from slots apart from eager calls', so an eager call never waits on a graph's
-+copies or the reverse. As for the other symm_mem ops, the symmetric-memory
-+workspace cannot be allocated during capture: run each op once, eagerly, with
-+the shapes it will be captured with (the first call per process group also sets
-+up this module).
++copies or the reverse. As for the other symm_mem ops, the inbox cannot be
++allocated during capture: run each op once, eagerly, with the shapes it will be
++captured with (the first call per process group also sets up this module).
 +
 +Opt-in with TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1. The transport (_rocm_sdma.hip) is
 +built with torch.utils.cpp_extension on first use, for the GPU's architecture
@@ -1628,19 +1945,22 @@ index 0000000000..9da90111ca
 +AUTO_MAX_CHUNKS = 8
 +AUTO_MIN_PIECE_BYTES = 16 << 20
 +MAX_WORLD = 64  # flag words one wait kernel checks
-+ABI_VERSION = 2  # rsdma_abi_version of the transport this module calls
++ABI_VERSION = 3  # rsdma_abi_version of the transport this module calls
 +DRAIN_S = 5.0  # how long an abandoned call's copies get to finish
 +_EAGER_SLOTS = 4
 +_CAPTURE_SLOTS = 8
 +
 +_lib = None
 +_groups: dict[str, "_Group"] = {}
++_ipc_workspaces: dict[str, "_IpcWorkspace"] = {}
++_outgrown: list["_IpcWorkspace"] = []  # kept mapped: captured graphs may still use them
 +_next_eager_slot = 0
 +_next_capture_slot = 0
 +_last_call = 0
 +_broken: str | None = None  # why the transport can no longer be used
 +_watchdog = None
 +_warned_archs: set[str] = set()
++_warned_default_path = False
 +
 +# Calls that took this path, per op (for tests).
 +num_calls = {
@@ -1664,6 +1984,15 @@ index 0000000000..9da90111ca
 +    if mode not in ("abort", "raise"):
 +        raise ValueError(
 +            f"TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT must be abort or raise; got {mode!r}"
++        )
++    return mode
++
++
++def _inbox_mode() -> str:
++    mode = _env("ROCM_SDMA_INBOX", "ipc").lower()
++    if mode not in ("ipc", "symm_mem"):
++        raise ValueError(
++            f"TORCH_SYMM_MEM_ROCM_SDMA_INBOX must be ipc or symm_mem; got {mode!r}"
 +        )
 +    return mode
 +
@@ -1703,6 +2032,21 @@ index 0000000000..9da90111ca
 +            arch,
 +        )
 +    return False
++
++
++def warn_default_path(op: str) -> None:
++    """Called when the path is enabled but `op` runs the default path: warn once that the default
++    path rendezvouses symmetric memory, which this path's ipc inbox avoids."""
++    global _warned_default_path
++    if _warned_default_path:
++        return
++    _warned_default_path = True
++    logger.warning(
++        "symm_mem's SDMA path does not support this %s call; it runs the default path, which "
++        "rendezvouses symmetric memory (on some amdgpu 6.x drivers this moves the memory to the "
++        "host). Warned once per process.",
++        op,
++    )
 +
 +
 +def should_use_all_gather_matmul(
@@ -1822,6 +2166,9 @@ index 0000000000..9da90111ca
 +        ("rsdma_peek_error", [ip, ip, ip, u64p], i),
 +        ("rsdma_take_error", [ip, ip, ip, u64p], i),
 +        ("rsdma_debug_drop_flag", [i, i], i),
++        ("rsdma_barrier", [vp, u64, u64, i, i, u64, dbl, i], i),
++        ("rsdma_ipc_alloc", [u64, ctypes.POINTER(vp), ctypes.c_char_p], i),
++        ("rsdma_ipc_open", [ctypes.c_char_p, ctypes.POINTER(vp)], i),
 +    ]:
 +        getattr(lib, name).argtypes = argtypes
 +        getattr(lib, name).restype = restype
@@ -1830,8 +2177,27 @@ index 0000000000..9da90111ca
 +    return lib
 +
 +
++def _ipc_share(lib, group, size: int) -> list[int]:
++    """`size` bytes of zeroed device memory on every rank of `group`, mapped in this process with
++    hipIpc handles: every rank's address here, in group rank order. Collective."""
++    ptr, handle = ctypes.c_void_p(), ctypes.create_string_buffer(64)
++    _check(lib.rsdma_ipc_alloc(size, ctypes.byref(ptr), handle), "rsdma_ipc_alloc")
++    handles = [None] * group.size()
++    dist.all_gather_object(handles, handle.raw, group=group)
++    bases = []
++    for r, h in enumerate(handles):
++        if r == group.rank():
++            bases.append(ptr.value)
++            continue
++        peer = ctypes.c_void_p()
++        _check(lib.rsdma_ipc_open(h, ctypes.byref(peer)), f"rsdma_ipc_open (rank {r})")
++        bases.append(peer.value)
++    return bases
++
++
 +class _Group:
-+    """Per process group: this rank's peers in step order, one SDMA engine per peer and a spare one."""
++    """Per process group: this rank's peers in step order, one SDMA engine per peer and a spare one,
++    and the arrival words of the ipc barrier."""
 +
 +    def __init__(self, group_name: str):
 +        if torch.cuda.is_current_stream_capturing():
@@ -1860,7 +2226,30 @@ index 0000000000..9da90111ca
 +            "rsdma_engine_plan",
 +        )
 +        self.engines = list(self.engine_arr[:n])
++        # Per rank: `world` arrival words (word q: the last barrier epoch rank q reached), then the
++        # epoch word of its own barriers.
++        words = _ipc_share(lib, group, (self.world + 1) * 8)
++        self.arrivals = words[self.rank]
++        self.epoch = self.arrivals + self.world * 8
++        self.arrival_ptrs = torch.tensor(words, dtype=torch.int64, device=device)
 +        _start_watchdog(lib)
++
++    def barrier(self, seconds: float) -> None:
++        """Enqueue on the current stream a barrier of the group's ranks, bounded by `seconds`; one
++        that runs out of time is reported as a failure of the current call."""
++        _check(
++            _load().rsdma_barrier(
++                ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
++                self.arrival_ptrs.data_ptr(),
++                self.arrivals,
++                self.world,
++                self.rank,
++                self.epoch,
++                seconds,
++                _last_call,
++            ),
++            "rsdma_barrier",
++        )
 +
 +
 +def _group(group_name: str) -> _Group:
@@ -1906,7 +2295,13 @@ index 0000000000..9da90111ca
 +) -> str:
 +    rank = dist.get_rank() if dist.is_initialized() else "?"
 +    plans = {name: dict(zip(g.peers, g.engines)) for name, g in _groups.items()}
-+    if status == 1:
++    if piece == -2:
++        ranks = [i for i in range(MAX_WORLD) if missing >> i & 1]
++        first = (
++            f"call {call}: group ranks {ranks} did not reach its barrier within "
++            f"{3 * _timeout_s():g} s"
++        )
++    elif status == 1:
 +        words = [i for i in range(MAX_WORLD) if missing >> i & 1]
 +        first = (
 +            f"call {call}, piece {piece}: flag words {words} came from ranks that abandoned the "
@@ -2081,10 +2476,67 @@ index 0000000000..9da90111ca
 +        _check(rc, "rsdma_wait_flags")
 +
 +
++class _DeviceBytes:
++    def __init__(self, ptr: int, nbytes: int):
++        self.__cuda_array_interface__ = {
++            "shape": (nbytes,),
++            "typestr": "|u1",
++            "data": (ptr, False),
++            "version": 2,
++            "strides": None,
++        }
++
++
++class _IpcWorkspace:
++    """An ipc inbox: `size` bytes of device memory per rank of a group, mapped in every rank's
++    process (_ipc_share). Offers what _inbox and _barrier use of a symmetric-memory workspace."""
++
++    def __init__(self, group_name: str, size: int):
++        self.g = _group(group_name)
++        self.size = size
++        self.bases = _ipc_share(_load(), c10d._resolve_process_group(group_name), size)
++        self.device = torch.device("cuda", torch.cuda.current_device())
++        self._bytes: dict[int, torch.Tensor] = {}
++
++    def get_buffer(
++        self, rank: int, shape, dtype: torch.dtype, storage_offset: int = 0
++    ) -> torch.Tensor:
++        if rank not in self._bytes:
++            self._bytes[rank] = torch.as_tensor(
++                _DeviceBytes(self.bases[rank], self.size), device=self.device
++            )
++        start = storage_offset * dtype.itemsize
++        end = start + math.prod(shape) * dtype.itemsize
++        if end > self.size:
++            raise ValueError(f"bytes {start}..{end} exceed the {self.size}-byte inbox")
++        return self._bytes[rank][start:end].view(dtype).view(tuple(shape))
++
++    def barrier(self, channel: int = 0, timeout_ms: int = 0) -> None:
++        self.g.barrier(timeout_ms / 1000)
++
++
++def _ipc_workspace(group_name: str, min_size: int) -> _IpcWorkspace:
++    """As get_symm_mem_workspace, for the ipc inbox: grows to at least twice its size."""
++    ws = _ipc_workspaces.get(group_name)
++    if ws is not None and ws.size >= min_size:
++        return ws
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError(
++            f"symm_mem's SDMA path needs a {min_size}-byte inbox, larger than the "
++            f"{0 if ws is None else ws.size} bytes allocated, and cannot allocate it during "
++            "capture: run the op once eagerly with the captured shapes before capturing it"
++        )
++    size = max(min_size, 2 * ws.size) if ws is not None else min_size
++    if ws is not None:
++        _outgrown.append(ws)
++    ws = _ipc_workspaces[group_name] = _IpcWorkspace(group_name, -(-size // 64) * 64)
++    return ws
++
++
 +def _inbox(group_name: str, rank: int, world: int, regions, chunks: int):
-+    """This rank's symmetric inbox: one buffer per (shape, dtype) in `regions`, each 64-byte
-+    aligned, then (chunks, world) int32 flag words. Also returns every rank's workspace base
-+    address and the byte offsets of the regions and of the flags."""
++    """This rank's inbox: one buffer per (shape, dtype) in `regions`, each 64-byte aligned, then
++    (chunks, world) int32 flag words. Also returns every rank's inbox base address and the byte
++    offsets of the regions and of the flags."""
 +    offsets, size = [], 0
 +    for shape, dtype in regions:
 +        offsets.append(size)
@@ -2092,7 +2544,10 @@ index 0000000000..9da90111ca
 +        size += -(-nbytes // 64) * 64
 +    flag_offset = size
 +    size += chunks * world * 4
-+    ws = symm_mem.get_symm_mem_workspace(group_name, min_size=size)
++    if _inbox_mode() == "ipc":
++        ws = _ipc_workspace(group_name, size)
++    else:
++        ws = symm_mem.get_symm_mem_workspace(group_name, min_size=size)
 +    bufs = [
 +        ws.get_buffer(rank, tuple(shape), dtype, storage_offset=offset // dtype.itemsize)
 +        for (shape, dtype), offset in zip(regions, offsets)

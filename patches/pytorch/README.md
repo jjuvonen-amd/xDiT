@@ -15,7 +15,7 @@ with tensor copies on two alternating streams. On ROCm, HIP runs concurrent copi
 buffers one at a time, so the all-gather moves at roughly one link's rate. The copies also compete
 with the matmuls for compute units.
 
-With the patch, every rank pushes its data into each peer's symmetric-memory inbox with ROCr's
+With the patch, every rank pushes its data into each peer's inbox with ROCr's
 `hsa_amd_memory_async_copy_on_engine`:
 - one SDMA engine per peer (the engine ROCr prefers for writing to that peer);
 - all peers at once;
@@ -61,6 +61,7 @@ Requirements:
 | `TORCH_SYMM_MEM_ROCM_SDMA_TIMEOUT_S` | `30` | how long a call waits for its flags, or for the copies of the call that last used its slot, before it is reported (see Failures) |
 | `TORCH_SYMM_MEM_ROCM_SDMA_ON_TIMEOUT` | `abort` | what happens once a failure is reported. `abort`: abort the process within about 0.1 s, logging what was missing. `raise`: raise on the next eager call. Either way the stream moves on, and that call's output is wrong |
 | `TORCH_SYMM_MEM_ROCM_SDMA_ALLOW_UNTESTED` | `0` | `1` also runs on GPU architectures other than gfx950 |
+| `TORCH_SYMM_MEM_ROCM_SDMA_INBOX` | `ipc` | where the copies land (see Inbox). `ipc`: device memory mapped with hipIpc handles, no symmetric-memory rendezvous. `symm_mem`: the group's symmetric-memory workspace |
 
 The SDMA path is used for any dtype when the gather or scatter dimension is not the last one and
 the group has 2 to 64 ranks. The fp8 variants take it with tensor-wise or row-wise scales. Everything
@@ -83,10 +84,29 @@ the fastest or within a few percent of it in `benchmarks/tp_comm_gemm_overlap.py
 fp8. The fp8 all-gather moves half the bytes of bf16, so it gets half as many pieces. Set
 `TORCH_SYMM_MEM_ROCM_SDMA_CHUNKS` to fix the count; the benchmark's `--chunks` sweeps it.
 
+## Inbox
+
+Each rank's copies land in its peers' inboxes, and a call passes a barrier before its copies start
+and another after its last wait.
+- `ipc` (default): each rank's inbox is plain device memory (`hipMalloc`), which the other ranks'
+  processes map with hipIpc handles, as RCCL does. The barriers are a one-thread kernel on arrival
+  words mapped the same way. The path never rendezvouses symmetric memory, and its barriers are
+  bounded like the flag waits.
+- `symm_mem`: the inbox is the group's symmetric-memory workspace (`get_symm_mem_workspace`) and the
+  barriers are its signal-pad barriers, as in earlier versions of this patch.
+
+Either way the copies and the matmuls are the same, and so are the results.
+
+Driver note: on some amdgpu 6.x kernel drivers, a symmetric-memory rendezvous (a dma-buf import of
+the peers' memory) moves the memory to the host and degrades later inter-GPU traffic, RCCL included,
+until a reboot. With the `ipc` inbox the SDMA path avoids it, but calls that run the default path
+(see Enable) still rendezvous; the path logs a warning once when that happens. Prefer amdgpu 7.x or
+later for workloads that use the default path.
+
 ## Memory
 
-Each call takes its inbox from the group's symmetric-memory workspace, which grows to the largest
-call so far and is kept:
+Each call takes its inbox from the group's workspace, which grows to the largest call so far and is
+kept:
 - all-gather: the gathered A (`world * rows * K` elements), plus the gathered row-wise scales for
   the fp8 variant with sharded scales. The fp8 variant always returns A (its schema does), as a copy
   of the inbox.
@@ -94,13 +114,19 @@ call so far and is kept:
   output dtype, plus as much again for this rank's own partial sums before they are pushed. That is
   twice the unreduced product, against once for the default path.
 
+An `ipc` inbox grows to at least twice its size. The memory it outgrew stays mapped until the process
+exits, because graphs captured earlier may still use it, so the total is at most about twice the
+largest inbox.
+
 ## Failures
 
 No wait on the GPU or the host is unbounded:
 - A flag wait reports flags that did not land within the timeout. A call's later waits then
   return at once, so a call spends at most one timeout in its waits.
 - Waiting for the copies of a slot's previous call is bounded by the timeout too.
-- The call's symmetric-memory barriers are bounded at three times the timeout.
+- The call's barriers are bounded at three times the timeout. An `ipc` barrier that runs out of
+  time is reported like a flag wait, naming the ranks that did not arrive; a `symm_mem` one faults
+  the GPU.
 
 A process does not leave copies waiting on its GPU's SDMA engines. The transport drains:
 - when an exception, including `KeyboardInterrupt`, stops an eager call after its copies were
@@ -117,7 +143,7 @@ A drain does three things:
    waiting for one of those flags reports it at once instead of at the timeout.
 
 After an exception, the rank still passes the call's last barrier, so its peers do not wait there
-until the barrier times out (a timed-out symm_mem barrier faults the GPU). Then it raises. If the
+until the barrier times out. Then it raises. If the
 copies did not finish within the drain, every later call on this path raises.
 
 The transport is built under a name derived from its source, and it checks the version of the
@@ -131,8 +157,8 @@ path.
 
 Captured calls are supported. A captured call issues its copies from a host-function node, so
 every replay issues them when the stream reaches the call. As with the other symm_mem ops, the
-symmetric-memory workspace cannot grow during capture: run each op once, eagerly, with the shapes
-it will be captured with.
+inbox cannot grow during capture: run each op once, eagerly, with the shapes it will be captured
+with.
 
 ## Tests
 
@@ -149,6 +175,10 @@ it will be captured with.
 - a lost flag that is reported instead of hanging;
 - an exception on one rank in the middle of a call, for both ops: the rank raises, its peers
   report the abandoned call without waiting for the timeout, and the next calls are right;
+- the core cases above with each inbox, `ipc` and `symm_mem`;
+- all four ops on a new group with the `ipc` inbox while symmetric-memory rendezvous raises;
+- an `ipc` inbox that grows, with calls of both sizes right after;
+- a rank that reaches a barrier late: its peers report it, and later calls are right;
 - the version of the loaded transport.
 
 `benchmarks/wan_tp/collect_torch_sdma.sh` in this repository runs those tests and the existing
