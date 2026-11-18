@@ -254,8 +254,12 @@ class TPRelay:
         self._plans[key] = entry
         return entry
 
-    def all_gather_gemm_fp8(self, xq, xs, w_t, w_s, chunks: int) -> torch.Tensor:
-        """xq [rows, K] fp8, xs [rows, 1] fp32, w_t [K, N] column-major, w_s [1, N] -> [Wt * rows, N] bf16."""
+    def all_gather_gemm_fp8(self, xq, xs, w_t, w_s, chunks: int, keep: bool = False):
+        """xq [rows, K] fp8, xs [rows, 1] fp32, w_t [K, N] column-major, w_s [1, N] -> [Wt * rows, N] bf16.
+
+        keep: also return the gathered rows [Wt * rows, K] and scales [Wt * rows, 1], views of this call's
+        receive buffers. They hold until this rank's next-but-one relayed all-gather is issued (peers write
+        that parity again only after this rank's next all-gather has sent, i.e. after work queued before it)."""
         import flydsl.expr as fx
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
@@ -326,6 +330,8 @@ class TPRelay:
         call.end()
         xq.record_stream(side)
         calls["all_gather_gemm"] += 1
+        if keep:
+            return out, x_in.view(xq.dtype).view(Wt * rows, K), s_in.view(Wt * rows, 1)
         return out
 
     # -- GEMM + reduce-scatter ------------------------------------------------------------------------------

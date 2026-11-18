@@ -225,6 +225,87 @@ def _(x, w_t, group_name):
     return x.new_empty(_group_size(group_name) * x.shape[0], w_t.shape[1])
 
 
+# Q/K before V under TP (Wan's --ulysses_sdma_overlap_qkv): one all-gather feeds the Q/K GEMM, which
+# also hands back the gathered rows; V's GEMM reads them after the Q/K exchange has been sent.
+@torch.library.custom_op("xfuser::tp_fp8_all_gather_gemm_keep", mutates_args=())
+def _tp_fp8_all_gather_gemm_keep(
+    xq: torch.Tensor, xs: torch.Tensor, w_t: torch.Tensor, w_s: torch.Tensor, group_name: str
+) -> List[torch.Tensor]:
+    """As xfuser::tp_fp8_all_gather_gemm, plus the gathered rows [world * rows, K] fp8 and their scales
+    [world * rows, 1]: [out, rows, scales]. The rows may be the relay's receive buffer, valid until this
+    rank's next-but-one relayed all-gather: use them before the next TP all-gather site."""
+    from xfuser.model_executor.layers.tp_persistent import _tile_chunks
+
+    rows, K = xq.shape
+    relay = _relay(group_name)
+    if relay is not None:
+        chunks = _tile_chunks(4, rows)
+        if chunks is not None and K % 128 == 0 and K >= 256:
+            return list(relay.all_gather_gemm_fp8(xq, xs, w_t, w_s, chunks, keep=True))
+    group = dist.distributed_c10d._resolve_process_group(group_name)
+    gathered, (out,) = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
+        xq,
+        [w_t],
+        xs,
+        [w_s],
+        gather_dim=0,
+        biases=[None],
+        result_scales=[None],
+        out_dtypes=[torch.bfloat16],
+        use_fast_accum=[False],
+        group_name=group_name,
+    )
+    scales = xs.new_empty(_group_size(group_name) * rows, 1)
+    dist.all_gather_into_tensor(scales, xs.contiguous(), group=group)
+    return [out, gathered, scales]
+
+
+@_tp_fp8_all_gather_gemm_keep.register_fake
+def _(xq, xs, w_t, w_s, group_name):
+    rows = _group_size(group_name) * xq.shape[0]
+    return [
+        xq.new_empty(rows, w_t.shape[1], dtype=torch.bfloat16),
+        xq.new_empty(rows, xq.shape[1]),
+        xs.new_empty(rows, 1),
+    ]
+
+
+@torch.library.custom_op("xfuser::tp_fp8_gathered_gemm", mutates_args=())
+def _tp_fp8_gathered_gemm(
+    token: torch.Tensor, xg: torch.Tensor, sg: torch.Tensor, w_t: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """Row-wise FP8 GEMM of already gathered rows, ordered after `token` (the Q/K send) under compile."""
+    return torch._scaled_mm(xg, w_t, sg, w_s, out_dtype=torch.bfloat16)
+
+
+@_tp_fp8_gathered_gemm.register_fake
+def _(token, xg, sg, w_t, w_s):
+    return xg.new_empty(xg.shape[0], w_t.shape[1], dtype=torch.bfloat16)
+
+
+def tp_fp8_column_parallel_split(x: torch.Tensor, linear: nn.Linear, split: int, site: str):
+    """FP8 column-parallel `linear` over the TP group's rows of `x`, output columns [:split] only, keeping
+    the gathered rows for the rest: (out [b, S, split] in x's dtype, bias added; `rest(token)`, which
+    computes columns [split:] from the kept rows after `token`). Call `rest` before the next TP all-gather."""
+    batch = x.shape[0]
+    w_t, w_s, bias = linear.tp_fp8_weight, linear.tp_fp8_scale, linear.bias
+    xq, xs = _rowwise_fp8(_seq_rows(x))
+    with record_function(f"tp_ag_fp8:{site}"):
+        out, xg, sg = torch.ops.xfuser.tp_fp8_all_gather_gemm_keep(
+            xq, xs, w_t[:, :split], w_s[:, :split], get_tp_group().device_group.group_name
+        )
+
+    def shape(y, b):
+        y = y.view(-1, batch, y.shape[-1]).transpose(0, 1).to(x.dtype)
+        return y if b is None else y + b
+
+    def rest(token: torch.Tensor) -> torch.Tensor:
+        y = torch.ops.xfuser.tp_fp8_gathered_gemm(token, xg, sg, w_t[:, split:], w_s[:, split:])
+        return shape(y, None if bias is None else bias[split:])
+
+    return shape(out, None if bias is None else bias[:split]), rest
+
+
 def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
     batch = x.shape[0]
     xq, xs = _rowwise_fp8(_seq_rows(x))

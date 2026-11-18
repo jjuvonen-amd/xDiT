@@ -27,6 +27,7 @@ from xfuser.model_executor.layers.tensor_parallel import (
     shard_linear_,
     shard_rms_norm_,
     tp_column_parallel,
+    tp_fp8_column_parallel_split,
     tp_gather_rows,
     tp_rms_norm,
     tp_row_parallel,
@@ -451,11 +452,71 @@ class xFuserWanSdmaAttnProcessor(xFuserWanAttnProcessor):
         encoder_hidden_states: Optional[torch.Tensor],
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
+        if usp_sdma.overlap_qkv() and self._tp_qk_first_eligible(attn, encoder_hidden_states, rotary_emb):
+            output = self._call_tp_qk_first(attn, hidden_states, rotary_emb)
+            if output is not None:
+                return self._finish_attention(attn, output.transpose(1, 2), hidden_states.dtype, None)
         if usp_sdma.overlap_qkv() and self._qk_first_eligible(attn, hidden_states, encoder_hidden_states, rotary_emb):
             output = self._call_qk_first(attn, hidden_states, rotary_emb)
             if output is not None:
                 return self._finish_attention(attn, output.transpose(1, 2), hidden_states.dtype, None)
         return super()._call_standard(attn, hidden_states, encoder_hidden_states, rotary_emb)
+
+    def _tp_qk_first_eligible(self, attn, encoder_hidden_states, rotary_emb) -> bool:
+        """Q/K before V under TP: self-attention with the FP8 fused TP sites (XDIT_TP_FP8 with
+        XDIT_TP_COMM_OVERLAP=symm_mem), whose all-gather can keep the gathered rows for V."""
+        return (
+            self.tensor_parallel
+            and not self.is_cross_attention
+            and self.attention_function is USP
+            and self.tp_fused == "symm_mem"
+            and encoder_hidden_states is None
+            and attn.add_k_proj is None
+            and rotary_emb is not None
+            and not torch.is_grad_enabled()
+            and getattr(attn, "fused_projections", False)
+            and getattr(attn.to_qkv, "tp_fp8_weight", None) is not None
+        )
+
+    def _call_tp_qk_first(self, attn, hidden_states, rotary_emb):
+        """TP x Ulysses Q/K before V: the TP all-gather feeds the Q/K columns of the QKV GEMM and keeps
+        the gathered rows; Q/K are normed over the TP group and rotated, head group 0's are sent, and
+        V's GEMM reads the kept rows while they are in flight (usp_sdma.qk_first_grouped_attention).
+        USP's [b, H, s, d], or None."""
+        from yunchang.globals import PROCESS_GROUP
+
+        width = attn.to_qkv.tp_fp8_weight.shape[1] // 3
+        qk, project_rest = tp_fp8_column_parallel_split(hidden_states, attn.to_qkv, 2 * width, "attn1_qk")
+        query, key = qk.chunk(2, dim=-1)
+        query, key = tp_rms_norm((query, key), (attn.norm_q, attn.norm_k), "attn1_qk_norm")
+        query, key, _ = self._rope_reference(attn, query, key, key, rotary_emb)
+
+        def project_v(token):
+            return project_rest(token).unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+        output = usp_sdma.qk_first_grouped_attention(
+            hidden_states,
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            project_v,
+            backend=None,
+            attention_kwargs=self.attention_kwargs,
+            group=PROCESS_GROUP.ULYSSES_PG,
+            rows=qk.shape[1],
+        )
+        if output is None:
+            # The rows the split all-gather kept must be used before the next TP all-gather.
+            value = project_v(qk.new_empty(0)).transpose(1, 2)
+            output = self.attention_function(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                backend=None,
+                attention_kwargs=self.attention_kwargs,
+                head_balance_layer=attn,
+                attn_layer=attn,
+            )
+        return output
 
     def _qk_first_eligible(self, attn, hidden_states, encoder_hidden_states, rotary_emb) -> bool:
         """Whether this call can send Q/K before V: plain self-attention in inference, batch one and

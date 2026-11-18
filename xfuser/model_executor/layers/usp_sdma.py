@@ -632,6 +632,84 @@ def qk_first_attention(
     )
 
 
+def qk_first_grouped_attention(
+    ref,
+    query,
+    key,
+    project_v,
+    *,
+    backend,
+    attention_kwargs,
+    group: dist.ProcessGroup,
+    rows: Optional[int] = None,
+):
+    """Ulysses attention with Q/K ready before V, in the configured head groups: head group 0's Q/K
+    are sent, V is projected (`project_v(token)` -> [b, H, s, d], through an op ordered after
+    `token`), then group 0's V and each later group's Q/K and V in turn. Returns USP's [b, H, s, d],
+    or None when the call cannot take this path.
+
+    `query` / `key` are [b, H, s, d] (normed and rotated); `ref` is the [b, s, ...] input and `rows`
+    overrides its s. Group 0's Q/K transfer runs under V's projection; the later groups' exchange
+    runs under the earlier groups' attention, as on the grouped path."""
+    if not selected():
+        return None
+    world = dist.get_world_size(group)
+    heads, head_dim = query.shape[1], query.shape[3]
+    if world <= 1 or heads % world:
+        return None
+    runtime = get_runtime_state()
+    if backend is None:
+        backend = runtime.attention_backend
+    reason = call_reason(
+        backend=backend,
+        ring_world_size=get_ring_parallel_world_size(),
+        joint_strategy=None,
+        fp8_comms=runtime.fp8_comms,
+        has_kv_cache=False,
+        head_balanced=runtime.runtime_config.use_sparseattn_head_balance,
+        attention_kwargs=attention_kwargs,
+    )
+    if reason is not None:
+        warn_fallback(reason)
+        return None
+    per_rank = heads // world
+    rows = ref.shape[1] if rows is None else rows
+    groups = _config().head_groups
+    spec = ulysses.encode(world, ref.shape[0], head_dim, [rows] * 3, [per_rank] * 3, [(0, 0)] * 3, groups)
+    sizes = ulysses.head_split([per_rank] * 3, groups)
+    offsets = [sum(g[0] for g in sizes[:i]) for i in range(len(sizes))]
+    packed = []
+
+    def qk_group(i):
+        return ulysses.pack_group([ulysses.pieces_from_heads(x, world, offsets[i], sizes[i][0]) for x in (query, key)])
+
+    packed.append(qk_group(0))
+    # Opened on group 0's Q/K: under torch.compile the call is armed once they exist.
+    token = torch.ops.xfuser.sdma_ulysses_begin(packed[0], spec, group.group_name, _config().mode)
+    token = torch.ops.xfuser.sdma_ulysses_send(token, packed[0], 0, [0, 1], group.group_name)
+    value = project_v(token)
+    for i in range(len(sizes)):
+        if i:
+            packed.append(qk_group(i))
+            token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], i, [0, 1], group.group_name)
+        packed.append(ulysses.pack_group([ulysses.pieces_from_heads(value, world, offsets[i], sizes[i][2])]))
+        token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], i, [2], group.group_name)
+    return finish(
+        token,
+        packed,
+        spec,
+        joint_key=None,
+        joint_value=None,
+        extra_names=[],
+        backend=backend,
+        dropout_p=0.0,
+        is_causal=False,
+        attention_kwargs=attention_kwargs,
+        kv_head_repeat=1,
+        group=group,
+    )
+
+
 def _prepare_grouped_qkv(attn: torch.nn.Module, world: int) -> bool:
     """Copy the attention module's Q/K/V weight rows per head group, for `world` Ulysses ranks
     and the configured head groups; False if its projections cannot be split."""

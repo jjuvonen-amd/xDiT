@@ -83,6 +83,9 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         os.environ["XDIT_TP_PERSISTENT"] = "1"
     if options.get("row_align"):
         os.environ["XDIT_TP_ROW_ALIGN"] = str(options["row_align"])
+    if options.get("relay"):
+        # The relay takes the FP8 sites it fits (the persistent kernels on its transport); the rest fall back.
+        os.environ.update(XDIT_TP_RELAY="1", XDIT_TP_PERSISTENT="1", XDIT_TP_IPC_WORKSPACE="1")
     torch_sdma = options.get("torch_sdma", False)
     if torch_sdma:
         os.environ.update(
@@ -124,12 +127,13 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         device = torch.device("cuda", rank)
         # Seeded on the CPU, so every process builds the same weights.
         torch.manual_seed(0)
-        model = xFuserWanTransformer3DWrapper(**_TINY_CONFIG).eval().to(device=device, dtype=torch.float32)
+        config = {**_TINY_CONFIG, **options.get("config", {})}
+        model = xFuserWanTransformer3DWrapper(**config).eval().to(device=device, dtype=torch.float32)
         model.shard_for_tensor_parallel(
             shard_cross_attention=cross_attention == "sharded", overlap_chunks=chunks, fused_comm=fused
         )
         if tp > 1:
-            heads = _TINY_CONFIG["num_attention_heads"]
+            heads = config["num_attention_heads"]
             assert all(isinstance(block, xFuserWanTPTransformerBlock) for block in model.blocks)
             assert model.blocks[0].attn1.heads == heads // tp
             assert model.blocks[0].attn2.heads == (heads // tp if cross_attention == "sharded" else heads)
@@ -142,9 +146,13 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         # fallback through the same op calls, so the wiring is still checked there.
         fallback = fused == "symm_mem" and torch.version.hip and not torch_sdma
         fused_kernels = symm_mem._test_mode() if fallback else contextlib.nullcontext()
-        with torch.no_grad(), fused_kernels:
-            output = model(**inputs, return_dict=False)[0]
-        if torch_sdma and not options.get("persistent"):  # the persistent path bypasses torch's ops
+        if options.get("qk_first_groups"):
+            output = _run_qk_first(model, inputs, options["qk_first_groups"], fused_kernels)
+        else:
+            with torch.no_grad(), fused_kernels:
+                output = model(**inputs, return_dict=False)[0]
+        # the persistent path and the relay bypass torch's ops
+        if torch_sdma and not options.get("persistent") and not options.get("relay"):
             from torch.distributed._symmetric_memory import _rocm_sdma
 
             ops = ("fused_all_gather_matmul", "fused_matmul_reduce_scatter")
@@ -164,6 +172,47 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
     finally:
         destroy_model_parallel()
         destroy_distributed_environment()
+
+
+def _run_qk_first(model, inputs, head_groups, fused_kernels):
+    """--ulysses_a2a sdma with and without --ulysses_sdma_overlap_qkv (TP: Q/K's GEMM and send before V's
+    GEMM, from the rows the all-gather kept): the outputs match and the Q/K-first path ran."""
+    from types import SimpleNamespace
+
+    from xfuser.config.ulysses_a2a import UlyssesA2AConfig
+    from xfuser.core.distributed import get_runtime_state
+    from xfuser.core.distributed.sdma import ulysses
+    from xfuser.model_executor.layers import usp_sdma
+    from xfuser.model_executor.models.transformers.transformer_wan import xFuserWanSdmaAttnProcessor
+
+    runtime = get_runtime_state().runtime_config
+    sends = []
+    original_send = ulysses.send
+
+    def counted_send(process_group, gi, packed, tensors=None):
+        sends.append(tuple(tensors) if tensors is not None else None)
+        return original_send(process_group, gi, packed, tensors)
+
+    ulysses.send = counted_send
+    try:
+        runtime.ulysses_a2a = UlyssesA2AConfig("sdma", head_groups)
+        with torch.no_grad(), fused_kernels:
+            expected = model(**inputs, return_dict=False)[0]
+        runtime.ulysses_a2a = UlyssesA2AConfig("sdma", head_groups, overlap_qkv=True)
+        usp_sdma.prepare(SimpleNamespace(transformer=model), ["transformer"], cpu_offload=False)
+        assert type(model.blocks[0].attn1.processor) is xFuserWanSdmaAttnProcessor
+        sends.clear()
+        with torch.no_grad(), fused_kernels:
+            output = model(**inputs, return_dict=False)[0]
+        layers = len(model.blocks)
+        qk_sends = sends.count((0, 1))
+        assert qk_sends >= layers, f"the TP Q/K-first path did not run: sends {sends}"
+        assert qk_sends == layers * head_groups, f"{qk_sends} Q/K sends for {layers} layers x {head_groups} groups"
+        torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
+    finally:
+        ulysses.send = original_send
+        runtime.ulysses_a2a = UlyssesA2AConfig()
+    return output
 
 
 def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=None, **extra):
@@ -414,3 +463,30 @@ def test_tensor_parallel_fp8_persistent_is_close_to_one_gpu(tmp_path, one_gpu_ou
 
     error = _relative_error(actual, expected)
     assert error <= FP8_TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+@pytest.mark.parametrize("heads, head_groups", [(4, 1), (8, 2)])
+@pytest.mark.parametrize("relay", [False, True], ids=["direct", "relay"])
+def test_tensor_parallel_fp8_ulysses_qk_first_matches_and_is_close_to_one_gpu(
+    tmp_path, one_gpu_output, heads, head_groups, relay, latent_shape
+):
+    """TP2 x Ulysses2, FP8 TP sites, SDMA Ulysses with --ulysses_sdma_overlap_qkv: self-attention's Q/K GEMM and
+    exchange run before V's GEMM, which reads the rows the all-gather kept (the relay's receive buffer with
+    XDIT_TP_RELAY=1); the output matches the same run without it and, for the stock head count, one GPU."""
+    if not torch.cuda.is_available() or torch.version.hip is None or not _torch_has_sdma_patch():
+        pytest.skip("needs ROCm and a torch patched with patches/pytorch")
+    if relay:
+        pytest.importorskip("flydsl")
+    extra = dict(fused="symm_mem", torch_sdma=True, fp8=True, qk_first_groups=head_groups)
+    if heads != _TINY_CONFIG["num_attention_heads"]:
+        extra["config"] = dict(num_attention_heads=heads, attention_head_dim=64)
+    if relay:
+        extra.update(relay=True, row_align=256)
+
+    actual = _run(tmp_path, "tp2-ulysses2", "wan", latent_shape, **extra)
+
+    if "config" not in extra:
+        error = _relative_error(actual, one_gpu_output("wan", latent_shape))
+        assert error <= FP8_TOLERANCE, f"relative error {error:.3e}"
