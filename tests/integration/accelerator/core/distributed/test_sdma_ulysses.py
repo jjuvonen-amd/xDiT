@@ -82,7 +82,11 @@ def exchange_mismatches(group, case, seed, rccl=False, qk_first=False):
         dist.all_gather(parts, x.contiguous(), group=group)
         full.append(torch.cat(parts, dim=2))
     heads = [x.shape[1] // world for x in tensors]
-    sizes = ulysses.head_split(heads, groups)
+    kv = (joint_rows, 0) if front else (0, joint_rows)
+    reserved = [(0, 0), kv, kv] + [(0, 0)] * extras
+    rows = [x.shape[2] for x in tensors]
+    exchange = ulysses.Exchange.make(world, batch, HEAD_DIM, q.dtype, rows, heads, reserved, groups)
+    sizes = exchange.sizes
     counts = [torch.zeros((), dtype=torch.int64, device=device) for _ in sizes]
     calls = []
 
@@ -91,6 +95,9 @@ def exchange_mismatches(group, case, seed, rccl=False, qk_first=False):
         calls.append(gi)
         for t, view in enumerate(views):
             off, h = sum(sizes[i][t] for i in range(gi)), sizes[gi][t]
+            if exchange.kv_whole and t in (1, 2):  # K/V whole with group 0: this group's slice of them
+                lo, hi = ulysses.kv_heads_for(sizes, gi, heads[0] // heads[1])
+                off, h = lo, hi - lo
             want = full[t][:, rank * heads[t] + off : rank * heads[t] + off + h]
             if joint and t in (1, 2):
                 own = joint[t - 1][:, off : off + h]
@@ -98,13 +105,9 @@ def exchange_mismatches(group, case, seed, rccl=False, qk_first=False):
             counts[gi].add_((view != want).sum())
         return views[0] * 2 + 1
 
-    kv = (joint_rows, 0) if front else (0, joint_rows)
-    reserved = [(0, 0), kv, kv] + [(0, 0)] * extras
     local = [None, *joint] + [None] * extras if joint else None
     if qk_first:
         # Each head group in two sends: Q and K first, then the rest.
-        rows = [x.shape[2] for x in tensors]
-        exchange = ulysses.Exchange.make(world, batch, HEAD_DIM, q.dtype, rows, heads, reserved, groups)
         ulysses.begin(group, exchange)
         offsets = [0] * len(tensors)
         for gi, group_sizes in enumerate(sizes):
@@ -132,6 +135,12 @@ EXCHANGES = [
     (1, 72, 64, 6, 6, 0, 8, False, 3, True),
     # Grouped-query K/V (4 query heads per K/V head) and an extra Q-shaped tensor.
     (1, 64, 64, 8, 2, 1, 0, True, 2, False),
+    # GQA with one K/V head per rank (U2 x TP4, 64 / 8 heads): K/V travel whole with group 0, Q split in 4 / 3
+    # (uneven) groups, also on group streams; and 2 K/V heads per rank split into 4 groups (2 per K/V head).
+    (1, 96, 96, 8, 1, 0, 0, True, 4, False),
+    (1, 96, 96, 8, 1, 0, 0, True, 3, True),
+    (1, 80, 80, 8, 2, 0, 0, True, 4, False),
+    (1, 64, 64, 8, 1, 0, 8, True, 4, False),
     # Larger than every call before it: the shared buffers grow.
     (1, 1024, 1024, 5, 5, 0, 0, True, 2, False),
 ]

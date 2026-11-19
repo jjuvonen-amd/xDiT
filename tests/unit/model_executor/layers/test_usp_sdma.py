@@ -10,6 +10,8 @@ from xfuser.core.distributed.sdma.ulysses import (
     MAX_HEAD_GROUPS,
     Exchange,
     head_split,
+    kv_heads_for,
+    kv_whole_split,
     pack_group,
     pieces_from_grouped,
     pieces_from_heads,
@@ -306,3 +308,22 @@ def test_q_k_first_modules_are_reported_with_their_one_head_group(monkeypatch, r
 def test_host_issued_copies_compile_without_cuda_graphs(monkeypatch, mode, transport, world, expected):
     _ulysses_a2a(monkeypatch, transport, 2, world=world)
     assert usp_sdma.compile_mode(mode) == expected
+
+
+def test_kv_whole_split_for_gqa_past_the_kv_cap():
+    # one K/V head per rank (U2 x TP4, 64 / 8 heads): K/V whole with group 0, only Q split
+    assert kv_whole_split((8, 1, 1), 4) == ((2, 1, 1), (2, 0, 0), (2, 0, 0), (2, 0, 0))
+    assert kv_whole_split((8, 1, 1), 3) == ((3, 1, 1), (3, 0, 0), (2, 0, 0))
+    # two K/V heads, four groups: each group's Q heads within one K/V head
+    sizes = kv_whole_split((8, 2, 2), 4)
+    assert sizes == ((2, 2, 2), (2, 0, 0), (2, 0, 0), (2, 0, 0))
+    assert [kv_heads_for(sizes, g, 4) for g in range(4)] == [(0, 1), (0, 1), (1, 2), (1, 2)]
+
+
+def test_kv_whole_split_leaves_the_plain_split_where_it_suffices():
+    assert kv_whole_split((8, 2, 2), 2) is None  # head_split makes the 2 groups
+    assert kv_whole_split((5, 5, 5), 2) is None  # not GQA
+    assert kv_whole_split((8, 2, 2, 8), 4) is None  # extra tensors
+    assert kv_whole_split((8, 1, 1), 1) is None  # one group asked for
+    # 3 Q heads per K/V head, 2 K/V heads, 4 groups: only 2 groups keep each within K/V heads, as the plain split does
+    assert kv_whole_split((6, 2, 2), 4) is None

@@ -232,7 +232,7 @@ def begin(query, rows, heads, reserved, group: dist.ProcessGroup):
     config = _config()
     spec = ulysses.encode(world, query.shape[0], query.shape[3], rows, heads, reserved, config.head_groups)
     token = torch.ops.xfuser.sdma_ulysses_begin(query, spec, group.group_name, config.mode)
-    return token, spec, ulysses.head_split(heads, config.head_groups)
+    return token, spec, ulysses.Exchange.decode(spec, query.dtype).sizes
 
 
 def finish(
@@ -655,7 +655,7 @@ def qk_first_grouped_attention(
         return None
     world = dist.get_world_size(group)
     heads, head_dim = query.shape[1], query.shape[3]
-    if world <= 1 or heads % world:
+    if world <= 1 or heads % world or key.shape[1] % world:
         return None
     runtime = get_runtime_state()
     if backend is None:
@@ -675,13 +675,17 @@ def qk_first_grouped_attention(
     per_rank = heads // world
     rows = ref.shape[1] if rows is None else rows
     groups = _config().head_groups
-    spec = ulysses.encode(world, ref.shape[0], head_dim, [rows] * 3, [per_rank] * 3, [(0, 0)] * 3, groups)
-    sizes = ulysses.head_split([per_rank] * 3, groups)
-    offsets = [sum(g[0] for g in sizes[:i]) for i in range(len(sizes))]
+    kv_rank = key.shape[1] // world
+    spec = ulysses.encode(world, ref.shape[0], head_dim, [rows] * 3, [per_rank, kv_rank, kv_rank], [(0, 0)] * 3, groups)
+    sizes = ulysses.Exchange.decode(spec, query.dtype).sizes
+    # per tensor (Q, K, V): its heads' offset in group i (K/V differ from Q under GQA)
+    offsets = [[sum(g[t] for g in sizes[:i]) for t in range(3)] for i in range(len(sizes))]
     packed = []
 
     def qk_group(i):
-        return ulysses.pack_group([ulysses.pieces_from_heads(x, world, offsets[i], sizes[i][0]) for x in (query, key)])
+        return ulysses.pack_group(
+            [ulysses.pieces_from_heads(x, world, offsets[i][t], sizes[i][t]) for t, x in enumerate((query, key))]
+        )
 
     packed.append(qk_group(0))
     # Opened on group 0's Q/K: under torch.compile the call is armed once they exist.
@@ -689,10 +693,14 @@ def qk_first_grouped_attention(
     token = torch.ops.xfuser.sdma_ulysses_send(token, packed[0], 0, [0, 1], group.group_name)
     value = project_v(token)
     for i in range(len(sizes)):
+        if i and not sizes[i][2]:  # GQA, K/V whole with group 0: this group is Q only, one send
+            packed.append(qk_group(i))
+            token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], i, [0, 1, 2], group.group_name)
+            continue
         if i:
             packed.append(qk_group(i))
             token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], i, [0, 1], group.group_name)
-        packed.append(ulysses.pack_group([ulysses.pieces_from_heads(value, world, offsets[i], sizes[i][2])]))
+        packed.append(ulysses.pack_group([ulysses.pieces_from_heads(value, world, offsets[i][2], sizes[i][2])]))
         token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], i, [2], group.group_name)
     return finish(
         token,

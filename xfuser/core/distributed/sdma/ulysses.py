@@ -79,6 +79,34 @@ def head_split(heads: Sequence[int], groups: int) -> Tuple[Tuple[int, ...], ...]
     return tuple(tuple(u * h // units for h in heads) for u in split_heads(units, groups))
 
 
+def kv_whole_split(heads: Sequence[int], groups: int) -> Optional[Tuple[Tuple[int, ...], ...]]:
+    """GQA split past the whole-K/V-head cap: K/V travel whole with group 0 and only Q is split into `groups`, or
+    None where it does not apply. `head_split` keeps every K/V head whole, so with fewer K/V heads per rank than
+    groups (U2 x TP4 with 8 K/V heads: one per rank) it can make one group only. This needs exactly Q, K, V (K and
+    V with the same heads, fewer than Q's), more groups asked for than the K/V-whole split makes, and each group's
+    Q heads either whole runs of one K/V head's queries or within one K/V head (what grouped attention needs)."""
+    if len(heads) != 3 or heads[1] != heads[2] or heads[1] >= heads[0] or heads[0] % heads[1]:
+        return None
+    plain = len(head_split(heads, groups))
+    if plain >= min(groups, MAX_HEAD_GROUPS):
+        return None
+    ratio = heads[0] // heads[1]
+    for g in range(min(groups, heads[0], MAX_HEAD_GROUPS), plain, -1):  # only if it beats the plain split
+        qs, off, ok = split_heads(heads[0], g), 0, True
+        for n in qs:
+            ok &= (off % ratio == 0 and n % ratio == 0) or off // ratio == (off + n - 1) // ratio
+            off += n
+        if ok:
+            return ((qs[0], heads[1], heads[2]),) + tuple((n, 0, 0) for n in qs[1:])
+    return None
+
+
+def kv_heads_for(sizes, g: int, ratio: int) -> Tuple[int, int]:
+    """[lo, hi) of the K/V heads group g's Q heads attend to (`kv_whole_split` groups)."""
+    off = sum(sz[0] for sz in sizes[:g])
+    return off // ratio, -(-(off + sizes[g][0]) // ratio)
+
+
 def encode(world, batch, head_dim, rows, heads, reserved, head_groups) -> List[int]:
     """An exchange as integers, for a custom op's arguments (its dtype travels with a tensor)."""
     out = [world, batch, head_dim, head_groups, len(rows)]
@@ -115,7 +143,13 @@ class Exchange:
     sizes: Tuple[Tuple[int, ...], ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        object.__setattr__(self, "sizes", head_split(self.heads, self.head_groups))
+        sizes = kv_whole_split(self.heads, self.head_groups) or head_split(self.heads, self.head_groups)
+        object.__setattr__(self, "sizes", sizes)
+
+    @property
+    def kv_whole(self) -> bool:
+        """K/V travel whole with group 0; later groups carry Q only (`kv_whole_split`)."""
+        return self.groups > 1 and self.sizes[1][1] == 0 and self.heads[1] > 0
 
     @staticmethod
     def make(world, batch, head_dim, dtype, rows, heads, reserved, head_groups) -> "Exchange":
@@ -293,6 +327,8 @@ def _in_copies(g, ex, gi, tensors, inbox, elt):
             h, s, R = ex.sizes[gi][t], ex.rows[t], ex.inbox_rows(t)
             block = s * h * d
             before = ex.reserved[t][0]
+            if not h:  # a kv_whole group past the first carries no K/V
+                continue
             for bi in range(b):
                 src = (p * peer_elems + start + bi * block) * elt
                 mine.append((src, inbox, (offsets[t] + (bi * R + before + r * s) * h * d) * elt, block * elt))
@@ -442,6 +478,7 @@ def finish(
         ready.record(stream)
         side = _streams(stream.device, G)
     held = []
+    kv0 = None
     for gi in range(G):
         group_stream = stream
         if concurrent:
@@ -449,6 +486,13 @@ def finish(
             group_stream.wait_event(ready)
         with torch.cuda.stream(group_stream):
             c.call.wait(gi, group_stream)
+            if concurrent and ex.kv_whole:
+                # K/V came with group 0: later groups wait for group 0's wait (a flag is waited on once)
+                if gi == 0:
+                    kv_landed = torch.cuda.Event()
+                    kv_landed.record(group_stream)
+                else:
+                    group_stream.wait_event(kv_landed)
             offsets = ex.inbox_offsets[gi]
             views = []
             for t in range(ex.tensors):
@@ -462,6 +506,7 @@ def finish(
                     if after:
                         x[:, ex.inbox_rows(t) - after :].copy_(own[:, before:])
                 views.append(x.transpose(1, 2))
+            kv0 = _kv_whole_views(ex, gi, views, kv0 if gi else None)
             out = attend(*views).transpose(1, 2)
             if out.dtype != ex.dtype:
                 out = out.to(ex.dtype)
@@ -489,6 +534,18 @@ def finish(
     return result.view(b, s, P * ex.heads[0], d)
 
 
+def _kv_whole_views(ex, gi, views, kv0):
+    """For a kv_whole exchange, give group gi the K/V heads its Q heads attend to, from group 0's (all of them);
+    returns group 0's K/V views. `views` ([b, h, rows, d] per tensor) are changed in place."""
+    if not ex.kv_whole:
+        return None
+    if kv0 is None:
+        kv0 = (views[1], views[2])
+    lo, hi = kv_heads_for(ex.sizes, gi, ex.heads[0] // ex.heads[1])
+    views[1], views[2] = kv0[0][:, lo:hi], kv0[1][:, lo:hi]
+    return kv0
+
+
 def _outbox(outbox, ex, gi, elt):
     """Group gi's out inbox, [P][b][s_q][h_qg][d]."""
     P, b, s, h, d = ex.world, ex.batch, ex.rows[0], ex.sizes[gi][0], ex.head_dim
@@ -501,6 +558,7 @@ def _finish_rccl(process_group, ex, packed, attend, local):
     P, b, d = ex.world, ex.batch, ex.head_dim
     s = ex.rows[0]
     result = torch.empty(b, s, P, ex.heads[0], d, dtype=ex.dtype, device=packed[0].device)
+    kv0 = None
     for gi in range(ex.groups):
         got = torch.empty_like(packed[gi])
         dist.all_to_all_single(got, packed[gi], group=process_group)
@@ -516,6 +574,7 @@ def _finish_rccl(process_group, ex, packed, attend, local):
                 x = torch.cat([own[:, :before], x, own[:, before:]], dim=1)
             views.append(x.transpose(1, 2))
             start += n
+        kv0 = _kv_whole_views(ex, gi, views, kv0 if gi else None)
         out = attend(*views).transpose(1, 2).to(ex.dtype)
         h = ex.sizes[gi][0]
         back = out.reshape(b, P, s, h, d).permute(1, 0, 2, 3, 4).contiguous()
