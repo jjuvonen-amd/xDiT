@@ -28,6 +28,7 @@ from xfuser.model_executor.layers.tensor_parallel import (
     shard_rms_norm_,
     tp_column_parallel,
     tp_fp8_column_parallel_split,
+    tp_fp8_rs_norm_ag,
     tp_gather_rows,
     tp_rms_norm,
     tp_row_parallel,
@@ -137,7 +138,12 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        tp_defer_out: bool = False,
+        tp_query: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """`tp_defer_out` (TP): return the attention output before the row-parallel output projection, [b, rows,
+        heads * d], for the block to pipeline it into its next projection (tp_fp8_rs_norm_ag); `tp_query` (TP
+        cross-attention): this rank's heads of the query, already projected (and biased) over the group's rows."""
         # The fused attention all-to-all projects full Q/K/V itself; TP's sharded projections take the standard path.
         if get_fused_a2a_mode() > 0 and not self.is_cross_attention and not self.tensor_parallel:
             return self._call_attention_a2a(
@@ -151,6 +157,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states,
             encoder_hidden_states,
             rotary_emb,
+            tp_defer_out=tp_defer_out,
+            tp_query=tp_query,
         )
 
     def _call_standard(
@@ -159,6 +167,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]],
+        tp_defer_out: bool = False,
+        tp_query: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         backend = None
         if self.is_cross_attention:
@@ -171,7 +181,10 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             attn,
             encoder_hidden_states,
         )
-        if self.tensor_parallel:
+        if self.tensor_parallel and tp_query is not None:  # cross-attention, its query projected by the block
+            key, value = attn.to_kv(encoder_hidden_states).chunk(2, dim=-1)
+            query = tp_query
+        elif self.tensor_parallel:
             query, key, value = self._get_tp_qkv_projections(attn, hidden_states, encoder_hidden_states)
         else:
             query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
@@ -226,6 +239,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states,
             activation_dtype,
             hidden_states_img,
+            defer=tp_defer_out,
         )
 
     def _call_attention_a2a(
@@ -353,13 +367,15 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         ).transpose(1, 2)
         return output.flatten(2, 3).to(activation_dtype)
 
-    def _finish_attention(self, attn, hidden_states, activation_dtype, hidden_states_img=None):
+    def _finish_attention(self, attn, hidden_states, activation_dtype, hidden_states_img=None, defer=False):
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(activation_dtype)
 
         if hidden_states_img is not None:
             hidden_states = hidden_states + hidden_states_img
 
+        if self.tensor_parallel and defer:  # the block pipelines the output projection into its next one
+            return hidden_states
         if self.tensor_parallel:
             # Row-parallel: partial sums over this rank's heads, reduced back to its rows.
             site = "attn2_out" if self.is_cross_attention else "attn1_out"
@@ -451,16 +467,26 @@ class xFuserWanSdmaAttnProcessor(xFuserWanAttnProcessor):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]],
+        tp_defer_out: bool = False,
+        tp_query: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if usp_sdma.overlap_qkv() and self._tp_qk_first_eligible(attn, encoder_hidden_states, rotary_emb):
+        if (
+            tp_query is None
+            and usp_sdma.overlap_qkv()
+            and self._tp_qk_first_eligible(attn, encoder_hidden_states, rotary_emb)
+        ):
             output = self._call_tp_qk_first(attn, hidden_states, rotary_emb)
             if output is not None:
-                return self._finish_attention(attn, output.transpose(1, 2), hidden_states.dtype, None)
+                return self._finish_attention(
+                    attn, output.transpose(1, 2), hidden_states.dtype, None, defer=tp_defer_out
+                )
         if usp_sdma.overlap_qkv() and self._qk_first_eligible(attn, hidden_states, encoder_hidden_states, rotary_emb):
             output = self._call_qk_first(attn, hidden_states, rotary_emb)
             if output is not None:
                 return self._finish_attention(attn, output.transpose(1, 2), hidden_states.dtype, None)
-        return super()._call_standard(attn, hidden_states, encoder_hidden_states, rotary_emb)
+        return super()._call_standard(
+            attn, hidden_states, encoder_hidden_states, rotary_emb, tp_defer_out=tp_defer_out, tp_query=tp_query
+        )
 
     def _tp_qk_first_eligible(self, attn, encoder_hidden_states, rotary_emb) -> bool:
         """Q/K before V under TP: self-attention with the FP8 fused TP sites (XDIT_TP_FP8 with
@@ -607,6 +633,51 @@ class xFuserWanTPTransformerBlock(WanTransformerBlock):
     the local rows.
     """
 
+    tp_chain = False
+
+    def _forward_chained(self, hidden_states, encoder_hidden_states, rotary_emb, mods):
+        """forward() with each attention's output projection pipelined, piece by piece, through the residual
+        update and the next norm (+ modulation) into the next projection (tp_fp8_rs_norm_ag): attn1's into
+        cross-attention's query, attn2's into the FFN's first projection. Same math as forward()."""
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = mods
+        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        o = self.attn1.processor(self.attn1, norm_hidden_states, None, None, rotary_emb, tp_defer_out=True)
+        hidden_states, query = tp_fp8_rs_norm_ag(
+            o,
+            self.attn1.to_out[0],
+            self.attn1.tp_out_bias,
+            hidden_states,
+            gate_msa,
+            self.norm2,
+            None,
+            self.attn2.to_q,
+            "attn1_out_attn2_q",
+        )
+        o = self.attn2.processor(
+            self.attn2, hidden_states, encoder_hidden_states, None, None, tp_defer_out=True, tp_query=query
+        )
+        act = self.ffn.net[0]
+        hidden_states, up = tp_fp8_rs_norm_ag(
+            o,
+            self.attn2.to_out[0],
+            self.attn2.tp_out_bias,
+            hidden_states,
+            None,
+            self.norm3,
+            (c_scale_msa, c_shift_msa),
+            act.proj,
+            "attn2_out_ffn_up",
+        )
+        ff_output = tp_row_parallel(
+            self.ffn.net[1](act.gelu(up)),
+            self.ffn.net[2],
+            self.ffn_out_bias,
+            "ffn_down",
+            self.tp_chunks,
+            self.tp_fused,
+        )
+        return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -614,6 +685,9 @@ class xFuserWanTPTransformerBlock(WanTransformerBlock):
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
     ) -> torch.Tensor:
+        if self.tp_chain and temb.ndim == 3 and hidden_states.shape[0] == 1:
+            mods = (self.scale_shift_table + temb.float()).chunk(6, dim=1)
+            return self._forward_chained(hidden_states, encoder_hidden_states, rotary_emb, mods)
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -807,6 +881,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                     quantize_linear_fp8_(attn.to_out[0])
                 quantize_linear_fp8_(block.ffn.net[0].proj)
                 quantize_linear_fp8_(block.ffn.net[2])
+                # attention outputs pipelined into the next projection (tp_fp8_rs_norm_ag)
+                block.tp_chain = shard_cross_attention and envs.environment_variables["XDIT_TP_RELAY_CHAIN"]() == "1"
         self._tp_size = tp_size
         self._tp_rank = tp_rank
         self._tp_chunks = overlap_chunks

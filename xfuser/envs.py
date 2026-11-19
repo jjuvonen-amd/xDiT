@@ -109,6 +109,10 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # 1 / 0.6 (11.29 -> 11.21 s/iter); 4 pieces lose (11.64: per-piece sends and waits on a bandwidth-bound RS).
     "XDIT_TP_RELAY_RS_DIRECT": lambda: os.environ.get("XDIT_TP_RELAY_RS_DIRECT", "0.7"),
     "XDIT_TP_RELAY_CHUNKS": lambda: os.environ.get("XDIT_TP_RELAY_CHUNKS", "2"),
+    # 1: Wan TP blocks pipeline each attention's output projection (GEMM + reduce-scatter) through the residual
+    # update and next norm into the next projection (all-gather + GEMM), piece by piece (tp_fp8_rs_norm_ag).
+    # Needs XDIT_TP_FP8=1 and sharded cross-attention; pipelines with XDIT_TP_RELAY=1.
+    "XDIT_TP_RELAY_CHAIN": lambda: os.environ.get("XDIT_TP_RELAY_CHAIN", "0"),
     # 1: the relayed GEMM + reduce-scatter sends the peers' partial sums as FP8 e4m3 (one scale per row and 256
     # columns, quantized beside the GEMM; this rank's own part stays bf16, the sum is fp32): half the RS bytes.
     # Wan TP4 x U2 720p, 8x MI355X: 11.23 -> 10.85 s/iter; 1-step output as close to the bf16-TP reference as with

@@ -86,6 +86,8 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
     if options.get("relay"):
         # The relay takes the FP8 sites it fits (the persistent kernels on its transport); the rest fall back.
         os.environ.update(XDIT_TP_RELAY="1", XDIT_TP_PERSISTENT="1", XDIT_TP_IPC_WORKSPACE="1")
+    if options.get("chain"):
+        os.environ["XDIT_TP_RELAY_CHAIN"] = "1"
     torch_sdma = options.get("torch_sdma", False)
     if torch_sdma:
         os.environ.update(
@@ -167,6 +169,10 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
 
             ran = [tp_persistent.calls[k] for k in ("all_gather_gemm", "gemm_reduce_scatter")]
             assert min(ran) > 0, f"the persistent FP8 kernels did not run: {tp_persistent.calls}"
+        if options.get("chain"):
+            from xfuser.model_executor.layers import tp_relay
+
+            assert tp_relay.calls["rs_then_ag"] > 0, f"the pipelined RS -> AG did not run: {tp_relay.calls}"
         if rank == 0:
             torch.save(output.cpu(), output_path)
     finally:
@@ -490,3 +496,26 @@ def test_tensor_parallel_fp8_ulysses_qk_first_matches_and_is_close_to_one_gpu(
     if "config" not in extra:
         error = _relative_error(actual, one_gpu_output("wan", latent_shape))
         assert error <= FP8_TOLERANCE, f"relative error {error:.3e}"
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
+def test_tensor_parallel_fp8_relay_chain_matches_unchained(tmp_path, one_gpu_output, latent_shape):
+    """XDIT_TP_RELAY_CHAIN=1: each attention's output projection pipelined through the residual update and the next
+    norm into the next projection (tp_fp8_rs_norm_ag over the relay); the same output as the blocks unchained."""
+    if not torch.cuda.is_available() or torch.version.hip is None or not _torch_has_sdma_patch():
+        pytest.skip("needs ROCm and a torch patched with patches/pytorch")
+    pytest.importorskip("flydsl")
+    extra = dict(fused="symm_mem", torch_sdma=True, fp8=True, relay=True, row_align=256)
+    for sub in ("unchained", "chained"):
+        (tmp_path / sub).mkdir()
+    expected = _run(tmp_path / "unchained", "tp2-ulysses2", "wan", latent_shape, **extra)
+    actual = _run(tmp_path / "chained", "tp2-ulysses2", "wan", latent_shape, chain=True, **extra)
+
+    # The fused reduce + norm + quantize kernel rounds the gated residual update with one FMA, which flips a few
+    # FP8 codes (0.01-0.03%, measured kernel vs eager math); on this 2-layer model ~4.4e-3, FP8-noise sized.
+    error = _relative_error(actual, expected)
+    print(f"chained vs unchained relative error {error:.3e}")
+    assert error <= 1e-2, f"relative error {error:.3e}"
+    error = _relative_error(actual, one_gpu_output("wan", latent_shape))
+    assert error <= FP8_TOLERANCE, f"relative error vs one GPU {error:.3e}"

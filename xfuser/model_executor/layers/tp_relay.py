@@ -26,6 +26,7 @@ reduces a chunk in fp32 once all pieces from all senders are in. Rows per rank m
 remainder (chunk_rows), so a tile count with no divisor (Wan: 37) still pipelines.
 """
 
+import dataclasses
 import functools
 from typing import Dict, Optional
 
@@ -43,7 +44,7 @@ _VALUES = 1 << 22  # call numbers available as flag values before the counters w
 _relays: Dict[str, "TPRelay"] = {}
 _side: Dict[int, torch.cuda.Stream] = {}  # helper forwards
 _post: Dict[int, torch.cuda.Stream] = {}  # GEMM + reduce-scatter: this rank's chunks, once their tiles are counted
-calls = {"all_gather_gemm": 0, "gemm_reduce_scatter": 0}
+calls = {"all_gather_gemm": 0, "gemm_reduce_scatter": 0, "rs_then_ag": 0}
 
 
 def enabled() -> bool:
@@ -137,6 +138,102 @@ def _fp8_kernels():
         tl.store(OUT + offs, acc.to(tl.bfloat16), mask=m)
 
     return quant_chunk, reduce_chunk_fp8
+
+
+@dataclasses.dataclass
+class RowEpilogue:
+    """The row-wise work between a reduce-scatter and the next all-gather in a Wan TP block, for one fused kernel
+    (reduce -> + bias -> residual update -> LayerNorm -> modulation -> FP8 row quantization): y = reduced + bias;
+    h = residual + y (fp32 times gate, or in bf16); out = LayerNorm(h) [* (1 + scale) + shift] (fp32). Tensors are
+    [N] (fp32 except the bf16 bias) or None; `residual` is this rank's [rows, N] bf16 and `new_residual` receives h."""
+
+    residual: torch.Tensor
+    new_residual: torch.Tensor
+    bias: Optional[torch.Tensor]
+    gate: Optional[torch.Tensor]
+    norm_w: Optional[torch.Tensor]
+    norm_b: Optional[torch.Tensor]
+    eps: float
+    mod_scale: Optional[torch.Tensor]
+    mod_shift: Optional[torch.Tensor]
+
+
+@functools.lru_cache(maxsize=None)
+def _reduce_norm_quant_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def reduce_norm_quant(
+        RECV,
+        RSC,
+        OWN,
+        BIAS,
+        RES,
+        GATE,
+        NW,
+        NB_,
+        MS,
+        MT,
+        H,
+        Q,
+        S,
+        sender_stride,
+        sc_stride,
+        me,
+        r0,
+        N,
+        NBLK,
+        eps,
+        W: tl.constexpr,
+        FP8: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        HAS_GATE: tl.constexpr,
+        HAS_NW: tl.constexpr,
+        HAS_MOD: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """One row of a reduced piece: the senders' parts (fp8 x block scale, or bf16; own part bf16) summed in fp32
+        in rank order and rounded to bf16 as the reduce does, then the residual update, LayerNorm, modulation and
+        row-wise FP8 quantization with the roundings of the unfused block. Writes H (new residual), Q, S."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        m = cols < N
+        off = row.to(tl.int64) * N + cols
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for r in tl.static_range(W):
+            if r == me:
+                v = tl.load(OWN + off, mask=m, other=0.0).to(tl.float32)
+            elif FP8:
+                q = tl.load(RECV + r * sender_stride + off, mask=m, other=0.0).to(tl.float32)
+                v = q * tl.load(RSC + r * sc_stride + row.to(tl.int64) * NBLK + cols // 256, mask=m, other=0.0)
+            else:
+                v = tl.load(RECV + r * sender_stride + off, mask=m, other=0.0).to(tl.float32)
+            acc += v
+        y = acc.to(tl.bfloat16)
+        if HAS_BIAS:
+            y = (y.to(tl.float32) + tl.load(BIAS + cols, mask=m, other=0.0).to(tl.float32)).to(tl.bfloat16)
+        grow = (r0 + row).to(tl.int64) * N + cols
+        res = tl.load(RES + grow, mask=m, other=0.0)
+        if HAS_GATE:
+            h = (res.to(tl.float32) + y.to(tl.float32) * tl.load(GATE + cols, mask=m, other=0.0)).to(tl.bfloat16)
+        else:
+            h = (res.to(tl.float32) + y.to(tl.float32)).to(tl.bfloat16)
+        tl.store(H + grow, h, mask=m)
+        hf = tl.where(m, h.to(tl.float32), 0.0)
+        mean = tl.sum(hf, axis=0) / N
+        d = tl.where(m, hf - mean, 0.0)
+        n = d * tl.rsqrt(tl.sum(d * d, axis=0) / N + eps)
+        if HAS_NW:
+            n = n * tl.load(NW + cols, mask=m, other=0.0) + tl.load(NB_ + cols, mask=m, other=0.0)
+        if HAS_MOD:
+            n = n * (1 + tl.load(MS + cols, mask=m, other=0.0)) + tl.load(MT + cols, mask=m, other=0.0)
+        o = tl.where(m, n.to(tl.bfloat16).to(tl.float32), 0.0)
+        scale = tl.maximum(tl.max(tl.abs(o), axis=0), 1e-12) / 448.0
+        tl.store(Q + grow, (o / scale).to(tl.float8e4nv), mask=m)
+        tl.store(S + r0 + row, scale)
+
+    return reduce_norm_quant
 
 
 def chunk_rows(rows: int, C: int):
@@ -687,6 +784,46 @@ class TPRelay:
             )
         return out[r0 : r0 + nr]
 
+    def _rs_reduce_norm_quant_chunk(self, st, c: int, ep: RowEpilogue, nq, ns) -> None:
+        """_rs_reduce_chunk fused with a RowEpilogue and the next all-gather's FP8 row quantization (one kernel)."""
+        import triton
+
+        e, N, NB, rows, Wt = st["e"], st["N"], st["NB"], st["rows"], self.Wt
+        r0, nr = st["bounds"][c]
+        own = st["partials"].view(Wt, rows * N)[self.me]
+        _wait_kernel()[(1,)](st["flags"], e["data_idx"][c], e["data_idx"][c].numel(), st["n"])
+        dummy = ns  # any pointer, for the inputs a constexpr switches off
+        _reduce_norm_quant_kernel()[(nr,)](
+            st["recv_flat"][0, r0 * N :],
+            st["rscale"][0, r0 * NB :] if st["fp8"] else dummy,
+            own[r0 * N :],
+            ep.bias if ep.bias is not None else dummy,
+            ep.residual,
+            ep.gate if ep.gate is not None else dummy,
+            ep.norm_w if ep.norm_w is not None else dummy,
+            ep.norm_b if ep.norm_b is not None else dummy,
+            ep.mod_scale if ep.mod_scale is not None else dummy,
+            ep.mod_shift if ep.mod_shift is not None else dummy,
+            ep.new_residual,
+            nq,
+            ns,
+            rows * N,
+            rows * NB,
+            self.me,
+            r0,
+            N,
+            NB,
+            ep.eps,
+            W=Wt,
+            FP8=st["fp8"],
+            HAS_BIAS=ep.bias is not None,
+            HAS_GATE=ep.gate is not None,
+            HAS_NW=ep.norm_w is not None,
+            HAS_MOD=ep.mod_scale is not None,
+            BLOCK=triton.next_power_of_2(N),
+            num_warps=16,
+        )
+
     def _rs_end(self, st, cur) -> None:
         cur.wait_stream(st["post"])
         cur.wait_stream(st["side"])
@@ -727,9 +864,12 @@ class TPRelay:
         ns = torch.empty(rows, dtype=torch.float32, device=xq.device)
         for c in range(chunks):
             r0, nr = rs["bounds"][c]
-            q, sc = _rowwise_fp8(then(r0, self._rs_reduce_chunk(rs, c)))  # as the FP8 TP sites quantize
-            nq[r0 : r0 + nr] = q
-            ns[r0 : r0 + nr] = sc.view(-1)
+            if isinstance(then, RowEpilogue):  # one kernel: reduce + bias + residual + norm + modulation + quantize
+                self._rs_reduce_norm_quant_chunk(rs, c, then, nq, ns)
+            else:
+                q, sc = _rowwise_fp8(then(r0, self._rs_reduce_chunk(rs, c)))  # as the FP8 TP sites quantize
+                nq[r0 : r0 + nr] = q
+                ns[r0 : r0 + nr] = sc.view(-1)
             self._ag_send_chunk(ag, c, nq, cur)
             self._ag_forward_chunk(ag, c)
         self._ag_send_scales(ag, ns, cur)
@@ -740,6 +880,7 @@ class TPRelay:
         nq.record_stream(ag["side"])
         calls["gemm_reduce_scatter"] += 1
         calls["all_gather_gemm"] += 1
+        calls["rs_then_ag"] += 1
         return rs["out"], out2
 
 

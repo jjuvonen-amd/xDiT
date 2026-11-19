@@ -37,7 +37,7 @@ With `fused="symm_mem"`, a linear given a row-wise FP8 weight by `quantize_linea
 gathered rows move as FP8 (half the bytes), and the GEMMs are scaled FP8.
 """
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -301,6 +301,113 @@ def tp_fp8_column_parallel_split(x: torch.Tensor, linear: nn.Linear, split: int,
         return shape(y, None if bias is None else bias[split:])
 
     return shape(out, None if bias is None else bias[:split]), rest
+
+
+def _rs_norm_epilogue(rs_bias, gate, norm_w, norm_b, eps, mod_scale, mod_shift):
+    """The row-wise work between a row-parallel output and the next column-parallel input in a Wan TP block, as
+    the block computes it: y = reduced rows + bias; h = residual + y (in fp32 times `gate` if given, else in the
+    residual's dtype); out = LayerNorm(h) (fp32, affine if `norm_w`) [* (1 + mod_scale) + mod_shift]. Returns
+    f(residual rows, reduced rows) -> (h, out), both in the residual's dtype."""
+
+    def f(res, y):
+        if rs_bias is not None:
+            y = y + rs_bias
+        h = (res.float() + y * gate).to(res.dtype) if gate is not None else res + y
+        n = F.layer_norm(h.float(), (h.shape[-1],), norm_w, norm_b, eps)
+        if mod_scale is not None:
+            n = n * (1 + mod_scale) + mod_shift
+        return h, n.to(res.dtype)
+
+    return f
+
+
+@torch.library.custom_op("xfuser::tp_fp8_rs_norm_ag", mutates_args=())
+def _tp_fp8_rs_norm_ag(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w_t: torch.Tensor,
+    w_s: torch.Tensor,
+    rs_bias: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    gate: Optional[torch.Tensor],
+    norm_w: Optional[torch.Tensor],
+    norm_b: Optional[torch.Tensor],
+    eps: float,
+    mod_scale: Optional[torch.Tensor],
+    mod_shift: Optional[torch.Tensor],
+    w2_t: torch.Tensor,
+    w2_s: torch.Tensor,
+    group_name: str,
+) -> List[torch.Tensor]:
+    """Row-parallel FP8 GEMM + reduce-scatter (xq [S, K], this rank's K shard) -> `_rs_norm_epilogue` on this rank's
+    rows (residual [rows, d]) -> column-parallel FP8 all-gather + GEMM (w2_t [d, N2]): [new residual [rows, d], next
+    GEMM output [W * rows, N2] bf16, no bias]. With the TP relay, pipelined piece by piece
+    (TPRelay.gemm_rs_then_ag_fp8): each reduced piece goes on to the next all-gather while later pieces land;
+    otherwise the two ops one after the other."""
+    f = _rs_norm_epilogue(rs_bias, gate, norm_w, norm_b, eps, mod_scale, mod_shift)
+    rows = residual.shape[0]
+    relay = _relay(group_name)
+    if relay is not None:
+        chunks = min(relay.chunks(rows) or 0, (relay.T._TRIGGERS - 1) // (2 * (1 + relay.Wt)))
+        if chunks and xq.shape[1] % 128 == 0 and xq.shape[1] >= 256 and w2_t.shape[0] >= 256:
+            from xfuser.model_executor.layers.tp_relay import RowEpilogue
+
+            new_res = torch.empty_like(residual)
+            ep = RowEpilogue(residual.contiguous(), new_res, rs_bias, gate, norm_w, norm_b, eps, mod_scale, mod_shift)
+            _, out2 = relay.gemm_rs_then_ag_fp8(xq, xs, w_t, w_s, ep, w2_t, w2_s, chunks)
+            return [new_res, out2]
+    y = torch.ops.xfuser.tp_fp8_gemm_reduce_scatter(xq, xs, w_t, w_s, group_name)
+    h, out = f(residual, y)
+    q, sc = _rowwise_fp8(out)
+    return [h, torch.ops.xfuser.tp_fp8_all_gather_gemm(q, sc, w2_t, w2_s, group_name)]
+
+
+@_tp_fp8_rs_norm_ag.register_fake
+def _(xq, xs, w_t, w_s, rs_bias, residual, gate, norm_w, norm_b, eps, mod_scale, mod_shift, w2_t, w2_s, group_name):
+    n = _group_size(group_name) * residual.shape[0]
+    return [torch.empty_like(residual), residual.new_empty(n, w2_t.shape[1], dtype=torch.bfloat16)]
+
+
+def tp_fp8_rs_norm_ag(
+    x: torch.Tensor,
+    out_linear: nn.Linear,
+    out_bias: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    gate: Optional[torch.Tensor],
+    norm: nn.Module,
+    mod: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    next_linear: nn.Linear,
+    site: str,
+):
+    """A Wan TP block's row-parallel output projection (x [1, S, K]) pipelined through the residual update and the
+    next norm (+ modulation) into the next column-parallel projection: (new residual [1, rows, d], the next
+    projection's output [1, S, N2] with its bias). Batch 1, FP8 TP weights on both linears."""
+    xq, xs = _rowwise_fp8(_seq_rows(x))
+    w = getattr(norm, "weight", None)
+    b = getattr(norm, "bias", None)
+    flat = lambda t: None if t is None else t.reshape(-1).float()  # noqa: E731
+    with record_function(f"tp_rs_norm_ag_fp8:{site}"):
+        h, out = torch.ops.xfuser.tp_fp8_rs_norm_ag(
+            xq,
+            xs,
+            out_linear.tp_fp8_weight,
+            out_linear.tp_fp8_scale,
+            out_bias,
+            residual.reshape(-1, residual.shape[-1]),
+            flat(gate),
+            flat(w),
+            flat(b),
+            float(norm.eps),
+            flat(mod[0]) if mod is not None else None,
+            flat(mod[1]) if mod is not None else None,
+            next_linear.tp_fp8_weight,
+            next_linear.tp_fp8_scale,
+            get_tp_group().device_group.group_name,
+        )
+    out = out.view(1, -1, out.shape[-1]).to(residual.dtype)
+    if next_linear.bias is not None:
+        out = out + next_linear.bias
+    return h.view_as(residual), out
 
 
 def _fp8_column_parallel(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
