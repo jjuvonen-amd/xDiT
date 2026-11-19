@@ -61,6 +61,18 @@ def _worker(rank, world_size, init_method):
                 assert tp_relay.calls["gemm_reduce_scatter"] == before + 1, "the relayed RS path did not run"
             error = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
             assert error < 1e-2, f"RS rows {rows} k {k} n {n}: relative error {error:.3e} vs the direct FP8 path"
+            # the same with the peers' partial sums sent as FP8 (XDIT_TP_RELAY_RS_FP8): e4m3 rounding of 3 of 4 parts
+            relays = [r for r in tp_relay._relays.values() if r]
+            for r in relays:
+                r.rs_fp8 = True
+            with torch.inference_mode():
+                out8 = tp_row_parallel(xr, row_linear, None, "test", 1, "symm_mem")
+            for r in relays:
+                r.rs_fp8 = False
+            error8 = ((out8.float() - ref.float()).norm() / ref.float().norm()).item()
+            if rank == 0:
+                print(f"RS rows {rows} n {n}: bf16 partials {error:.2e}, fp8 partials {error8:.2e}", flush=True)
+            assert error8 < 4e-2, f"RS rows {rows} k {k} n {n}: FP8 partials relative error {error8:.3e}"
         dist.barrier()
     finally:
         destroy_model_parallel()

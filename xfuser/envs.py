@@ -109,6 +109,13 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # 1 / 0.6 (11.29 -> 11.21 s/iter); 4 pieces lose (11.64: per-piece sends and waits on a bandwidth-bound RS).
     "XDIT_TP_RELAY_RS_DIRECT": lambda: os.environ.get("XDIT_TP_RELAY_RS_DIRECT", "0.7"),
     "XDIT_TP_RELAY_CHUNKS": lambda: os.environ.get("XDIT_TP_RELAY_CHUNKS", "2"),
+    # 1: the relayed GEMM + reduce-scatter sends the peers' partial sums as FP8 e4m3 (one scale per row and 256
+    # columns, quantized beside the GEMM; this rank's own part stays bf16, the sum is fp32): half the RS bytes.
+    # Wan TP4 x U2 720p, 8x MI355X: 11.23 -> 10.85 s/iter; 1-step output as close to the bf16-TP reference as with
+    # bf16 partials (PSNR 29.46 vs 29.40 dB). Off by default (output changes).
+    "XDIT_TP_RELAY_RS_FP8": lambda: os.environ.get("XDIT_TP_RELAY_RS_FP8", "0"),
+    # With FP8 partials: eighths of the CUs the persistent GEMM leaves to the quantization running beside it.
+    "XDIT_TP_RELAY_RS_FREE_CU_EIGHTHS": lambda: os.environ.get("XDIT_TP_RELAY_RS_FREE_CU_EIGHTHS", "3"),
     # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
     # thread logs what was missing and aborts the process (no wrong output is used); raise: the
     # stream moves on (that call's output is wrong) and the next SDMA call raises.

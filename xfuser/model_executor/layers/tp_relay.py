@@ -90,6 +90,55 @@ def _reduce_kernel():
     return reduce_chunk
 
 
+@functools.lru_cache(maxsize=None)
+def _fp8_kernels():
+    """Row x 256-column block FP8 (e4m3) quantization of this rank's partial sums for its peers, and the reduce
+    that dequantizes the peers' parts (this rank's own part stays bf16)."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def quant_chunk(P, Q, SC, rows, r0, nr, n_rows, me, N, NB, ROWS: tl.constexpr, BLOCK: tl.constexpr):
+        """Rows r0 .. r0 + nr of every peer's block of the [W * rows, N] partials -> Q (fp8) and SC (fp32, one scale
+        per row and BLOCK columns). ROWS rows per program, looping over the column blocks: few, fat programs, since
+        this runs beside the persistent GEMM on the compute units it leaves free."""
+        i = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+        ok = i < n_rows
+        di = i // nr
+        dest = di + (di >= me).to(tl.int32)
+        grow = (dest * rows + r0 + i % nr).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        for b in range(0, NB):
+            x = tl.load(P + grow[:, None] * N + b * BLOCK + cols[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+            scale = tl.maximum(tl.max(tl.abs(x), axis=1) / 448.0, 1e-30)
+            tl.store(
+                Q + grow[:, None] * N + b * BLOCK + cols[None, :],
+                (x / scale[:, None]).to(tl.float8e4nv),
+                mask=ok[:, None],
+            )
+            tl.store(SC + grow * NB + b, scale, mask=ok)
+
+    @triton.jit
+    def reduce_chunk_fp8(
+        RECV, RSC, OWN, OUT, sender_stride, sc_stride, me, n, N, NB, W: tl.constexpr, BLOCK: tl.constexpr
+    ):
+        """OUT[i] = bf16(sum over r < W in rank order): rank r's fp8 part times its block scale, or OWN for r == me."""
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        sc_off = (offs // N) * NB + (offs % N) // 256
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for r in tl.static_range(W):
+            if r == me:
+                v = tl.load(OWN + offs, mask=m, other=0.0).to(tl.float32)
+            else:
+                q = tl.load(RECV + r * sender_stride + offs, mask=m, other=0.0).to(tl.float32)
+                v = q * tl.load(RSC + r * sc_stride + sc_off, mask=m, other=0.0)
+            acc += v
+        tl.store(OUT + offs, acc.to(tl.bfloat16), mask=m)
+
+    return quant_chunk, reduce_chunk_fp8
+
+
 def chunk_rows(rows: int, C: int):
     """[(first row, rows)] of C chunks of whole BLOCK_M-row tiles: C - 1 equal ones, the last also takes the remainder
     (as the persistent kernel splits a rank's row blocks)."""
@@ -134,6 +183,7 @@ class TPRelay:
         rs_direct = envs.environment_variables["XDIT_TP_RELAY_RS_DIRECT"]().strip()
         self.direct_frac_rs = float(rs_direct) if rs_direct else self.direct_frac
         self.want_chunks = int(envs.environment_variables["XDIT_TP_RELAY_CHUNKS"]())
+        self.rs_fp8 = envs.environment_variables["XDIT_TP_RELAY_RS_FP8"]().strip() == "1"
         self.n = {"ag": 0, "rs": 0}  # calls per op kind (flag values)
         self._plans: Dict[tuple, dict] = {}
         dev = torch.device("cuda", torch.cuda.current_device())
@@ -355,18 +405,24 @@ class TPRelay:
         return out
 
     # -- GEMM + reduce-scatter ------------------------------------------------------------------------------
-    def _rs(self, rows: int, N: int, C: int) -> dict:
-        key = ("rs", rows, N, C)
+    def _rs(self, rows: int, N: int, C: int, fp8: bool) -> dict:
+        """Plans of GEMM + reduce-scatter: partial sums as bf16, or (fp8) as e4m3 codes with one fp32 scale per row
+        and 256 columns (the scales go with the direct piece). The send buffer holds [W * rows, N] codes, then
+        [W * rows, N / 256] scales."""
+        key = ("rs", rows, N, C, fp8)
         w, Wt, H, P = self.w, self.Wt, self.H, self.P
+        esz, NB = (1, N // 256) if fp8 else (2, 0)
         bounds = chunk_rows(rows, C)
-        pieces = [_pieces(n * N * 2, H, self.direct_frac_rs) for _, n in bounds]  # chunk c of bf16 partial sums
+        pieces = [_pieces(n * N * esz, H, self.direct_frac_rs) for _, n in bounds]  # chunk c of partial sums
         slot = max(s for pc in pieces for _, s in pc[1:])
-        rh, sth = Wt * rows * N * 2, Wt * Wt * C * slot
+        rh, sth, rsh = Wt * rows * N * esz, Wt * Wt * C * slot, Wt * rows * NB * 4
         bufs = {
             "recv": w.buffer("tp_relay_rs_recv", 2 * rh),  # [parity][sender][rows] at each destination
             "stage": w.buffer("tp_relay_rs_stage", 2 * sth),
             "flags": w.buffer("tp_relay_rs_flags", self._flags_layout(C)[-1] * 4),
         }
+        if fp8:
+            bufs["rscale"] = w.buffer("tp_relay_rs_rscale", 2 * rsh)  # [parity][sender][rows][N / 256]
         cached = self._plans.get(key)
         if cached is not None and all(cached["bufs"][k] is b and b.live for k, b in bufs.items()):
             return cached
@@ -378,13 +434,19 @@ class TPRelay:
             return self.base(f, rank) + word * 4
 
         def src(dest, c):  # this rank's partials for dest's chunk c: rows dest * rows + its first row, of [S, N]
-            return (dest * rows + bounds[c][0]) * N * 2
+            return (dest * rows + bounds[c][0]) * N * esz
+
+        def src_scale(dest, c):  # its scales, after the S x N codes in the send buffer
+            return Wt * rows * N + (dest * rows + bounds[c][0]) * NB * 4
 
         par_plans = []
         for par in range(2):
 
             def recv_at(rank, sender, c, off, par=par):
-                return self.base(bufs["recv"], rank) + par * rh + (sender * rows + bounds[c][0]) * N * 2 + off
+                return self.base(bufs["recv"], rank) + par * rh + (sender * rows + bounds[c][0]) * N * esz + off
+
+            def rscale_at(rank, sender, c, par=par):
+                return self.base(bufs["rscale"], rank) + par * rsh + (sender * rows + bounds[c][0]) * NB * 4
 
             def stage_at(helper_rank, sender, dest, c, par=par):
                 return self.base(bufs["stage"], helper_rank) + par * sth + ((sender * Wt + dest) * C + c) * slot
@@ -396,7 +458,10 @@ class TPRelay:
                     if q in ranks:
                         d = ranks.index(q)
                         off, size = pieces[c][0]
-                        copies.append([(src(d, c) + off, recv_at(q, me, c, off), size)])
+                        direct = [(src(d, c) + off, recv_at(q, me, c, off), size)]
+                        if fp8:  # the chunk's scales, on the same engine before the flag
+                            direct.append((src_scale(d, c), rscale_at(q, me, c), bounds[c][1] * NB * 4))
+                        copies.append(direct)
                         flags.append(flag(q, data + (c * Wt + me) * P))
                     else:
                         off, size = pieces[c][1 + helpers.index(q)]
@@ -428,7 +493,9 @@ class TPRelay:
         entry = {
             "par": par_plans,
             "bufs": bufs,
-            "halves": (rh, sth),
+            "halves": (rh, sth, rsh),
+            "fp8": fp8,
+            "NB": NB,
             "tiles": [n // BLOCK_M * ((N + 255) // 256) for _, n in bounds],  # GEMM tiles per (chunk c, dest)
             "bounds": bounds,
             "cnt_idx": [torch.tensor([c * Wt + p for p in peers_of], dtype=torch.int32, device=dev) for c in range(C)],
@@ -458,23 +525,32 @@ class TPRelay:
         N = w_t.shape[1]
         C, Wt = chunks, self.Wt
         rows = S // Wt
-        e = self._rs(rows, N, C)
-        bounds = e["bounds"]
+        fp8 = self.rs_fp8 and N % 256 == 0
+        e = self._rs(rows, N, C, fp8)
+        bounds, NB = e["bounds"], e["NB"]
         n = self._next("rs")
         par = n % 2
         pp = e["par"][par]
-        rh, sth = e["halves"]
+        rh, sth, rsh = e["halves"]
         nwords = self._flags_layout(C)[-1]
         dev = xq.device
         cur = torch.cuda.current_stream()
         side = _side.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
         flags = e["bufs"]["flags"].local.view(torch.int32)[:nwords]
-        recv_flat = e["bufs"]["recv"].local[par * rh : (par + 1) * rh].view(torch.bfloat16).view(Wt, rows * N)
+        recv_flat = e["bufs"]["recv"].local[par * rh : (par + 1) * rh]
+        recv_flat = recv_flat.view(torch.float8_e4m3fn if fp8 else torch.bfloat16).view(Wt, rows * N)
         stage_all = e["bufs"]["stage"].local  # forward plans hold offsets from the buffer start (parity included)
         flag_src = self.values[n : n + 1].data_ptr()
         cnt = e["cnt"]
         partials = torch.empty(S, N, dtype=torch.bfloat16, device=dev)
         out = torch.empty(rows, N, dtype=torch.bfloat16, device=dev)
+        send = partials
+        if fp8:  # the peers' partial sums go out as e4m3 codes + scales, quantized per chunk on the poster stream
+            quant, reduce_fp8 = _fp8_kernels()
+            send = torch.empty(S * N + S * NB * 4, dtype=torch.uint8, device=dev)
+            q8 = send[: S * N].view(torch.float8_e4m3fn)
+            sc = send[S * N :].view(torch.float32)
+            rscale = e["bufs"]["rscale"].local[par * rsh : (par + 1) * rsh].view(torch.float32).view(Wt, rows * NB)
         cnt.zero_()
         call = self.w.begin()
         post = _post.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
@@ -487,13 +563,21 @@ class TPRelay:
         for c in range(C):
             with torch.cuda.stream(post):
                 wait[(1,)](cnt, e["cnt_idx"][c], e["cnt_idx"][c].numel(), e["tiles"][c])
-                call.send(pp["chunks"][c], partials, post, flag_src)
+                if fp8:
+                    r0, nr = bounds[c]
+                    n_rows = (Wt - 1) * nr
+                    quant[((n_rows + 7) // 8,)](
+                        partials, q8, sc, rows, r0, nr, n_rows, self.me, N, NB, ROWS=8, BLOCK=256, num_warps=8
+                    )
+                call.send(pp["chunks"][c], send, post, flag_src)
             with torch.cuda.stream(side):
                 for i in range(Wt):
                     wait[(1,)](flags, e["stage_idx"][c * Wt + i], 1, n)
                     call.send(pp["fwd"][c][i], stage_all, side, flag_src)
         exe = compile_persistent_ag_gemm_fp8(K=K, BLOCK_M=BLOCK_M, BLOCK_N=256, mode="rs")
-        progs = torch.cuda.get_device_properties(dev).multi_processor_count * 7 // 8
+        # CUs left free: the poster's / forwarders' spin kernels and, with FP8 partials, the quantization
+        free = int(envs.environment_variables["XDIT_TP_RELAY_RS_FREE_CU_EIGHTHS"]()) if fp8 else 1
+        progs = torch.cuda.get_device_properties(dev).multi_processor_count * (8 - free) // 8
         _run_compiled(
             exe,
             xq.contiguous().view(torch.int8).view(-1)[: rows * K],
@@ -522,13 +606,30 @@ class TPRelay:
         for c, (r0, nr) in enumerate(bounds):
             nel = nr * N
             wait[(1,)](flags, e["data_idx"][c], e["data_idx"][c].numel(), n)
-            reduce[((nel + RB - 1) // RB,)](
-                recv_flat[0, r0 * N :], own[r0 * N :], out[r0:], rows * N, self.me, nel, W=Wt, BLOCK=RB
-            )
+            if fp8:
+                reduce_fp8[((nel + RB - 1) // RB,)](
+                    recv_flat[0, r0 * N :],
+                    rscale[0, r0 * NB :],
+                    own[r0 * N :],
+                    out[r0:],
+                    rows * N,
+                    rows * NB,
+                    self.me,
+                    nel,
+                    N,
+                    NB,
+                    W=Wt,
+                    BLOCK=RB,
+                )
+            else:
+                reduce[((nel + RB - 1) // RB,)](
+                    recv_flat[0, r0 * N :], own[r0 * N :], out[r0:], rows * N, self.me, nel, W=Wt, BLOCK=RB
+                )
         cur.wait_stream(post)
         cur.wait_stream(side)
         call.end()
         partials.record_stream(post)
+        send.record_stream(post)
         calls["gemm_reduce_scatter"] += 1
         return out
 
