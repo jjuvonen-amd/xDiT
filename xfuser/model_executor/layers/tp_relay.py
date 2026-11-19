@@ -325,8 +325,11 @@ class TPRelay:
                 plan.free()
 
     # -- all-gather + GEMM ------------------------------------------------------------------------------
-    def _ag(self, rows: int, K: int, C: int) -> dict:
-        key = ("ag", rows, K, C)
+    def _ag(self, rows: int, K: int, C: int, chunk_scales: bool = False) -> dict:
+        """Plans of a relayed all-gather. chunk_scales: each piece's row scales travel with its direct copy (send
+        source = [rows, K] codes then [rows] fp32 scales), so the GEMM's per-piece data wait covers them and no
+        scale plan is sent (a piece-by-piece producer has no scales until its last piece)."""
+        key = ("ag", rows, K, C, chunk_scales)
         w, Wt, H, P = self.w, self.Wt, self.H, self.P
         bounds = chunk_rows(rows, C)
         coff = [r0 * K for r0, _ in bounds]  # byte offset of chunk c in a rank's rows (fp8)
@@ -373,7 +376,12 @@ class TPRelay:
                 for q in peers:
                     if q in ranks:
                         off, size = pieces[c][0]
-                        copies.append([(coff[c] + off, x_at(q, me, c, off), size)])
+                        direct = [(coff[c] + off, x_at(q, me, c, off), size)]
+                        if chunk_scales:  # this piece's row scales, on the same engine before the flag
+                            r0, nr = bounds[c]
+                            s_dst = self.base(bufs["s"], q) + par * sh + (me * rows + r0) * 4
+                            direct.append((rows * K + r0 * 4, s_dst, nr * 4))
+                        copies.append(direct)
                         flags.append(flag(q, data + (c * Wt + me) * P))
                     else:
                         off, size = pieces[c][1 + helpers.index(q)]
@@ -411,6 +419,7 @@ class TPRelay:
             "stage_idx": [
                 torch.tensor([stage + c * Wt + i], dtype=torch.int32, device=dev) for c in range(C) for i in range(Wt)
             ],
+            "chunk_scales": chunk_scales,
             "own_words": torch.tensor(
                 [data + (c * Wt + me) * P + k for c in range(C) for k in range(P)] + [scale + me],
                 dtype=torch.long,
@@ -420,11 +429,11 @@ class TPRelay:
         self._plans[key] = entry
         return entry
 
-    def _ag_begin(self, rows: int, K: int, C: int, call, cur) -> dict:
+    def _ag_begin(self, rows: int, K: int, C: int, call, cur, chunk_scales: bool = False) -> dict:
         """Open a relayed all-gather of `rows` x K fp8 rows in C pieces on `call`: buffers, this rank's flag words,
         the helper-side forwarders (side stream). The pieces go out with _ag_send_chunk / _ag_send_scales."""
         Wt = self.Wt
-        e = self._ag(rows, K, C)
+        e = self._ag(rows, K, C, chunk_scales)
         n = self._next("ag")
         par = n % 2
         xh, sh, _ = e["halves"]
@@ -469,7 +478,11 @@ class TPRelay:
         r0, nr = chunk_rows(st["rows"], st["C"])[c]
         K = st["K"]
         st["x_in"][self.me][r0 * K : (r0 + nr) * K].copy_(xq_rows[r0 : r0 + nr].view(torch.uint8).view(-1))
-        st["call"].send(st["pp"]["chunks"][c], xq_rows, cur, st["flag_src"])
+        src = xq_rows
+        if st["e"]["chunk_scales"]:  # xq_rows is the codes view of a [codes | scales] send buffer
+            src, rows = st["send_buf"], st["rows"]
+            st["s_in"][self.me][r0 : r0 + nr].copy_(src[rows * K :].view(torch.float32)[r0 : r0 + nr])
+        st["call"].send(st["pp"]["chunks"][c], src, cur, st["flag_src"])
 
     def _ag_send_scales(self, st, xs_rows, cur) -> None:
         """This rank's row scales ([rows] fp32, ready on `cur`), to every TP peer."""
@@ -487,7 +500,8 @@ class TPRelay:
         N = w_t.shape[1]
         data = self._flags_layout(C)[0]
         out = torch.empty(Wt * rows, N, dtype=torch.bfloat16, device=cur.device)
-        _wait_kernel()[(1,)](st["flags"], e["scale_idx"], e["scale_idx"].numel(), st["n"])
+        if not e["chunk_scales"]:  # else each piece's scales came with its data (waited for in-kernel)
+            _wait_kernel()[(1,)](st["flags"], e["scale_idx"], e["scale_idx"].numel(), st["n"])
         exe = compile_persistent_ag_gemm_fp8(K=K, BLOCK_M=BLOCK_M, BLOCK_N=256)
         # leave CUs for the forwarders on the side stream: other ranks wait for what they forward
         progs = torch.cuda.get_device_properties(cur.device).multi_processor_count * 7 // 8
@@ -851,17 +865,18 @@ class TPRelay:
         output [Wt * rows, N2]). One transport call carries both ops' sends."""
         from xfuser.model_executor.layers.tensor_parallel import _rowwise_fp8
 
-        # both ops' sends in one call: RS C * (1 + Wt), AG C * (1 + Wt) + the scales
-        if 2 * chunks * (1 + self.Wt) + 1 > self.T._TRIGGERS:
+        # both ops' sends in one call: RS C * (1 + Wt), AG C * (1 + Wt) (its scales travel with the pieces)
+        if 2 * chunks * (1 + self.Wt) > self.T._TRIGGERS:
             raise ValueError(f"{chunks} pieces exceed the transport's {self.T._TRIGGERS} sends per call")
         cur = torch.cuda.current_stream()
         S = xq.shape[0]
         rows, K2 = S // self.Wt, w2_t.shape[0]
         call = self.w.begin()
         rs = self._rs_begin(xq, xs, w_t, w_s, chunks, call, cur)
-        ag = self._ag_begin(rows, K2, chunks, call, cur)
-        nq = torch.empty(rows, K2, dtype=torch.float8_e4m3fn, device=xq.device)
-        ns = torch.empty(rows, dtype=torch.float32, device=xq.device)
+        ag = self._ag_begin(rows, K2, chunks, call, cur, chunk_scales=True)
+        send = ag["send_buf"] = torch.empty(rows * K2 + rows * 4, dtype=torch.uint8, device=xq.device)
+        nq = send[: rows * K2].view(torch.float8_e4m3fn).view(rows, K2)
+        ns = send[rows * K2 :].view(torch.float32)
         for c in range(chunks):
             r0, nr = rs["bounds"][c]
             if isinstance(then, RowEpilogue):  # one kernel: reduce + bias + residual + norm + modulation + quantize
@@ -872,12 +887,11 @@ class TPRelay:
                 ns[r0 : r0 + nr] = sc.view(-1)
             self._ag_send_chunk(ag, c, nq, cur)
             self._ag_forward_chunk(ag, c)
-        self._ag_send_scales(ag, ns, cur)
         out2 = self._ag_gemm(ag, w2_t, w2_s, cur)
         self._rs_end(rs, cur)
         cur.wait_stream(ag["side"])
         call.end()
-        nq.record_stream(ag["side"])
+        send.record_stream(ag["side"])
         calls["gemm_reduce_scatter"] += 1
         calls["all_gather_gemm"] += 1
         calls["rs_then_ag"] += 1

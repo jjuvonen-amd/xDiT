@@ -111,7 +111,8 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_TP_RELAY_CHUNKS": lambda: os.environ.get("XDIT_TP_RELAY_CHUNKS", "2"),
     # 1: Wan TP blocks pipeline each attention's output projection (GEMM + reduce-scatter) through the residual
     # update and next norm into the next projection (all-gather + GEMM), piece by piece (tp_fp8_rs_norm_ag).
-    # Needs XDIT_TP_FP8=1 and sharded cross-attention; pipelines with XDIT_TP_RELAY=1.
+    # Needs XDIT_TP_FP8=1 and sharded cross-attention; pipelines with XDIT_TP_RELAY=1. Wan TP4 x U2 720p compiled,
+    # 8x MI355X: 10.85 -> 10.70 s/iter (2 pieces); output within FP8 rounding of the unchained blocks.
     "XDIT_TP_RELAY_CHAIN": lambda: os.environ.get("XDIT_TP_RELAY_CHAIN", "0"),
     # 1: the relayed GEMM + reduce-scatter sends the peers' partial sums as FP8 e4m3 (one scale per row and 256
     # columns, quantized beside the GEMM; this rank's own part stays bf16, the sum is fp32): half the RS bytes.
