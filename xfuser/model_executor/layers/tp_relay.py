@@ -21,8 +21,9 @@ pieces, and the persistent kernel (layers/flydsl_tp_gemm.py, "ag") waits in-kern
 (chunk, rank) before its tiles. GEMM + reduce-scatter (FP8): the persistent kernel ("rs") writes partial
 sums in send order and counts tiles per (chunk, dest); one side stream, per chunk, posts this rank's
 pieces once counted and then forwards the other group's staged pieces of that chunk; each destination
-reduces a chunk in fp32 once all pieces from all senders are in. Rows per piece must be whole 256-row
-tiles (XDIT_TP_ROW_ALIGN=256).
+reduces a chunk in fp32 once all pieces from all senders are in. Rows per rank must be whole 256-row tiles
+(XDIT_TP_ROW_ALIGN=256); pieces are XDIT_TP_RELAY_CHUNKS - 1 equal runs of tiles and a last one with the
+remainder (chunk_rows), so a tile count with no divisor (Wan: 37) still pipelines.
 """
 
 import functools
@@ -89,6 +90,13 @@ def _reduce_kernel():
     return reduce_chunk
 
 
+def chunk_rows(rows: int, C: int):
+    """[(first row, rows)] of C chunks of whole BLOCK_M-row tiles: C - 1 equal ones, the last also takes the remainder
+    (as the persistent kernel splits a rank's row blocks)."""
+    base = rows // BLOCK_M // C * BLOCK_M
+    return [(c * base, base if c < C - 1 else rows - (C - 1) * base) for c in range(C)]
+
+
 def _pieces(nbytes: int, helpers: int, direct_frac: float):
     """[(offset, size)] of a chunk's pieces: the direct one first, then one per helper; 256-byte aligned."""
     d = int(nbytes * direct_frac) // _ALIGN * _ALIGN
@@ -123,11 +131,22 @@ class TPRelay:
         self.H = len(self.helpers)
         self.P = 1 + self.H
         self.direct_frac = float(envs.environment_variables["XDIT_TP_RELAY_DIRECT"]())
+        rs_direct = envs.environment_variables["XDIT_TP_RELAY_RS_DIRECT"]().strip()
+        self.direct_frac_rs = float(rs_direct) if rs_direct else self.direct_frac
+        self.want_chunks = int(envs.environment_variables["XDIT_TP_RELAY_CHUNKS"]())
         self.n = {"ag": 0, "rs": 0}  # calls per op kind (flag values)
         self._plans: Dict[tuple, dict] = {}
         dev = torch.device("cuda", torch.cuda.current_device())
         self.values = torch.arange(_VALUES, dtype=torch.int32, device=dev)  # flag source of call n: values[n]
         logger.info(f"TP relay for group {self.ranks} through {self.helpers}")
+
+    def chunks(self, rows: int) -> Optional[int]:
+        """Pieces for `rows` rows per rank: XDIT_TP_RELAY_CHUNKS, at most one per 256-row tile and at most what fits
+        the transport's sends per call (all-gather: 1 + C * (1 + Wt)); None unless rows are whole tiles."""
+        if rows % BLOCK_M:
+            return None
+        cap = (self.T._TRIGGERS - 1) // (1 + self.Wt)
+        return max(1, min(self.want_chunks, rows // BLOCK_M, cap))
 
     def _next(self, kind: str) -> int:
         self.n[kind] += 1
@@ -162,10 +181,10 @@ class TPRelay:
     def _ag(self, rows: int, K: int, C: int) -> dict:
         key = ("ag", rows, K, C)
         w, Wt, H, P = self.w, self.Wt, self.H, self.P
-        block = rows // C
-        cb = block * K  # bytes of a chunk (fp8)
-        pieces = _pieces(cb, H, self.direct_frac)
-        slot = max(s for _, s in pieces[1:])
+        bounds = chunk_rows(rows, C)
+        coff = [r0 * K for r0, _ in bounds]  # byte offset of chunk c in a rank's rows (fp8)
+        pieces = [_pieces(n * K, H, self.direct_frac) for _, n in bounds]
+        slot = max(s for pc in pieces for _, s in pc[1:])
         xh, sh, sth = Wt * rows * K, Wt * rows * 4, Wt * Wt * C * slot  # one parity's bytes
         bufs = {
             "x": w.buffer("tp_relay_ag_x", 2 * xh),
@@ -187,7 +206,7 @@ class TPRelay:
         for par in range(2):
 
             def x_at(rank, slot_rank, c, off, par=par):
-                return self.base(bufs["x"], rank) + par * xh + slot_rank * rows * K + c * cb + off
+                return self.base(bufs["x"], rank) + par * xh + slot_rank * rows * K + coff[c] + off
 
             def stage_at(helper_rank, sender, dest, c, par=par):
                 return self.base(bufs["stage"], helper_rank) + par * sth + ((sender * Wt + dest) * C + c) * slot
@@ -206,18 +225,18 @@ class TPRelay:
                 copies, flags = [], []
                 for q in peers:
                     if q in ranks:
-                        off, size = pieces[0]
-                        copies.append([(c * cb + off, x_at(q, me, c, off), size)])
+                        off, size = pieces[c][0]
+                        copies.append([(coff[c] + off, x_at(q, me, c, off), size)])
                         flags.append(flag(q, data + (c * Wt + me) * P))
                     else:
-                        off, size = pieces[1 + helpers.index(q)]
-                        copies.append([(c * cb + off, stage_at(q, me, d, c), size) for d in range(Wt) if d != me])
+                        off, size = pieces[c][1 + helpers.index(q)]
+                        copies.append([(coff[c] + off, stage_at(q, me, d, c), size) for d in range(Wt) if d != me])
                         flags.append(flag(q, stage + c * Wt + me))
                 chunk_plans.append(self._plan(copies, flags))
             # as helper `me` of the other group: forward client sender i's pieces of chunk c to each client dest
-            off, size = pieces[1 + me]
             fwd = []
             for c in range(C):
+                off, size = pieces[c][1 + me]
                 row = []
                 for i in range(Wt):
                     copies, flags = [], []
@@ -317,7 +336,8 @@ class TPRelay:
             self.me,
             Wt,
             rows,
-            rows // C,
+            chunk_rows(rows, C)[0][1],
+            C,
             rows,
             rows,
             data,
@@ -338,13 +358,12 @@ class TPRelay:
     def _rs(self, rows: int, N: int, C: int) -> dict:
         key = ("rs", rows, N, C)
         w, Wt, H, P = self.w, self.Wt, self.H, self.P
-        block = rows // C
-        cb = block * N * 2  # bytes of a chunk of bf16 partial sums
-        pieces = _pieces(cb, H, self.direct_frac)
-        slot = max(s for _, s in pieces[1:])
-        rh, sth = Wt * C * cb, Wt * Wt * C * slot
+        bounds = chunk_rows(rows, C)
+        pieces = [_pieces(n * N * 2, H, self.direct_frac_rs) for _, n in bounds]  # chunk c of bf16 partial sums
+        slot = max(s for pc in pieces for _, s in pc[1:])
+        rh, sth = Wt * rows * N * 2, Wt * Wt * C * slot
         bufs = {
-            "recv": w.buffer("tp_relay_rs_recv", 2 * rh),  # [parity][sender][c] at each destination
+            "recv": w.buffer("tp_relay_rs_recv", 2 * rh),  # [parity][sender][rows] at each destination
             "stage": w.buffer("tp_relay_rs_stage", 2 * sth),
             "flags": w.buffer("tp_relay_rs_flags", self._flags_layout(C)[-1] * 4),
         }
@@ -358,14 +377,14 @@ class TPRelay:
         def flag(rank, word):
             return self.base(f, rank) + word * 4
 
-        def src(dest, c):  # this rank's partials for dest's chunk c: rows dest * rows + c * block of [S, N]
-            return (dest * rows + c * block) * N * 2
+        def src(dest, c):  # this rank's partials for dest's chunk c: rows dest * rows + its first row, of [S, N]
+            return (dest * rows + bounds[c][0]) * N * 2
 
         par_plans = []
         for par in range(2):
 
             def recv_at(rank, sender, c, off, par=par):
-                return self.base(bufs["recv"], rank) + par * rh + (sender * C + c) * cb + off
+                return self.base(bufs["recv"], rank) + par * rh + (sender * rows + bounds[c][0]) * N * 2 + off
 
             def stage_at(helper_rank, sender, dest, c, par=par):
                 return self.base(bufs["stage"], helper_rank) + par * sth + ((sender * Wt + dest) * C + c) * slot
@@ -376,17 +395,17 @@ class TPRelay:
                 for q in peers:
                     if q in ranks:
                         d = ranks.index(q)
-                        off, size = pieces[0]
+                        off, size = pieces[c][0]
                         copies.append([(src(d, c) + off, recv_at(q, me, c, off), size)])
                         flags.append(flag(q, data + (c * Wt + me) * P))
                     else:
-                        off, size = pieces[1 + helpers.index(q)]
+                        off, size = pieces[c][1 + helpers.index(q)]
                         copies.append([(src(d, c) + off, stage_at(q, me, d, c), size) for d in range(Wt) if d != me])
                         flags.append(flag(q, stage + c * Wt + me))
                 chunk_plans.append(self._plan(copies, flags))
-            off, size = pieces[1 + me]
             fwd = []
             for c in range(C):
+                off, size = pieces[c][1 + me]
                 row = []
                 for i in range(Wt):
                     copies, flags = [], []
@@ -410,7 +429,8 @@ class TPRelay:
             "par": par_plans,
             "bufs": bufs,
             "halves": (rh, sth),
-            "tiles": (block // BLOCK_M) * ((N + 255) // 256),  # GEMM tiles per (chunk, dest)
+            "tiles": [n // BLOCK_M * ((N + 255) // 256) for _, n in bounds],  # GEMM tiles per (chunk c, dest)
+            "bounds": bounds,
             "cnt_idx": [torch.tensor([c * Wt + p for p in peers_of], dtype=torch.int32, device=dev) for c in range(C)],
             "stage_idx": [
                 torch.tensor([stage + c * Wt + i], dtype=torch.int32, device=dev) for c in range(C) for i in range(Wt)
@@ -438,8 +458,8 @@ class TPRelay:
         N = w_t.shape[1]
         C, Wt = chunks, self.Wt
         rows = S // Wt
-        block = rows // C
         e = self._rs(rows, N, C)
+        bounds = e["bounds"]
         n = self._next("rs")
         par = n % 2
         pp = e["par"][par]
@@ -449,7 +469,7 @@ class TPRelay:
         cur = torch.cuda.current_stream()
         side = _side.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
         flags = e["bufs"]["flags"].local.view(torch.int32)[:nwords]
-        recv = e["bufs"]["recv"].local[par * rh : (par + 1) * rh].view(torch.bfloat16).view(Wt, C, block, N)
+        recv_flat = e["bufs"]["recv"].local[par * rh : (par + 1) * rh].view(torch.bfloat16).view(Wt, rows * N)
         stage_all = e["bufs"]["stage"].local  # forward plans hold offsets from the buffer start (parity included)
         flag_src = self.values[n : n + 1].data_ptr()
         cnt = e["cnt"]
@@ -466,7 +486,7 @@ class TPRelay:
         # stream). Separate streams: a forwarder's wait never holds back the next post's release, nor vice versa.
         for c in range(C):
             with torch.cuda.stream(post):
-                wait[(1,)](cnt, e["cnt_idx"][c], e["cnt_idx"][c].numel(), e["tiles"])
+                wait[(1,)](cnt, e["cnt_idx"][c], e["cnt_idx"][c].numel(), e["tiles"][c])
                 call.send(pp["chunks"][c], partials, post, flag_src)
             with torch.cuda.stream(side):
                 for i in range(Wt):
@@ -486,7 +506,8 @@ class TPRelay:
             self.me,
             Wt,
             rows,
-            block,
+            bounds[0][1],
+            C,
             rows,
             rows,
             0,
@@ -495,15 +516,14 @@ class TPRelay:
             progs,
             fx.Stream(cur),
         )
-        own = partials.view(Wt, C, block * N)[self.me]
-        recv_flat = recv.view(Wt, C, block * N)
+        own = partials.view(Wt, rows * N)[self.me]
         reduce = _reduce_kernel()
         RB = 4096
-        nel = block * N
-        for c in range(C):
+        for c, (r0, nr) in enumerate(bounds):
+            nel = nr * N
             wait[(1,)](flags, e["data_idx"][c], e["data_idx"][c].numel(), n)
             reduce[((nel + RB - 1) // RB,)](
-                recv_flat[0, c], own[c], out[c * block :], C * nel, self.me, nel, W=Wt, BLOCK=RB
+                recv_flat[0, r0 * N :], own[r0 * N :], out[r0:], rows * N, self.me, nel, W=Wt, BLOCK=RB
             )
         cur.wait_stream(post)
         cur.wait_stream(side)

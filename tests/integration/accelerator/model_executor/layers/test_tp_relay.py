@@ -28,8 +28,10 @@ def _worker(rank, world_size, init_method):
         initialize_model_parallel(tensor_parallel_degree=4, ulysses_degree=2)
         assert ipc_workspace.install_torch_sdma_inbox()
         gen = torch.Generator(device="cuda").manual_seed(0)
-        # repeated calls, a larger shape (plans rebuilt, buffers grown), then the first shape again
-        for rows, k, n in ((1024, 1024, 768), (1024, 1024, 768), (2048, 2048, 1280), (1024, 1024, 768)):
+        # repeated calls, a larger shape (plans rebuilt, buffers grown), the first shape again, then 9 tiles per rank
+        # (no equal split into 4 pieces: 2 + 2 + 2 + 3 tiles) and 37 tiles (Wan 720p's 9472 rows: 9 + 9 + 9 + 10)
+        shapes = ((1024, 1024, 768), (1024, 1024, 768), (2048, 2048, 1280), (1024, 1024, 768), (2304, 1024, 768))
+        for rows, k, n in shapes + ((9472, 1280, 1024),):
             linear = torch.nn.Linear(k, n, device="cuda", dtype=torch.bfloat16)
             torch.nn.init.normal_(linear.weight, std=k**-0.5, generator=gen)
             dist.broadcast(linear.weight.data, 0)

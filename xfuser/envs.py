@@ -104,6 +104,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # the other group's GPUs (layers/tp_relay.py); XDIT_TP_RELAY_DIRECT is the share that goes direct.
     "XDIT_TP_RELAY": lambda: os.environ.get("XDIT_TP_RELAY", "0"),
     "XDIT_TP_RELAY_DIRECT": lambda: os.environ.get("XDIT_TP_RELAY_DIRECT", "0.6"),
+    # The reduce-scatter's direct share; pieces per relayed op (whole 256-row tiles, the last piece takes the
+    # remainder; capped by the transport's sends per call). Wan TP4 x U2 720p on 8x MI355X: 2 pieces and 0.7 beat
+    # 1 / 0.6 (11.29 -> 11.21 s/iter); 4 pieces lose (11.64: per-piece sends and waits on a bandwidth-bound RS).
+    "XDIT_TP_RELAY_RS_DIRECT": lambda: os.environ.get("XDIT_TP_RELAY_RS_DIRECT", "0.7"),
+    "XDIT_TP_RELAY_CHUNKS": lambda: os.environ.get("XDIT_TP_RELAY_CHUNKS", "2"),
     # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
     # thread logs what was missing and aborts the process (no wrong output is used); raise: the
     # stream moves on (that call's output is wrong) and the next SDMA call raises.

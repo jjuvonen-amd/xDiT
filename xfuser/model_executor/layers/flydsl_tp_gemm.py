@@ -111,6 +111,16 @@ class _StoreC:
 _CACHE = {}
 
 
+def _chunk_of(m, bpc, bpr, n_chunks):
+    """Chunk of a rank's row block m: n_chunks chunks of bpc row blocks, the last one also takes the remaining
+    bpr - n_chunks * bpc (so row counts need only be whole tiles, not whole chunks). (chunk, first block, blocks)."""
+    last = n_chunks - 1
+    c = m // bpc
+    c = (c > last).select(last, c)
+    csize = (c == last).select(bpr - last * bpc, bpc)
+    return c, c * bpc, csize
+
+
 def compile_persistent_ag_gemm_fp8(*, K, BLOCK_M=256, BLOCK_N=256, waves_per_eu=1, mode="ag"):
     """mode "ag": A rows of peer r come from the receive slots, tiles wait on the chunk's flags.
     mode "rs": A = my full [S, K] input (a_slot_rows = s_slot_rows = rows); tiles in send order (chunk-major over
@@ -155,6 +165,7 @@ def compile_persistent_ag_gemm_fp8(*, K, BLOCK_M=256, BLOCK_N=256, waves_per_eu=
         W: fx.Int32,
         rows: fx.Int32,
         rows_chunk: fx.Int32,
+        n_chunks: fx.Int32,
         a_slot_rows: fx.Int32,
         s_slot_rows: fx.Int32,
         f0: fx.Int32,
@@ -168,7 +179,7 @@ def compile_persistent_ag_gemm_fp8(*, K, BLOCK_M=256, BLOCK_N=256, waves_per_eu=
         wave_m, wave_n = wave_id // 4, wave_id % 4
         n_blocks_n = (c_n + BLOCK_N - 1) // BLOCK_N
         bpr = rows // BLOCK_M  # row blocks per rank
-        bpc = rows_chunk // BLOCK_M  # row blocks per chunk
+        bpc = rows_chunk // BLOCK_M  # row blocks per chunk (the last chunk also takes the remainder)
         peers = W - 1
         total = W * bpr * n_blocks_n
         for t in range(fx.Int32(fx.block_idx.x), total, n_progs):
@@ -180,20 +191,20 @@ def compile_persistent_ag_gemm_fp8(*, K, BLOCK_M=256, BLOCK_N=256, waves_per_eu=
                 j = mo - bpr
                 own = mo < bpr
                 jj = own.select(fx.Int32(0), j)
-                c = jj // (bpc * peers)
-                q = jj % (bpc * peers)
-                pi = q // bpc
+                c, cstart, csize = _chunk_of(jj // peers, bpc, bpr, n_chunks)
+                q = jj - peers * cstart
+                pi = q // csize
                 r = own.select(me, pi + (pi >= me).select(fx.Int32(1), fx.Int32(0)))
-                lmb = own.select(mo, c * bpc + q % bpc)
+                lmb = own.select(mo, cstart + q % csize)
             else:
                 # send order -> (destination rank r, local row block lmb, chunk c); own rows last
                 own = mo >= peers * bpr
                 jj = own.select(fx.Int32(0), mo)
-                c = jj // (bpc * peers)
-                q = jj % (bpc * peers)
-                pi = q // bpc
+                c, cstart, csize = _chunk_of(jj // peers, bpc, bpr, n_chunks)
+                q = jj - peers * cstart
+                pi = q // csize
                 r = own.select(me, (me + 1 + pi) % W)
-                lmb = own.select(mo - peers * bpr, c * bpc + q % bpc)
+                lmb = own.select(mo - peers * bpr, cstart + q % csize)
             r64 = fx.Int64(r)
             gA = _rank_buffer(A, r64 * fx.Int64(a_slot_rows) * fx.Int64(K), fx.Int64(rows) * fx.Int64(K), F8)
             gB = make_fp8_buffer_tensor(B_T, F8)
@@ -340,6 +351,7 @@ def compile_persistent_ag_gemm_fp8(*, K, BLOCK_M=256, BLOCK_N=256, waves_per_eu=
         W: fx.Int32,
         rows: fx.Int32,
         rows_chunk: fx.Int32,
+        n_chunks: fx.Int32,
         a_slot_rows: fx.Int32,
         s_slot_rows: fx.Int32,
         f0: fx.Int32,
@@ -360,6 +372,7 @@ def compile_persistent_ag_gemm_fp8(*, K, BLOCK_M=256, BLOCK_N=256, waves_per_eu=
             W,
             rows,
             rows_chunk,
+            n_chunks,
             a_slot_rows,
             s_slot_rows,
             f0,

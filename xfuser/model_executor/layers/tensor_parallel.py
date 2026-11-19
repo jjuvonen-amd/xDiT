@@ -137,12 +137,11 @@ def _tp_fp8_all_gather_gemm(
 ) -> torch.Tensor:
     """all_gather(xq rows) @ w_t, row-wise FP8 (xq [rows, K], xs [rows, 1]) -> [world * rows, N] bf16:
     relayed (XDIT_TP_RELAY), persistent (XDIT_TP_PERSISTENT) or torch's fused op, whichever applies."""
-    from xfuser.model_executor.layers.tp_persistent import _tile_chunks
 
     rows, K = xq.shape
     relay = _relay(group_name)
     if relay is not None:
-        chunks = _tile_chunks(4, rows)
+        chunks = relay.chunks(rows)
         if chunks is not None and K % 128 == 0 and K >= 256:
             return relay.all_gather_gemm_fp8(xq, xs, w_t, w_s, chunks)
     rs = _persistent_ops()
@@ -179,13 +178,12 @@ def _tp_fp8_gemm_reduce_scatter(
 ) -> torch.Tensor:
     """reduce_scatter(xq @ w_t), row-wise FP8 (xq [S, K], xs [S, 1]) -> this rank's [S / world, N] bf16:
     relayed, persistent or torch's fused op, whichever applies."""
-    from xfuser.model_executor.layers.tp_persistent import _tile_chunks
 
     S, K = xq.shape
     n = w_t.shape[1]
     relay = _relay(group_name)
     if relay is not None and S % relay.Wt == 0:
-        chunks = _tile_chunks(4, S // relay.Wt)
+        chunks = relay.chunks(S // relay.Wt)
         if chunks is not None and K % 128 == 0 and K >= 256:
             return relay.gemm_reduce_scatter_fp8(xq, xs, w_t, w_s, chunks)
     rs = _persistent_ops()
@@ -234,12 +232,11 @@ def _tp_fp8_all_gather_gemm_keep(
     """As xfuser::tp_fp8_all_gather_gemm, plus the gathered rows [world * rows, K] fp8 and their scales
     [world * rows, 1]: [out, rows, scales]. The rows may be the relay's receive buffer, valid until this
     rank's next-but-one relayed all-gather: use them before the next TP all-gather site."""
-    from xfuser.model_executor.layers.tp_persistent import _tile_chunks
 
     rows, K = xq.shape
     relay = _relay(group_name)
     if relay is not None:
-        chunks = _tile_chunks(4, rows)
+        chunks = relay.chunks(rows)
         if chunks is not None and K % 128 == 0 and K >= 256:
             return list(relay.all_gather_gemm_fp8(xq, xs, w_t, w_s, chunks, keep=True))
     group = dist.distributed_c10d._resolve_process_group(group_name)
