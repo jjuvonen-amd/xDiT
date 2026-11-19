@@ -323,66 +323,86 @@ class TPRelay:
         self._plans[key] = entry
         return entry
 
-    def all_gather_gemm_fp8(self, xq, xs, w_t, w_s, chunks: int, keep: bool = False):
-        """xq [rows, K] fp8, xs [rows, 1] fp32, w_t [K, N] column-major, w_s [1, N] -> [Wt * rows, N] bf16.
+    def _ag_begin(self, rows: int, K: int, C: int, call, cur) -> dict:
+        """Open a relayed all-gather of `rows` x K fp8 rows in C pieces on `call`: buffers, this rank's flag words,
+        the helper-side forwarders (side stream). The pieces go out with _ag_send_chunk / _ag_send_scales."""
+        Wt = self.Wt
+        e = self._ag(rows, K, C)
+        n = self._next("ag")
+        par = n % 2
+        xh, sh, _ = e["halves"]
+        nwords = self._flags_layout(C)[-1]
+        dev = cur.device
+        side = _side.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
+        flags = e["bufs"]["flags"].local.view(torch.int32)[:nwords]
+        st = {
+            "e": e,
+            "n": n,
+            "pp": e["par"][par],
+            "rows": rows,
+            "K": K,
+            "C": C,
+            "flags": flags,
+            "side": side,
+            "x_in": e["bufs"]["x"].local[par * xh : (par + 1) * xh].view(Wt, rows * K),
+            "s_in": e["bufs"]["s"].local[par * sh : (par + 1) * sh].view(torch.float32).view(Wt, rows),
+            "flag_src": self.values[n : n + 1].data_ptr(),
+            "call": call,
+        }
+        # own flag words for this call (no reset: peers' words only ever grow)
+        flags.index_fill_(0, e["own_words"], n)
+        side.wait_stream(cur)
+        return st
 
-        keep: also return the gathered rows [Wt * rows, K] and scales [Wt * rows, 1], views of this call's
-        receive buffers. They hold until this rank's next-but-one relayed all-gather is issued (peers write
-        that parity again only after this rank's next all-gather has sent, i.e. after work queued before it)."""
+    def _ag_forward_chunk(self, st, c: int) -> None:
+        """Helper side of piece c: forward each client sender's piece once it has landed in this rank's staging
+        (side stream). Engines run copies in host issue order, so issue a piece's forwards after this rank's own
+        send of that piece: forwards of a later piece ahead of it would wait for peers' sends queued behind their
+        own forwards of that piece (a cycle)."""
+        e, n, Wt, side = st["e"], st["n"], self.Wt, st["side"]
+        stage_all = e["bufs"]["stage"].local  # forward plans hold offsets from the buffer start (parity included)
+        wait = _wait_kernel()
+        with torch.cuda.stream(side):
+            for i in range(Wt):
+                wait[(1,)](st["flags"], e["stage_idx"][c * Wt + i], 1, n)
+                st["call"].send(st["pp"]["fwd"][c][i], stage_all, side, st["flag_src"])
+
+    def _ag_send_chunk(self, st, c: int, xq_rows, cur) -> None:
+        """Piece c of this rank's rows: `xq_rows` is the full [rows, K] fp8 tensor whose piece c is ready on `cur`."""
+        r0, nr = chunk_rows(st["rows"], st["C"])[c]
+        K = st["K"]
+        st["x_in"][self.me][r0 * K : (r0 + nr) * K].copy_(xq_rows[r0 : r0 + nr].view(torch.uint8).view(-1))
+        st["call"].send(st["pp"]["chunks"][c], xq_rows, cur, st["flag_src"])
+
+    def _ag_send_scales(self, st, xs_rows, cur) -> None:
+        """This rank's row scales ([rows] fp32, ready on `cur`), to every TP peer."""
+        st["s_in"][self.me].copy_(xs_rows)
+        st["call"].send(st["pp"]["scale"], xs_rows, cur, st["flag_src"])
+
+    def _ag_gemm(self, st, w_t, w_s, cur) -> torch.Tensor:
+        """The persistent GEMM over the gathered rows (peers' pieces waited for in-kernel): [Wt * rows, N] bf16."""
         import flydsl.expr as fx
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
         from xfuser.model_executor.layers.flydsl_tp_gemm import compile_persistent_ag_gemm_fp8
 
-        rows, K = xq.shape
+        e, rows, K, C, Wt = st["e"], st["rows"], st["K"], st["C"], self.Wt
         N = w_t.shape[1]
-        C, Wt, P = chunks, self.Wt, self.P
-        e = self._ag(rows, K, C)
-        n = self._next("ag")
-        par = n % 2
-        pp = e["par"][par]
-        xh, sh, sth = e["halves"]
-        data, _, _, _, nwords = self._flags_layout(C)
-        dev = xq.device
-        cur = torch.cuda.current_stream()
-        side = _side.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
-        flags = e["bufs"]["flags"].local.view(torch.int32)[:nwords]
-        x_in = e["bufs"]["x"].local[par * xh : (par + 1) * xh].view(Wt, rows * K)
-        s_in = e["bufs"]["s"].local[par * sh : (par + 1) * sh].view(torch.float32).view(Wt, rows)
-        stage_all = e["bufs"]["stage"].local  # forward plans hold offsets from the buffer start (parity included)
-        flag_src = self.values[n : n + 1].data_ptr()
-        xq = xq.contiguous()
-        xs = xs.reshape(rows).float().contiguous()
-        # own slot and own flag words for this call (no reset: peers' words only ever grow)
-        x_in[self.me].copy_(xq.view(torch.uint8).view(-1))
-        s_in[self.me].copy_(xs)
-        flags.index_fill_(0, e["own_words"], n)
-        call = self.w.begin()
-        call.send(pp["scale"], xs, cur, flag_src)
-        for c in range(C):
-            call.send(pp["chunks"][c], xq, cur, flag_src)
-        wait = _wait_kernel()
-        # helper side: forward each client sender's piece once it has landed in this rank's staging
-        side.wait_stream(cur)
-        with torch.cuda.stream(side):
-            for c in range(C):
-                for i in range(Wt):
-                    wait[(1,)](flags, e["stage_idx"][c * Wt + i], 1, n)
-                    call.send(pp["fwd"][c][i], stage_all, side, flag_src)
-        out = torch.empty(Wt * rows, N, dtype=torch.bfloat16, device=dev)
-        wait[(1,)](flags, e["scale_idx"], e["scale_idx"].numel(), n)
+        data = self._flags_layout(C)[0]
+        out = torch.empty(Wt * rows, N, dtype=torch.bfloat16, device=cur.device)
+        _wait_kernel()[(1,)](st["flags"], e["scale_idx"], e["scale_idx"].numel(), st["n"])
         exe = compile_persistent_ag_gemm_fp8(K=K, BLOCK_M=BLOCK_M, BLOCK_N=256)
         # leave CUs for the forwarders on the side stream: other ranks wait for what they forward
-        progs = torch.cuda.get_device_properties(dev).multi_processor_count * 7 // 8
+        progs = torch.cuda.get_device_properties(cur.device).multi_processor_count * 7 // 8
         _run_compiled(
             exe,
-            x_in[0][: rows * K].view(torch.int8),  # rank-0-sized views: the kernel rebases per rank
+            st["x_in"][0][: rows * K].view(torch.int8),  # rank-0-sized views: the kernel rebases per rank
             w_t.t().view(torch.int8).reshape(-1),
             out.view(-1)[: rows * N],
-            s_in[0][:rows],
+            st["s_in"][0][:rows],
             w_s.reshape(-1).float().contiguous(),
             e["bufs"]["flags"].ptr,
-            n,
+            st["n"],
             self.me,
             Wt,
             rows,
@@ -391,17 +411,38 @@ class TPRelay:
             rows,
             rows,
             data,
-            P,
+            self.P,
             N,
             progs,
             fx.Stream(cur),
         )
-        cur.wait_stream(side)
+        return out
+
+    def all_gather_gemm_fp8(self, xq, xs, w_t, w_s, chunks: int, keep: bool = False):
+        """xq [rows, K] fp8, xs [rows, 1] fp32, w_t [K, N] column-major, w_s [1, N] -> [Wt * rows, N] bf16.
+
+        keep: also return the gathered rows [Wt * rows, K] and scales [Wt * rows, 1], views of this call's
+        receive buffers. They hold until this rank's next-but-one relayed all-gather is issued (peers write
+        that parity again only after this rank's next all-gather has sent, i.e. after work queued before it)."""
+        rows, K = xq.shape
+        cur = torch.cuda.current_stream()
+        xq = xq.contiguous()
+        xs = xs.reshape(rows).float().contiguous()
+        call = self.w.begin()
+        st = self._ag_begin(rows, K, chunks, call, cur)
+        self._ag_send_scales(st, xs, cur)
+        for c in range(chunks):
+            self._ag_send_chunk(st, c, xq, cur)
+        for c in range(chunks):
+            self._ag_forward_chunk(st, c)
+        out = self._ag_gemm(st, w_t, w_s, cur)
+        cur.wait_stream(st["side"])
         call.end()
-        xq.record_stream(side)
+        xq.record_stream(st["side"])
         calls["all_gather_gemm"] += 1
         if keep:
-            return out, x_in.view(xq.dtype).view(Wt * rows, K), s_in.view(Wt * rows, 1)
+            Wt = self.Wt
+            return out, st["x_in"].view(xq.dtype).view(Wt * rows, K), st["s_in"].view(Wt * rows, 1)
         return out
 
     # -- GEMM + reduce-scatter ------------------------------------------------------------------------------
@@ -513,9 +554,9 @@ class TPRelay:
         self._plans[key] = entry
         return entry
 
-    def gemm_reduce_scatter_fp8(self, xq, xs, w_t, w_s, chunks: int) -> torch.Tensor:
-        """xq [S, K] fp8 (all rows of the group, this rank's K shard), xs [S, 1], w_t [K, N] column-major,
-        w_s [1, N] -> this rank's [S / Wt, N] bf16, partial sums relayed through the other group."""
+    def _rs_begin(self, xq, xs, w_t, w_s, C: int, call, cur) -> dict:
+        """Start a relayed GEMM + reduce-scatter on `call`: the poster / forwarder streams' sends and the persistent
+        GEMM. Its pieces are reduced with _rs_reduce_chunk and closed with _rs_end."""
         import flydsl.expr as fx
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
@@ -523,7 +564,7 @@ class TPRelay:
 
         S, K = xq.shape
         N = w_t.shape[1]
-        C, Wt = chunks, self.Wt
+        Wt = self.Wt
         rows = S // Wt
         fp8 = self.rs_fp8 and N % 256 == 0
         e = self._rs(rows, N, C, fp8)
@@ -534,7 +575,6 @@ class TPRelay:
         rh, sth, rsh = e["halves"]
         nwords = self._flags_layout(C)[-1]
         dev = xq.device
-        cur = torch.cuda.current_stream()
         side = _side.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
         flags = e["bufs"]["flags"].local.view(torch.int32)[:nwords]
         recv_flat = e["bufs"]["recv"].local[par * rh : (par + 1) * rh]
@@ -543,17 +583,31 @@ class TPRelay:
         flag_src = self.values[n : n + 1].data_ptr()
         cnt = e["cnt"]
         partials = torch.empty(S, N, dtype=torch.bfloat16, device=dev)
-        out = torch.empty(rows, N, dtype=torch.bfloat16, device=dev)
-        send = partials
+        st = {
+            "e": e,
+            "n": n,
+            "fp8": fp8,
+            "rows": rows,
+            "N": N,
+            "NB": NB,
+            "bounds": bounds,
+            "flags": flags,
+            "recv_flat": recv_flat,
+            "partials": partials,
+            "send": partials,
+            "side": side,
+            "out": torch.empty(rows, N, dtype=torch.bfloat16, device=dev),
+        }
         if fp8:  # the peers' partial sums go out as e4m3 codes + scales, quantized per chunk on the poster stream
-            quant, reduce_fp8 = _fp8_kernels()
-            send = torch.empty(S * N + S * NB * 4, dtype=torch.uint8, device=dev)
+            quant, _ = _fp8_kernels()
+            send = st["send"] = torch.empty(S * N + S * NB * 4, dtype=torch.uint8, device=dev)
             q8 = send[: S * N].view(torch.float8_e4m3fn)
             sc = send[S * N :].view(torch.float32)
-            rscale = e["bufs"]["rscale"].local[par * rsh : (par + 1) * rsh].view(torch.float32).view(Wt, rows * NB)
+            st["rscale"] = (
+                e["bufs"]["rscale"].local[par * rsh : (par + 1) * rsh].view(torch.float32).view(Wt, rows * NB)
+            )
         cnt.zero_()
-        call = self.w.begin()
-        post = _post.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
+        post = st["post"] = _post.setdefault(dev.index, torch.cuda.Stream(device=dev, priority=-1))
         post.wait_stream(cur)  # counters zeroed before the poster reads them
         side.wait_stream(cur)
         wait = _wait_kernel()
@@ -569,7 +623,7 @@ class TPRelay:
                     quant[((n_rows + 7) // 8,)](
                         partials, q8, sc, rows, r0, nr, n_rows, self.me, N, NB, ROWS=8, BLOCK=256, num_warps=8
                     )
-                call.send(pp["chunks"][c], send, post, flag_src)
+                call.send(pp["chunks"][c], st["send"], post, flag_src)
             with torch.cuda.stream(side):
                 for i in range(Wt):
                     wait[(1,)](flags, e["stage_idx"][c * Wt + i], 1, n)
@@ -600,38 +654,93 @@ class TPRelay:
             progs,
             fx.Stream(cur),
         )
-        own = partials.view(Wt, rows * N)[self.me]
-        reduce = _reduce_kernel()
+        return st
+
+    def _rs_reduce_chunk(self, st, c: int) -> torch.Tensor:
+        """Wait for every sender's piece c and reduce it (fp32, rank order) on the current stream: rows of `out`."""
+        e, N, NB, rows, Wt = st["e"], st["N"], st["NB"], st["rows"], self.Wt
+        r0, nr = st["bounds"][c]
+        nel = nr * N
+        out = st["out"]
+        own = st["partials"].view(Wt, rows * N)[self.me]
         RB = 4096
-        for c, (r0, nr) in enumerate(bounds):
-            nel = nr * N
-            wait[(1,)](flags, e["data_idx"][c], e["data_idx"][c].numel(), n)
-            if fp8:
-                reduce_fp8[((nel + RB - 1) // RB,)](
-                    recv_flat[0, r0 * N :],
-                    rscale[0, r0 * NB :],
-                    own[r0 * N :],
-                    out[r0:],
-                    rows * N,
-                    rows * NB,
-                    self.me,
-                    nel,
-                    N,
-                    NB,
-                    W=Wt,
-                    BLOCK=RB,
-                )
-            else:
-                reduce[((nel + RB - 1) // RB,)](
-                    recv_flat[0, r0 * N :], own[r0 * N :], out[r0:], rows * N, self.me, nel, W=Wt, BLOCK=RB
-                )
-        cur.wait_stream(post)
-        cur.wait_stream(side)
+        _wait_kernel()[(1,)](st["flags"], e["data_idx"][c], e["data_idx"][c].numel(), st["n"])
+        if st["fp8"]:
+            _, reduce_fp8 = _fp8_kernels()
+            reduce_fp8[((nel + RB - 1) // RB,)](
+                st["recv_flat"][0, r0 * N :],
+                st["rscale"][0, r0 * NB :],
+                own[r0 * N :],
+                out[r0:],
+                rows * N,
+                rows * NB,
+                self.me,
+                nel,
+                N,
+                NB,
+                W=Wt,
+                BLOCK=RB,
+            )
+        else:
+            _reduce_kernel()[((nel + RB - 1) // RB,)](
+                st["recv_flat"][0, r0 * N :], own[r0 * N :], out[r0:], rows * N, self.me, nel, W=Wt, BLOCK=RB
+            )
+        return out[r0 : r0 + nr]
+
+    def _rs_end(self, st, cur) -> None:
+        cur.wait_stream(st["post"])
+        cur.wait_stream(st["side"])
+        st["partials"].record_stream(st["post"])
+        st["send"].record_stream(st["post"])
+
+    def gemm_reduce_scatter_fp8(self, xq, xs, w_t, w_s, chunks: int) -> torch.Tensor:
+        """xq [S, K] fp8 (all rows of the group, this rank's K shard), xs [S, 1], w_t [K, N] column-major,
+        w_s [1, N] -> this rank's [S / Wt, N] bf16, partial sums relayed through the other group."""
+        cur = torch.cuda.current_stream()
+        call = self.w.begin()
+        st = self._rs_begin(xq, xs, w_t, w_s, chunks, call, cur)
+        for c in range(chunks):
+            self._rs_reduce_chunk(st, c)
+        self._rs_end(st, cur)
         call.end()
-        partials.record_stream(post)
-        send.record_stream(post)
         calls["gemm_reduce_scatter"] += 1
-        return out
+        return st["out"]
+
+    def gemm_rs_then_ag_fp8(self, xq, xs, w_t, w_s, then, w2_t, w2_s, chunks: int):
+        """A relayed GEMM + reduce-scatter pipelined into the next relayed all-gather + GEMM, piece by piece:
+        each reduced piece of this rank's rows goes through `then(r0, rows_bf16) -> next input rows (bf16)` (any
+        row-wise work, e.g. residual add + norm + modulation; it may keep state of its own), is quantized row-wise
+        to FP8 and sent while later pieces still land. Returns (this rank's reduced rows [rows, N], the next GEMM's
+        output [Wt * rows, N2]). One transport call carries both ops' sends."""
+        from xfuser.model_executor.layers.tensor_parallel import _rowwise_fp8
+
+        # both ops' sends in one call: RS C * (1 + Wt), AG C * (1 + Wt) + the scales
+        if 2 * chunks * (1 + self.Wt) + 1 > self.T._TRIGGERS:
+            raise ValueError(f"{chunks} pieces exceed the transport's {self.T._TRIGGERS} sends per call")
+        cur = torch.cuda.current_stream()
+        S = xq.shape[0]
+        rows, K2 = S // self.Wt, w2_t.shape[0]
+        call = self.w.begin()
+        rs = self._rs_begin(xq, xs, w_t, w_s, chunks, call, cur)
+        ag = self._ag_begin(rows, K2, chunks, call, cur)
+        nq = torch.empty(rows, K2, dtype=torch.float8_e4m3fn, device=xq.device)
+        ns = torch.empty(rows, dtype=torch.float32, device=xq.device)
+        for c in range(chunks):
+            r0, nr = rs["bounds"][c]
+            q, sc = _rowwise_fp8(then(r0, self._rs_reduce_chunk(rs, c)))  # as the FP8 TP sites quantize
+            nq[r0 : r0 + nr] = q
+            ns[r0 : r0 + nr] = sc.view(-1)
+            self._ag_send_chunk(ag, c, nq, cur)
+            self._ag_forward_chunk(ag, c)
+        self._ag_send_scales(ag, ns, cur)
+        out2 = self._ag_gemm(ag, w2_t, w2_s, cur)
+        self._rs_end(rs, cur)
+        cur.wait_stream(ag["side"])
+        call.end()
+        nq.record_stream(ag["side"])
+        calls["gemm_reduce_scatter"] += 1
+        calls["all_gather_gemm"] += 1
+        return rs["out"], out2
 
 
 def relay_for(group_name: str) -> Optional[TPRelay]:

@@ -12,13 +12,20 @@ def _worker(rank, world_size, init_method):
     import torch
     import torch.distributed as dist
 
-    os.environ.update(TORCH_SYMM_MEM_ENABLE_ROCM_SDMA="1", XDIT_TP_IPC_WORKSPACE="1")
+    # bf16 partial sums first (tight check); the FP8 ones are checked per shape below
+    os.environ.update(TORCH_SYMM_MEM_ENABLE_ROCM_SDMA="1", XDIT_TP_IPC_WORKSPACE="1", XDIT_TP_RELAY_RS_FP8="0")
     pytest.importorskip("torch.distributed._symmetric_memory._rocm_sdma")
     pytest.importorskip("flydsl")
     from xfuser.core.distributed import init_distributed_environment, initialize_model_parallel, ipc_workspace
     from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
     from xfuser.model_executor.layers import tp_relay
-    from xfuser.model_executor.layers.tensor_parallel import quantize_linear_fp8_, tp_column_parallel, tp_row_parallel
+    from xfuser.core.distributed.parallel_state import get_tp_group
+    from xfuser.model_executor.layers.tensor_parallel import (
+        _rowwise_fp8,
+        quantize_linear_fp8_,
+        tp_column_parallel,
+        tp_row_parallel,
+    )
 
     try:
         torch.cuda.set_device(rank)
@@ -73,6 +80,33 @@ def _worker(rank, world_size, init_method):
             if rank == 0:
                 print(f"RS rows {rows} n {n}: bf16 partials {error:.2e}, fp8 partials {error8:.2e}", flush=True)
             assert error8 < 4e-2, f"RS rows {rows} k {k} n {n}: FP8 partials relative error {error8:.3e}"
+            # GEMM + RS pipelined into the next AG + GEMM, piece by piece, through a row-wise function: bitwise the
+            # same as the two ops one after the other with the function in between
+            relay = tp_relay.relay_for(get_tp_group().device_group.group_name)
+            if relay is not None and rows % 256 == 0:
+                nxt = torch.nn.Linear(n, 512, bias=False, device="cuda", dtype=torch.bfloat16)
+                torch.nn.init.normal_(nxt.weight, std=n**-0.5, generator=gen)
+                quantize_linear_fp8_(nxt)
+                xq, xs = _rowwise_fp8(xr[0])
+                bias = torch.randn(n, device="cuda", dtype=torch.bfloat16, generator=gen)
+
+                def then(r0, y):
+                    return (y.float() * 0.5 + bias.float()).to(torch.bfloat16)
+
+                w_t, w_s, w2_t, w2_s = (
+                    row_linear.tp_fp8_weight,
+                    row_linear.tp_fp8_scale,
+                    nxt.tp_fp8_weight,
+                    nxt.tp_fp8_scale,
+                )
+                chunks = relay.chunks(rows)
+                with torch.inference_mode():
+                    red = relay.gemm_reduce_scatter_fp8(xq, xs, w_t, w_s, chunks).clone()
+                    q2, s2 = _rowwise_fp8(then(0, red))
+                    seq_out = relay.all_gather_gemm_fp8(q2, s2, w2_t, w2_s, chunks)
+                    red_f, fused_out = relay.gemm_rs_then_ag_fp8(xq, xs, w_t, w_s, then, w2_t, w2_s, chunks)
+                assert torch.equal(red_f, red), f"rows {rows}: fused RS rows differ"
+                assert torch.equal(fused_out, seq_out), f"rows {rows}: fused RS -> AG output differs"
         dist.barrier()
     finally:
         destroy_model_parallel()
