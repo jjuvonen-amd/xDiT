@@ -148,8 +148,12 @@ class RelayPair:
         )
         per_sender = -(-per_sender // _ALIGN) * _ALIGN
         r = _Route(signal)
-        # One staging buffer per route (collective: every rank builds the same routes).
-        r.stage = self.w.buffer(f"relay_stage_{key!r}_{signal}", transport._SLOTS * W * per_sender)
+        # One staging buffer per lane (collective: every rank builds the same routes): the route key without its
+        # first element (the exchange, which carries the shape), plus the signal. Routes of one call never share a
+        # lane, and a new shape grows the lane's buffer instead of adding one (the old one is released and the
+        # routes still on it rebuild), so memory stays bounded by the largest route per lane.
+        lane = key[1:] if isinstance(key, tuple) and len(key) > 1 else key
+        r.stage = self.w.buffer(f"relay_stage_{lane!r}_{signal}", transport._SLOTS * W * per_sender)
         r.buffers = list({id(c[1]): c[1] for rb in by_pair_rank.values() for c in rb}.values())
 
         def stage_offset(slot, sender, j, helper):

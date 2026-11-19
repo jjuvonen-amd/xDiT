@@ -210,10 +210,20 @@ def _relay_worker(rank, world_size, init_method, cfg, tp):
             for call in range(3):
                 wrong = exchange_mismatches(group, case, 10 * index + call)
                 assert wrong == 0, f"relayed {case}: {wrong} wrong elements"
+        world = ulysses._transport(group).w
+
+        def staging():
+            return sorted(name for name in world._buffers if name.startswith("relay_stage_"))
+
+        lanes = staging()
         for sweep in range(2):
             for index, case in enumerate(EXCHANGES):
                 wrong = exchange_mismatches(group, case, 1000 + 100 * sweep + index)
                 assert wrong == 0, f"relayed, interleaved {case}: {wrong} wrong elements"
+        # staging is per lane (route key without its exchange, plus signal), grown to the largest shape: the
+        # buffers are not keyed by shape, and revisiting shapes adds none
+        assert not any("Exchange(" in name for name in lanes), f"relay staging keyed by shape: {lanes[:2]}"
+        assert staging() == lanes, f"relay staging grew from {len(lanes)} to {len(staging())} buffers"
         dist.barrier()
     finally:
         destroy_model_parallel()
@@ -391,7 +401,6 @@ def _compiled_worker(rank, world_size, init_method):
 
 
 def _usp_call(fn, x, w, mode, head_groups):
-
     previous = _configure(mode, head_groups)
     try:
         return fn(x, w)
