@@ -51,3 +51,28 @@ def test_amdgpu_version_parses_the_module_version(monkeypatch, tmp_path):
     assert ipc_workspace.amdgpu_version() == (7, 1, 3)
     path.write_text("")
     assert ipc_workspace.amdgpu_version() is None
+
+
+@pytest.mark.parametrize(
+    "abi, inbox_mode, replaced",
+    [(2, None, True), (3, "ipc", False), (3, "symm_mem", True)],
+)
+def test_install_torch_sdma_inbox_defers_to_the_patch_inbox(monkeypatch, abi, inbox_mode, replaced):
+    import sys
+    import types
+
+    import torch.distributed._symmetric_memory as symm_mem
+
+    def own_inbox(*args):
+        raise AssertionError("not called")
+
+    fake = types.ModuleType("torch.distributed._symmetric_memory._rocm_sdma")
+    fake.ABI_VERSION = abi
+    fake._inbox = own_inbox
+    fake._inbox_mode = lambda: inbox_mode
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    monkeypatch.setattr(symm_mem, "_rocm_sdma", fake, raising=False)
+    monkeypatch.setattr(ipc_workspace, "enabled", lambda: True)
+
+    assert ipc_workspace.install_torch_sdma_inbox() is True
+    assert (fake._inbox is ipc_workspace._torch_sdma_inbox) is replaced
