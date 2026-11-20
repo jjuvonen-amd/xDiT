@@ -1,10 +1,15 @@
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
+from xfuser.core.attention.spec import EXACT_KV_TOKENS_KEY, EXACT_Q_TOKENS_KEY
 from xfuser.core.distributed import (
+    get_runtime_state,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
 )
+from xfuser.core.distributed.runtime_state import runtime_state_is_initialized
 from xfuser.model_executor.layers.usp import USP
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister,
@@ -27,9 +32,29 @@ def _make_xfuser_ideogram4_attention_processor():
 
     @xFuserAttentionProcessorRegister.register(Ideogram4AttnProcessor)
     class xFuserIdeogram4AttnProcessor(Ideogram4AttnProcessor):
+        """Ideogram4AttnProcessor with the attention call routed through USP.
+
+        Every layer of one transformer shares an instance. Before the layers run, the transformer
+        sets ``valid_kv_len`` to the joint sequence's real length when the SP pad made it longer,
+        so the pad keys are dropped after the all-to-all, and ``exact_tokens`` to the prompt's
+        tokens over the padded sequence, for backends that select KV blocks: their keys and their
+        own query rows are computed exactly. Every other backend ignores it.
+        """
+
         def __init__(self) -> None:
             super().__init__()
             self.attention_function = USP
+            self.valid_kv_len: int | None = None
+            self.exact_tokens: torch.Tensor | None = None
+
+        def _attention_kwargs(self) -> dict[str, Any] | None:
+            if self.valid_kv_len is None and self.exact_tokens is None:
+                return None
+            return {
+                "valid_kv_len": self.valid_kv_len,
+                EXACT_KV_TOKENS_KEY: self.exact_tokens,
+                EXACT_Q_TOKENS_KEY: self.exact_tokens,
+            }
 
         def __call__(
             self,
@@ -64,6 +89,7 @@ def _make_xfuser_ideogram4_attention_processor():
                 query.transpose(1, 2),
                 key.transpose(1, 2),
                 value.transpose(1, 2),
+                attention_kwargs=self._attention_kwargs(),
             ).transpose(1, 2)
             hidden_states = hidden_states.flatten(2, 3).type_as(query)
             return attn.to_out[0](hidden_states)
@@ -84,8 +110,24 @@ def _make_xfuser_ideogram4_transformer_wrapper():
 
     class xFuserIdeogram4Transformer2DWrapper(Ideogram4Transformer2DModel):
         def _install_xfuser_processors(self) -> None:
+            self._xfuser_processor = processor_class()
+            self._exact_tokens: dict[tuple[int, int, torch.device], torch.Tensor] = {}
             for layer in self.layers:
-                layer.attention.set_processor(processor_class())
+                layer.attention.set_processor(self._xfuser_processor)
+
+        def _prompt_tokens(self, num_text_tokens: int, padded_len: int, device: torch.device) -> torch.Tensor | None:
+            # The prompt leads the joint sequence. A backend that selects KV blocks keeps its keys
+            # exact for every query and computes its own rows exactly: every later layer reads
+            # them back. One tensor per shape, kept, so a compiled forward sees the same input.
+            if num_text_tokens == 0:
+                return None
+            key = (num_text_tokens, padded_len, device)
+            exact_tokens = self._exact_tokens.get(key)
+            if exact_tokens is None:
+                exact_tokens = torch.zeros(padded_len, dtype=torch.bool, device=device)
+                exact_tokens[:num_text_tokens] = True
+                self._exact_tokens[key] = exact_tokens
+            return exact_tokens
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -165,6 +207,9 @@ def _make_xfuser_ideogram4_transformer_wrapper():
         ):
             sp_rank = self._sp_rank
             sp_size = self._sp_size
+            if runtime_state_is_initialized():
+                # One forward is one entry of the per-step schedules (--solattn_beta_schedule).
+                get_runtime_state().increment_step_counter()
 
             batch_size, _, in_channels = hidden_states.shape
             if in_channels != self.in_channels:
@@ -224,6 +269,10 @@ def _make_xfuser_ideogram4_transformer_wrapper():
 
             sequence_length = num_text_tokens + num_image_tokens
             pad_amount = (sp_size - sequence_length % sp_size) % sp_size
+            self._xfuser_processor.valid_kv_len = sequence_length if pad_amount else None
+            self._xfuser_processor.exact_tokens = self._prompt_tokens(
+                num_text_tokens, sequence_length + pad_amount, hidden_states.device
+            )
             hidden_states = chunk_and_pad_sequence(
                 hidden_states,
                 sp_rank,

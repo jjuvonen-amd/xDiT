@@ -123,3 +123,23 @@ def test_flux3_serves_sol_beside_a_dense_text_stage(model):
         _build_flux3(model, attention_backend="aiter_fp8_sol")
     with pytest.raises(ValueError, match="cannot be AITER_FP8_SOL"):
         _build_flux3(model, attention_backend="aiter_fp8_sol", cross_attention_backend="aiter_fp8_sol")
+
+
+def _build_ideogram4(**config):
+    from xfuser import xFuserArgs
+    from xfuser.model_executor.models.runner_models import ideogram4  # noqa: F401  registers
+    from xfuser.model_executor.models.runner_models.base_model import MODEL_REGISTRY
+
+    return MODEL_REGISTRY["Ideogram-4"](xFuserArgs(model="Ideogram-4", **config))
+
+
+@pytest.mark.parametrize("backend", ["aiter_bf16_sol", "aiter_mxfp8_sol", "aiter_f6f6_sol", "aiter_mxfp4_sol"])
+def test_ideogram4_serves_the_sol_recipes_with_an_hd256_row(backend):
+    """Ideogram 4 runs head dim 256 and has no text-only attention to put on a dense backend."""
+    _build_ideogram4(attention_backend=backend, ulysses_degree=2)
+
+
+@pytest.mark.parametrize("backend", ["aiter_fp8_sol", "aiter_f6f4_sol"])
+def test_ideogram4_refuses_a_sol_recipe_without_an_hd256_row(backend):
+    with pytest.raises(ValueError, match="runs head dimension 256 and that backend serves only 128"):
+        _build_ideogram4(attention_backend=backend)

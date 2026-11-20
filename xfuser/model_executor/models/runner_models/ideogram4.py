@@ -296,6 +296,10 @@ class xFuserIdeogram4Model(xFuserModel):
         use_parallel_vae=True,
         enable_tiling=True,
         enable_slicing=True,
+        # The joint [prompt; image] attention is ~16.4k image tokens at 2048² and ~65.5k at 4096²,
+        # what Sol-Attn's routing is for, on its hd256 rows. The prompt's KV blocks and its own
+        # query rows are computed exactly.
+        supports_sol_attention_backends=True,
     )
     default_input_values = DefaultInputValues(
         height=2048,
@@ -478,6 +482,11 @@ class xFuserIdeogram4Model(xFuserModel):
 
     def _get_compiled_pipe_components(self) -> list[str]:
         return ["transformer", "unconditional_transformer"]
+
+    def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
+        # Every step runs the conditional and the unconditional transformer, on one rank unless
+        # CFG parallel puts them on two. Per-step schedules count forwards.
+        return 1 if self.config.use_cfg_parallel else 2
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
         guidance_scale = input_args.get("guidance_scale")

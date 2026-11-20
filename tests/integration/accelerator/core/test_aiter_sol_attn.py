@@ -851,13 +851,13 @@ def _tilt_recipes():
 TILT_RECIPES = _tilt_recipes()
 
 
-def _correlated_operands(seqlen=4096, heads=2, seed=1234):
+def _correlated_operands(seqlen=4096, heads=2, seed=1234, head_dim=128):
     """_operands with V partly a linear function of K: the in-block covariance the tilt models.
 
     Sharpness 0.5 rather than 2.0, so the skipped blocks keep real attention mass. At 2.0 the
     selected blocks hold nearly all of it, and there is nothing pooled to correct.
     """
-    query, key, value = _operands(seqlen=seqlen, heads=heads, seed=seed, sharpness=0.5)
+    query, key, value = _operands(seqlen=seqlen, heads=heads, head_dim=head_dim, seed=seed, sharpness=0.5)
     generator = torch.Generator(device=key.device).manual_seed(seed + 1)
     mix = torch.randn(key.shape[-1], value.shape[-1], generator=generator, device=key.device)
     value = (0.5 * value.float() + key.float() @ (mix / key.shape[-1] ** 0.5)).to(torch.bfloat16)
@@ -944,3 +944,138 @@ def test_the_compiled_tilt_is_not_the_capped_term_alone(recipe):
         tilted = torch.compile(functools.partial(run, tilt_rank=2))(query, key, value).float()
 
     assert ((tilted - capped).norm() / capped.norm()).item() > 1e-2
+
+
+# ---------------------------------------------------------------------------
+# head dim 256
+# ---------------------------------------------------------------------------
+
+
+def _hd256_recipes():
+    from xfuser.core.attention.sparsity.sol import SOL_ATTN_HEAD_DIMS, SOL_ATTN_RECIPES
+
+    return [r for r in SOL_ATTN_RECIPES if 256 in SOL_ATTN_HEAD_DIMS[r]]
+
+
+HD256_RECIPES = _hd256_recipes()
+
+
+def _require_hd256(recipe):
+    _require_sol_recipe(recipe)
+    from xfuser.core.attention.sparsity.sol import SolAttnUnsupported, check_sol_attn_recipe
+
+    try:
+        check_sol_attn_recipe(recipe, head_dim=256)
+    except SolAttnUnsupported as error:
+        pytest.skip(str(error))
+
+
+# The hd256 rows' distance from themselves with every tile exact, as _DENSE_SIBLING_TOLERANCE.
+_HD256_EXACT_TOLERANCE = {"bf16": 1e-6, "mxfp8": 2e-3, "f6f6": 2e-3, "mxfp4": 2e-2}
+
+
+@pytest.mark.parametrize("recipe", HD256_RECIPES)
+def test_every_hd256_row_holds_itself_with_every_tile_exact(recipe):
+    """No dense hd256 sibling is assumed, so each row is graded against its own kernel with every
+    query tile forced to compute all of its blocks: the same quantization, no pooled blocks."""
+    _require_hd256(recipe)
+    from xfuser.core.attention.sparsity.sol import sol_attn_bhsd
+
+    tolerance = _HD256_EXACT_TOLERANCE[recipe]
+    query, key, value = _operands(seqlen=4096, head_dim=256)
+    reference = _fp32_attention(query, key, value)
+    every_row = torch.ones(query.shape[2], dtype=torch.bool, device=query.device)
+    with torch.no_grad():
+        sol, cost = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe, return_head_cost=True)
+        exact, exact_cost = sol_attn_bhsd(
+            query, key, value, beta=0.5, recipe=recipe, return_head_cost=True, exact_query_tokens=every_row
+        )
+
+    assert sol.shape == query.shape and sol.dtype == torch.bfloat16
+    assert torch.isfinite(sol).all()
+    assert (cost < exact_cost).all(), "routing should skip blocks on clustered operands"
+    sibling = _cosine(sol, exact)
+    assert 1.0 - sibling < tolerance, f"the hd256 {recipe} row tracks itself all-exact at {sibling:.8f}"
+    sol_cosine, exact_cosine = _cosine(sol, reference), _cosine(exact, reference)
+    assert abs(sol_cosine - exact_cosine) < tolerance, (
+        f"the hd256 {recipe} row tracks fp32 at {sol_cosine:.6f} against all-exact {exact_cosine:.6f}"
+    )
+
+
+@pytest.mark.parametrize("recipe", HD256_RECIPES)
+@pytest.mark.parametrize("seqlen", [4096, 4000])
+def test_an_hd256_call_holds_one_graph(recipe, seqlen):
+    _require_hd256(recipe)
+    from xfuser.core.attention.sparsity.sol import sol_attn_bhsd
+
+    query, key, value = _operands(seqlen=seqlen, head_dim=256)
+
+    def run(q, k, v):
+        return sol_attn_bhsd(q, k, v, beta=0.5, recipe=recipe)[0]
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        compiled = torch.compile(run, fullgraph=True)(query, key, value)
+        eager = run(query, key, value)
+    assert torch.isfinite(eager).all()
+    assert torch.equal(compiled, eager), "compiling must not change the result"
+
+
+@pytest.mark.parametrize("recipe", HD256_RECIPES)
+def test_the_hd256_tilt_recovers_what_the_capped_term_leaves(recipe):
+    _require_hd256(recipe)
+    from xfuser.core.attention.sparsity.sol import sol_attn_bhsd
+
+    query, key, value = _correlated_operands(head_dim=256)
+    reference = _fp32_attention(query, key, value)
+
+    def error(**options):
+        with torch.no_grad():
+            out, _ = sol_attn_bhsd(query, key, value, beta=0.5, recipe=recipe, **options)
+        assert torch.isfinite(out).all()
+        return _relative_error(out, reference)
+
+    plain, capped, tilted = error(), error(_jensen_only=True), error(tilt_rank=2)
+    assert tilted < capped, f"{recipe}: tilt {tilted:.4f}, capped {capped:.4f}, plain {plain:.4f}"
+    assert tilted < plain, f"{recipe}: tilt {tilted:.4f}, capped {capped:.4f}, plain {plain:.4f}"
+
+
+@pytest.mark.parametrize("recipe", HD256_RECIPES)
+@pytest.mark.parametrize("options", [dict(_jensen_only=True), dict(tilt_rank=2)], ids=["capped", "tilt2"])
+def test_the_hd256_capped_term_and_tilt_hold_one_graph(recipe, options):
+    _require_hd256(recipe)
+    from xfuser.core.attention.sparsity.sol import sol_attn_bhsd
+
+    query, key, value = _correlated_operands(seqlen=2048, head_dim=256)
+
+    def run(q, k, v):
+        return sol_attn_bhsd(q, k, v, beta=0.5, recipe=recipe, **options)[0]
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        compiled = torch.compile(run, fullgraph=True)(query, key, value)
+        eager = run(query, key, value)
+    if recipe in _TILT_TOLERANCE:
+        torch.testing.assert_close(compiled.float(), eager.float(), atol=_TILT_TOLERANCE[recipe], rtol=0)
+    else:
+        assert torch.equal(compiled, eager)
+
+
+def test_an_hd256_call_refuses_a_block_size_its_row_lacks():
+    """The run's block size is checked against the hd128 rows at selection; an hd256 call checks
+    its own row, which is 256x64 only."""
+    _require_hd256("bf16")
+    from xfuser.core.attention.sparsity.sol import SolAttnUnsupported, sol_attn_bhsd
+
+    query, key, value = _operands(seqlen=1024, head_dim=256)
+    with pytest.raises(SolAttnUnsupported, match="at head dim 256"):
+        sol_attn_bhsd(query, key, value, recipe="bf16", block_tile=(64, 64))
+
+
+def test_an_hd256_call_is_refused_on_a_recipe_without_an_hd256_row():
+    _require_sol_recipe("fp8")
+    from xfuser.core.attention.sparsity.sol import SolAttnUnsupported, sol_attn_bhsd
+
+    query, key, value = _operands(seqlen=1024, head_dim=256)
+    with pytest.raises(SolAttnUnsupported, match="no head dim 256 row"):
+        sol_attn_bhsd(query, key, value, recipe="fp8")

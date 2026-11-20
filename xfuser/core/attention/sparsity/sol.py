@@ -74,6 +74,7 @@ def _probe_aiter():
         # Predates the MXFP6 Q/K, FP8 V row, which is then reported as not served.
         quantize_v_fp8 = None
     return SimpleNamespace(
+        **_probe_hd256(),
         sol=mha_v4_sol,
         packed=mha_v4_packed,
         prepare=sol_prepare,
@@ -107,6 +108,28 @@ def _probe_aiter():
         per_channel_scale=AttentionScaleMode.F32_PER_CHANNEL,
         block_scale=AttentionScaleMode.E8M0_PER_1X32,
     )
+
+
+_HD256_SYMBOLS = (
+    "quantize_mxfp8_q_hd256",
+    "quantize_mxfp8_k_hd256",
+    "mxfp8_k_view_hd256",
+    "quantize_mxfp6_q_hd256",
+    "quantize_mxfp6_k_hd256",
+    "mxfp6_k_view_hd256",
+    "quantize_mxfp4_q_hd256",
+    "quantize_mxfp4_k_hd256",
+    "quantize_v_mxfp6_fp6_p_hd256",
+    "quantize_v_mxfp4_fp6_p_hd256",
+)
+
+
+def _probe_hd256():
+    """aiter's hd256 quantizers and views, each None on a build without it, where no hd256 row
+    is served."""
+    import aiter.ops.mha_v4 as mha_v4
+
+    return {name: getattr(mha_v4, name, None) for name in _HD256_SYMBOLS}
 
 
 def _probe_scale_storage():
@@ -180,6 +203,13 @@ _block_scale_storage, _SCALE_TILE_ROWS, _SCALE_LOOKAHEAD_ROWS = (
 ) = _probe_second_order() if _AITER is not None else (None,) * 7
 # Whether sol_prepare can add forced blocks to its selection (exact KV tokens).
 _SOL_PREPARE_FORCES_BLOCKS = _AITER is not None and "force_block_mask" in inspect.signature(_AITER.prepare).parameters
+# Whether aiter's geometry queries take a head dim. Before they did, every row was hd128.
+_GEOMETRY_TAKES_HEAD_DIM = _AITER is not None and "head_dim" in inspect.signature(_AITER.block_tile).parameters
+
+
+def _geometry(recipe):
+    """The head dim argument aiter's geometry queries take for `recipe`, if they take one."""
+    return (recipe.head_dim,) if _GEOMETRY_TAKES_HEAD_DIM else ()
 
 
 def sol_attn_block_tile(recipe, block_tile=None):
@@ -191,7 +221,7 @@ def sol_attn_block_tile(recipe, block_tile=None):
     """
     if block_tile is not None:
         return tuple(block_tile)
-    return _default_block_tile(_recipe_operands(recipe), _AITER.sol_mode)
+    return _default_block_tile(_recipe_operands(recipe), _AITER.sol_mode, *_geometry(recipe))
 
 
 class _Recipe(NamedTuple):
@@ -221,6 +251,7 @@ class _Recipe(NamedTuple):
     # for a row aiter builds without the tilt. aiter's manifest has no column for it; this follows
     # mha_v4_packed's documentation.
     tilt: Optional[str] = None
+    head_dim: int = 128
 
     @property
     def v_pack(self) -> str:
@@ -230,8 +261,15 @@ class _Recipe(NamedTuple):
     @property
     def routes_through_raw(self) -> bool:
         """Whether mha_v4_sol serves this row. MXFP8's addressable block-scaled K needs its scale
-        handed to the pooling, which the raw entry point cannot take, so it goes packed."""
-        return not (self.qk_scale_mode == "block" and self.k_packed is None)
+        handed to the pooling, which the raw entry point cannot take, so it goes packed. So does
+        every hd256 row: mha_v4_sol quantizes its MX rows for hd128 only."""
+        return self.head_dim == 128 and not self.pools_addressable_block_k
+
+    @property
+    def pools_addressable_block_k(self) -> bool:
+        """Whether K is block-scaled with addressable codes, so its pooled K carries a scale of
+        its own: the hd128 MXFP8 row."""
+        return self.qk_scale_mode == "block" and self.k_packed is None
 
 
 _RECIPES = {
@@ -319,6 +357,40 @@ _RECIPES = {
 
 SOL_ATTN_RECIPES = tuple(_RECIPES)
 
+# The rows aiter has an hd256 kernel for. Their quantizers rotate each 128-channel half as an
+# hd128 row, and an hd256 MXFP8 K is packed: its scales ride inside its records.
+_HD256_RECIPES = {
+    r.id: r
+    for r in (
+        _RECIPES["bf16"]._replace(head_dim=256),
+        _RECIPES["mxfp8"]._replace(
+            quantize_q="quantize_mxfp8_q_hd256",
+            quantize_k="quantize_mxfp8_k_hd256",
+            k_packed="mxfp8",
+            tilt="packed_mxfp8_planes",
+            head_dim=256,
+        ),
+        _RECIPES["f6f6"]._replace(
+            quantize_q="quantize_mxfp6_q_hd256",
+            quantize_k="quantize_mxfp6_k_hd256",
+            quantize_v="quantize_v_mxfp6_fp6_p_hd256",
+            head_dim=256,
+        ),
+        _RECIPES["mxfp4"]._replace(
+            quantize_q="quantize_mxfp4_q_hd256",
+            quantize_k="quantize_mxfp4_k_hd256",
+            quantize_v="quantize_v_mxfp4_fp6_p_hd256",
+            head_dim=256,
+        ),
+    )
+}
+_RECIPES_BY_HEAD_DIM = {128: _RECIPES, 256: _HD256_RECIPES}
+
+# recipe id -> the head dims it has a row at, for the backends' call constraints.
+SOL_ATTN_HEAD_DIMS = {
+    recipe: tuple(d for d, table in _RECIPES_BY_HEAD_DIM.items() if recipe in table) for recipe in SOL_ATTN_RECIPES
+}
+
 
 def check_sol_attn_device(device=None):
     """Raise unless this build and device can run Sol-Attn. Defaults to the current CUDA device.
@@ -351,42 +423,51 @@ def _device_arch(device=None):
     return next((arch for arch in _SUPPORTED_ARCHS if name.startswith(arch)), None)
 
 
-def check_sol_attn_recipe(recipe_id, device=None, block_tile=None):
-    """Raise unless this device has a Sol-Attn manifest row for recipe_id, at block_tile if given.
+def check_sol_attn_recipe(recipe_id, device=None, block_tile=None, head_dim=128):
+    """Raise unless this device has a Sol-Attn manifest row for recipe_id at head_dim, at block_tile
+    if given.
 
     block_tile is --sparseattn_block_size, which is valid only where the recipe's own row serves it.
     """
     check_sol_attn_device(device)
-    recipe = _resolve_recipe(recipe_id)
+    recipe = _resolve_recipe(recipe_id, head_dim)
     if not _serves_recipe(recipe):
+        at = "" if head_dim == 128 else f" head dim {head_dim}"
         raise SolAttnUnsupported(
-            f"Sol-Attn '{recipe_id}' has no {_device_arch(device)} manifest row; "
-            f"this device serves {', '.join(sol_attn_recipes_served()) or 'none'}"
+            f"Sol-Attn '{recipe_id}' has no {_device_arch(device)}{at} manifest row; "
+            f"this device serves {', '.join(sol_attn_recipes_served(head_dim)) or 'none'}"
         )
-    if block_tile is None:
-        return
+    if block_tile is not None:
+        _check_block_tile(recipe, block_tile)
+
+
+def _check_block_tile(recipe, block_tile):
     q_tile, kv_tile = block_tile
     operands = _recipe_operands(recipe)
-    if _kv_tile_for_q_tile(q_tile, operands, _AITER.sol_mode) == kv_tile:
+    if _kv_tile_for_q_tile(q_tile, operands, _AITER.sol_mode, *_geometry(recipe)) == kv_tile:
         return
-    served = _AITER.block_tiles(operands, _AITER.sol_mode)
+    served = _AITER.block_tiles(operands, _AITER.sol_mode, *_geometry(recipe))
+    at = "" if recipe.head_dim == 128 else f" at head dim {recipe.head_dim}"
     raise SolAttnUnsupported(
         f"--sparseattn_block_size {q_tile}x{kv_tile} has no Sol-Attn kernel with the '{recipe.id}' "
-        f"recipe on this GPU; it serves {', '.join(f'{qo}x{kv}' for qo, kv in served) or 'none'}. "
+        f"recipe{at} on this GPU; it serves {', '.join(f'{qo}x{kv}' for qo, kv in served) or 'none'}. "
         f"Omit it for the default geometry ({'x'.join(str(part) for part in sol_attn_block_tile(recipe))})."
     )
 
 
-def sol_attn_recipes_served():
-    """The recipe ids this device has a Sol-Attn row for, in declaration order."""
-    return [r for r in SOL_ATTN_RECIPES if _serves_recipe(_RECIPES[r])]
+def sol_attn_recipes_served(head_dim=128):
+    """The recipe ids this device has a Sol-Attn row for at head_dim, in declaration order."""
+    table = _RECIPES_BY_HEAD_DIM.get(head_dim, {})
+    return [r for r in SOL_ATTN_RECIPES if r in table and _serves_recipe(table[r])]
 
 
 def _serves_recipe(recipe):
     """Whether the active device's manifest has a mode-2 row, at any geometry, for `recipe`."""
-    if getattr(_AITER, recipe.quantize_v) is None:
+    if any(getattr(_AITER, name) is None for name in (recipe.quantize_q, recipe.quantize_k, recipe.quantize_v)):
         return False
-    return bool(_AITER.block_tiles(_recipe_operands(recipe), _AITER.sol_mode))
+    if recipe.head_dim != 128 and not _GEOMETRY_TAKES_HEAD_DIM:
+        return False
+    return bool(_AITER.block_tiles(_recipe_operands(recipe), _AITER.sol_mode, *_geometry(recipe)))
 
 
 def _recipe_operands(recipe):
@@ -406,7 +487,7 @@ def _takes_ragged_kv(recipe, block_tile):
     does not needs K/V padded to a whole number of blocks."""
     if _ragged_kv is None:
         return False
-    return _ragged_kv(_recipe_operands(recipe), _AITER.sol_mode, block_tile)
+    return _ragged_kv(_recipe_operands(recipe), _AITER.sol_mode, block_tile, *_geometry(recipe))
 
 
 def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
@@ -430,14 +511,20 @@ def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
         )
 
 
-def _resolve_recipe(recipe):
-    """The named recipe, or a clear error listing what this build actually ships."""
-    try:
-        return _RECIPES[recipe]
-    except KeyError:
+def _resolve_recipe(recipe, head_dim=128):
+    """The named recipe's row at head_dim, or a clear error listing what this build actually ships."""
+    if recipe not in _RECIPES:
         raise SolAttnUnsupported(
             f"unknown Sol-Attn recipe {recipe!r}; this build has {', '.join(SOL_ATTN_RECIPES)}"
-        ) from None
+        )
+    table = _RECIPES_BY_HEAD_DIM.get(head_dim, {})
+    if recipe not in table:
+        has = ", ".join(map(str, SOL_ATTN_HEAD_DIMS[recipe]))
+        others = ", ".join(r for r in SOL_ATTN_RECIPES if r in table) or "none"
+        raise SolAttnUnsupported(
+            f"Sol-Attn '{recipe}' has no head dim {head_dim} row, only {has}; the recipes with one are {others}"
+        )
+    return table[recipe]
 
 
 def _format(name):
@@ -476,7 +563,10 @@ def _quantize(recipe, query, key, value, softmax_scale):
     if recipe.k_packed == "mxfp4":
         k = _AITER.mxfp4_k_view(k, k_descale)
     elif recipe.k_packed == "mxfp6":
-        k, k_descale = _AITER.mxfp6_k_view(k, k_descale, *key.shape[:3])
+        view = _AITER.mxfp6_k_view_hd256 if recipe.head_dim == 256 else _AITER.mxfp6_k_view
+        k, k_descale = view(k, k_descale, *key.shape[:3])
+    elif recipe.k_packed == "mxfp8":
+        k = _AITER.mxfp8_k_view_hd256(k, *key.shape[:3])
 
     v, v_descale = getattr(_AITER, recipe.quantize_v)(value)
     if recipe.v_packed == "mxfp4_fp6_p":
@@ -666,6 +756,27 @@ def _second_order(recipe, q, k, v, routing, softmax_scale, block_tile, tilt_rank
             block_gain=gain,
         )
         params = _tilt_scaled_params(planes, planes.k_scale_plane_stride)
+    elif recipe.tilt == "packed_mxfp8_planes":
+        # hd256 MXFP8: the A planes go through K's own packer, from the unrotated sources and Q
+        # maxima as for the other packed K rows; the FP8 B planes' stride rides in the third dword.
+        planes = _tilt_planes(
+            k[2],
+            v[0],
+            _q_abs_max(q[2], q_tile),
+            mean_k,
+            mean_v,
+            softmax_scale,
+            tilt_rank,
+            kv_tile,
+            k_format="mxfp8",
+            v_format="e4m3",
+            v_descale=v[1],
+            q_multiplier=_AITER.q_multiplier(softmax_scale),
+            mean_k_scale=mean_k_scale,
+            mean_k_pooled=routing["mean_k_pooled"],
+            block_gain=gain,
+        )
+        params = _tilt_scaled_params(planes, planes.v_plane_stride)
     elif recipe.tilt == "bf16_planes":
         # BF16 A planes against the BF16 Q. BF16/FP8's B planes are FP8, half the K planes' width,
         # so the V plane stride rides in the parameter block's third dword.
@@ -857,12 +968,12 @@ def sol_attn_bhsd(
     query/key/value are (batch, nheads, seqlen, head_dim) bf16 tensors. They are permuted into the
     BSHD layout the kernel takes and handed to aiter's mha_v4 Sol-Attn row for `recipe`, which owns
     the Q/K Hadamard rotation, format validation and the ASM launch. See SOL_ATTN_RECIPES for the
-    rows this build ships.
+    rows this build ships. head_dim is 128, or 256 on the recipes SOL_ATTN_HEAD_DIMS lists it for.
 
     return_head_cost asks for the per-head count of exactly-computed KV blocks, float32 (nheads_q,),
     for the Ulysses head balancer. The raw entry point keeps its routing internal, so asking for it
-    moves the call onto aiter's packed API with quantization and routing done here. MXFP8 and a
-    caller-supplied `routing` always take that path.
+    moves the call onto aiter's packed API with quantization and routing done here. MXFP8, every
+    hd256 row and a caller-supplied `routing` always take that path.
 
     key_seqlen is the number of real KV tokens when the caller has padded the sequence. Sol-Attn
     takes no mask, so the tail is dropped rather than attended.
@@ -891,7 +1002,11 @@ def sol_attn_bhsd(
     if _AITER is None:
         raise SolAttnUnsupported("Sol-Attn requires aiter with mha_v4_sol and sol_prepare; please update AITER")
     check_sol_attn_supported(query, key, value, is_causal, ring_world_size=ring_world_size)
-    recipe = _resolve_recipe(recipe)
+    recipe = _resolve_recipe(recipe, query.shape[-1])
+    if block_tile is not None and recipe.head_dim != 128:
+        # The run's block size is checked against the hd128 rows when the backend is selected,
+        # before any call shows the model's head dim.
+        _check_block_tile(recipe, block_tile)
     block_tile = sol_attn_block_tile(recipe, block_tile)
 
     query = query.permute(0, 2, 1, 3).contiguous()
@@ -947,10 +1062,10 @@ def sol_attn_bhsd(
             mean_k_scale=routing["mean_k_scale"],
             mean_v_scale=routing["mean_v_scale"],
         )
-    if not recipe.routes_through_raw and "sol_tilt" not in pooled:
-        # Only the MXFP8 row reads past the pooled K scale, and it is the one row that is not raw.
-        # The tilt's planes come in AITER's own padded storage; sol_prepare's pooled scale does
-        # not. Drop the copy once AITER's sol_prepare pads the scale itself.
+    if recipe.pools_addressable_block_k and "sol_tilt" not in pooled:
+        # Only the hd128 MXFP8 row reads past the pooled K scale. The tilt's planes come in
+        # AITER's own padded storage; sol_prepare's pooled scale does not. Drop the copy once
+        # AITER's sol_prepare pads the scale itself.
         pooled["mean_k_scale"] = _with_scale_lookahead(pooled["mean_k_scale"])
     qk_fmt, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
     qk_scale, v_scale = _scale_mode(recipe.qk_scale_mode), _scale_mode(recipe.v_scale_mode)

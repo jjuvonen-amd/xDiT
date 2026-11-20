@@ -233,3 +233,19 @@ def test_the_backend_drops_a_declared_trailing_pad_by_length(monkeypatch):
     )
 
     assert seen["key_seqlen"] == 201
+
+
+def test_each_backend_accepts_the_head_dims_its_recipe_has_rows_at():
+    """spec.py cannot import sol.py, so its head-dim column is a copy of SOL_ATTN_HEAD_DIMS."""
+    from xfuser.core.attention.sparsity.sol import SOL_ATTN_HEAD_DIMS
+
+    for spec in _sol_specs():
+        assert spec.accepts.head_dims() == SOL_ATTN_HEAD_DIMS[spec.impl.bound["recipe"]], spec.type.name
+
+
+def test_an_hd256_call_is_refused_on_a_recipe_without_an_hd256_row():
+    tensor = torch.zeros((1, 2, 8, 256), dtype=torch.bfloat16)
+    assert "head dimension 128 only" in registry.get(AttentionBackendType.AITER_FP8_SOL).rejects(
+        tensor, tensor, tensor, AttnCall()
+    )
+    assert registry.get(AttentionBackendType.AITER_MXFP4_SOL).rejects(tensor, tensor, tensor, AttnCall()) is None
