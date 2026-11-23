@@ -173,7 +173,7 @@ requires a compatible DBCache layout and is described in the PipeFusion guide.
 | [Hunyuanvideo-1.5](#model-hunyuanvideo-1-5) | — | — | — | `dbcache` | — |
 | [Hunyuanvideo-1.5-Distilled](#model-hunyuanvideo-1-5-distilled) | — | — | — | `dbcache` | — |
 | [Hunyuanvideo-1.5-Sparse](#model-hunyuanvideo-1-5-sparse) | — | — | ✓ | `dbcache` | — |
-| [Ideogram-4](#model-ideogram-4) | — | — | — | — | — |
+| [Ideogram-4](#model-ideogram-4) | — | — | ✓ | — | — |
 | [Krea-2-Raw](#model-krea-2-raw) | — | — | — | — | — |
 | [Krea-2-Turbo](#model-krea-2-turbo) | — | — | — | — | — |
 | [LingBot-Video-Dense](#model-lingbot-video-dense) | — | — | — | — | — |

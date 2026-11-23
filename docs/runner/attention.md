@@ -68,7 +68,10 @@ MXFP6 Q/K and FP8 V, and `aiter_f6f6_sol` uses MXFP6 for Q, K, and V.
 Not every row exists on every AITER build. The runner refuses a row that the
 device does not serve.
 
-The Sol backends require head dimension 128, BF16 inputs, and non-causal attention.
+The Sol backends require BF16 inputs, non-causal attention, and head dimension
+128. `aiter_bf16_sol`, `aiter_mxfp8_sol`, `aiter_f6f6_sol`, and `aiter_mxfp4_sol`
+also serve head dimension 256 on AITER builds with those rows. The runner refuses
+a model whose head dimension the installed AITER has no row for before it loads.
 Packed keys are accepted only as one sequence's trailing pad. Ring is refused at
 startup; use `--ulysses_degree` for sequence parallelism. Set
 `--cross_attention_backend` to a dense backend. Short text keys give the routing
@@ -78,6 +81,8 @@ and its own query rows exactly, and route the image and reference tokens.
 On MiniMax-H3 the text and audio blocks are always computed exactly, and the
 video tokens are ordered along a space-filling curve over their frame grid. A KV
 block then holds a compact patch of the video instead of a few frame rows.
+Ideogram 4 (head dimension 256) computes its prompt's KV blocks and its own query
+rows exactly, and routes the image tokens.
 
 - `--solattn_beta` sets the routing threshold (default `0.5`). A larger value
   computes fewer blocks exactly.
