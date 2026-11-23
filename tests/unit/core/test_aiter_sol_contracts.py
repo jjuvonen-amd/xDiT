@@ -235,17 +235,37 @@ def test_the_backend_drops_a_declared_trailing_pad_by_length(monkeypatch):
     assert seen["key_seqlen"] == 201
 
 
-def test_each_backend_accepts_the_head_dims_its_recipe_has_rows_at():
-    """spec.py cannot import sol.py, so its head-dim column is a copy of SOL_ATTN_HEAD_DIMS."""
+def _aiter_build(monkeypatch, *, hd256):
+    """Stand in for an aiter build with or without the hd256 rows. Only its symbols are read:
+    the hd256 quantizers, and whether its geometry queries take a head dim."""
+    from xfuser.core.attention.sparsity import sol
+
+    class Build:
+        def __getattr__(self, name):
+            return object() if hd256 or not name.endswith("_hd256") else None
+
+    monkeypatch.setattr(sol, "_AITER", Build())
+    monkeypatch.setattr(sol, "_GEOMETRY_TAKES_HEAD_DIM", hd256)
+
+
+@pytest.mark.parametrize("hd256", [True, False], ids=["hd256-build", "hd128-build"])
+def test_each_backend_accepts_the_head_dims_its_aiter_build_has_rows_at(monkeypatch, hd256):
+    """The model gate reads these at selection, so a head dim the build has no row for is refused
+    before the model loads rather than at its first attention call."""
     from xfuser.core.attention.sparsity.sol import SOL_ATTN_HEAD_DIMS
 
+    _aiter_build(monkeypatch, hd256=hd256)
     for spec in _sol_specs():
-        assert spec.accepts.head_dims() == SOL_ATTN_HEAD_DIMS[spec.impl.bound["recipe"]], spec.type.name
+        declared = SOL_ATTN_HEAD_DIMS[spec.impl.bound["recipe"]]
+        assert spec.accepts.head_dims() == (declared if hd256 else (128,)), spec.type.name
 
 
-def test_an_hd256_call_is_refused_on_a_recipe_without_an_hd256_row():
+@pytest.mark.parametrize("hd256", [True, False], ids=["hd256-build", "hd128-build"])
+def test_an_hd256_call_needs_a_recipe_and_a_build_with_an_hd256_row(monkeypatch, hd256):
+    _aiter_build(monkeypatch, hd256=hd256)
     tensor = torch.zeros((1, 2, 8, 256), dtype=torch.bfloat16)
     assert "head dimension 128 only" in registry.get(AttentionBackendType.AITER_FP8_SOL).rejects(
         tensor, tensor, tensor, AttnCall()
     )
-    assert registry.get(AttentionBackendType.AITER_MXFP4_SOL).rejects(tensor, tensor, tensor, AttnCall()) is None
+    refusal = registry.get(AttentionBackendType.AITER_MXFP4_SOL).rejects(tensor, tensor, tensor, AttnCall())
+    assert (refusal is None) == hd256, refusal

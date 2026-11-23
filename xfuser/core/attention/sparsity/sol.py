@@ -392,6 +392,27 @@ SOL_ATTN_HEAD_DIMS = {
 }
 
 
+def sol_attn_head_dims_built(recipe_id):
+    """The head dims of SOL_ATTN_HEAD_DIMS[recipe_id] this aiter build has rows for.
+
+    Every Sol build has the hd128 rows. Another head dim needs its quantizers and geometry
+    queries that take a head dim. Asks no device, so it can gate a model before it loads.
+    Without aiter it is the whole declared set: the backend is unavailable then anyway.
+    """
+    declared = SOL_ATTN_HEAD_DIMS[recipe_id]
+    if _AITER is None:
+        return declared
+
+    def built(head_dim):
+        if head_dim == 128:
+            return True
+        recipe = _RECIPES_BY_HEAD_DIM[head_dim][recipe_id]
+        quantizers = (recipe.quantize_q, recipe.quantize_k, recipe.quantize_v)
+        return _GEOMETRY_TAKES_HEAD_DIM and all(getattr(_AITER, name) is not None for name in quantizers)
+
+    return tuple(d for d in declared if built(d))
+
+
 def check_sol_attn_device(device=None):
     """Raise unless this build and device can run Sol-Attn. Defaults to the current CUDA device.
 
@@ -514,9 +535,7 @@ def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1):
 def _resolve_recipe(recipe, head_dim=128):
     """The named recipe's row at head_dim, or a clear error listing what this build actually ships."""
     if recipe not in _RECIPES:
-        raise SolAttnUnsupported(
-            f"unknown Sol-Attn recipe {recipe!r}; this build has {', '.join(SOL_ATTN_RECIPES)}"
-        )
+        raise SolAttnUnsupported(f"unknown Sol-Attn recipe {recipe!r}; this build has {', '.join(SOL_ATTN_RECIPES)}")
     table = _RECIPES_BY_HEAD_DIM.get(head_dim, {})
     if recipe not in table:
         has = ", ".join(map(str, SOL_ATTN_HEAD_DIMS[recipe]))

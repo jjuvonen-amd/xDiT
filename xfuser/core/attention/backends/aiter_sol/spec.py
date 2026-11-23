@@ -10,11 +10,12 @@ Not to be confused with SOL_ATTN, the NVIDIA kernel from the sol_attn package.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from xfuser.core.attention.constraints import (
     BF16,
     HEAD_DIM,
+    CallConstraint,
     NO_DROPOUT,
     NON_CAUSAL,
     TRAILING_PAD_KEYS,
@@ -31,28 +32,25 @@ class SolRecipe:
     recipe: str  # the row's id in xfuser.core.attention.sparsity.sol
     archs: Requirement
     low_precision: bool
-    head_dims: tuple  # as SOL_ATTN_HEAD_DIMS has them for `recipe`
 
-
-HD128 = (128,)
-HD128_256 = (128, 256)
 
 # fmt: off
 # Q/K format then V format, as the dense MHA v4 table names them: F8F6 is FP8
 # Q/K with MXFP6 V, MXFP6 is MXFP6 Q/K with FP8 V, F6F6 MXFP6 throughout. The
-# MX-V rows are gfx950's FP6-P kernels.
+# MX-V rows are gfx950's FP6-P kernels. The head dims each row serves are
+# sol.SOL_ATTN_HEAD_DIMS's, as far as the installed aiter builds them.
 RECIPES = [
-    #          name       recipe     on      low precision  head dims
-    SolRecipe("BF16",    "bf16",    GFX950, False,         HD128_256),
-    SolRecipe("BF16FP8", "bf16fp8", GFX950, False,         HD128),
-    SolRecipe("I8FP8",   "i8fp8",   GFX950, True,          HD128),
-    SolRecipe("FP8",     "fp8",     GFX950, True,          HD128),
-    SolRecipe("MXFP8",   "mxfp8",   GFX950, True,          HD128_256),
-    SolRecipe("F8F6",    "f8f6",    GFX950, True,          HD128),
-    SolRecipe("MXFP6",   "mxfp6",   GFX950, True,          HD128),
-    SolRecipe("F6F6",    "f6f6",    GFX950, True,          HD128_256),
-    SolRecipe("F6F4",    "f6f4",    GFX950, True,          HD128),
-    SolRecipe("MXFP4",   "mxfp4",   GFX950, True,          HD128_256),
+    #          name       recipe     on      low precision
+    SolRecipe("BF16",    "bf16",    GFX950, False),
+    SolRecipe("BF16FP8", "bf16fp8", GFX950, False),
+    SolRecipe("I8FP8",   "i8fp8",   GFX950, True),
+    SolRecipe("FP8",     "fp8",     GFX950, True),
+    SolRecipe("MXFP8",   "mxfp8",   GFX950, True),
+    SolRecipe("F8F6",    "f8f6",    GFX950, True),
+    SolRecipe("MXFP6",   "mxfp6",   GFX950, True),
+    SolRecipe("F6F6",    "f6f6",    GFX950, True),
+    SolRecipe("F6F4",    "f6f4",    GFX950, True),
+    SolRecipe("MXFP4",   "mxfp4",   GFX950, True),
 ]
 # fmt: on
 
@@ -74,6 +72,29 @@ class _SolRow(Requirement):
         return None
 
 
+@dataclass(frozen=True)
+class _SolHeadDims(CallConstraint):
+    """HEAD_DIM over the head dims this aiter build has `recipe`'s rows at.
+
+    The hd128 rows come with every Sol build, wider ones only with builds that ship them. The
+    model gate reads head_dims() at selection, so a model whose head dim has no row here is
+    refused before it loads rather than at its first attention call.
+    """
+
+    recipe: str
+
+    def _built(self) -> HEAD_DIM:
+        from xfuser.core.attention.sparsity.sol import sol_attn_head_dims_built
+
+        return HEAD_DIM(*sol_attn_head_dims_built(self.recipe))
+
+    def unmet(self, query, key, value, call) -> Optional[str]:
+        return self._built().unmet(query, key, value, call)
+
+    def head_dims(self) -> Tuple[int, ...]:
+        return self._built().head_dims()
+
+
 # Sol-Attn has no mask, so a packed call's pad is dropped from K/V by length
 # rather than attended, and the pooled blocks would straddle any other boundary.
 CALLS = NO_DROPOUT & NON_CAUSAL & BF16 & TRAILING_PAD_KEYS
@@ -89,7 +110,7 @@ def _spec(row: SolRecipe) -> Spec:
         sparsity=Sparsity.SOL,
         head_balanced=True,
         low_precision=row.low_precision,
-        accepts=CALLS & HEAD_DIM(*row.head_dims),
+        accepts=CALLS & _SolHeadDims(row.recipe),
         requires=(
             SYMBOL("aiter.ops.mha_v4:mha_v4_sol")
             & SYMBOL("aiter.ops.triton.attention.utils:sol_prepare")

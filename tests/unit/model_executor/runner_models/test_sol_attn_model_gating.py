@@ -133,13 +133,37 @@ def _build_ideogram4(**config):
     return MODEL_REGISTRY["Ideogram-4"](xFuserArgs(model="Ideogram-4", **config))
 
 
-@pytest.mark.parametrize("backend", ["aiter_bf16_sol", "aiter_mxfp8_sol", "aiter_f6f6_sol", "aiter_mxfp4_sol"])
-def test_ideogram4_serves_the_sol_recipes_with_an_hd256_row(backend):
+def _aiter_build(monkeypatch, *, hd256):
+    """Stand in for an aiter build with or without the hd256 rows (see test_aiter_sol_contracts)."""
+    from xfuser.core.attention.sparsity import sol
+
+    class Build:
+        def __getattr__(self, name):
+            return object() if hd256 or not name.endswith("_hd256") else None
+
+    monkeypatch.setattr(sol, "_AITER", Build())
+    monkeypatch.setattr(sol, "_GEOMETRY_TAKES_HEAD_DIM", hd256)
+
+
+HD256_BACKENDS = ["aiter_bf16_sol", "aiter_mxfp8_sol", "aiter_f6f6_sol", "aiter_mxfp4_sol"]
+
+
+@pytest.mark.parametrize("backend", HD256_BACKENDS)
+def test_ideogram4_serves_the_sol_recipes_with_an_hd256_row(monkeypatch, backend):
     """Ideogram 4 runs head dim 256 and has no text-only attention to put on a dense backend."""
+    _aiter_build(monkeypatch, hd256=True)
     _build_ideogram4(attention_backend=backend, ulysses_degree=2)
 
 
+@pytest.mark.parametrize("backend", HD256_BACKENDS)
+def test_ideogram4_refuses_sol_before_loading_on_an_aiter_without_hd256_rows(monkeypatch, backend):
+    _aiter_build(monkeypatch, hd256=False)
+    with pytest.raises(ValueError, match="runs head dimension 256 and that backend serves only 128"):
+        _build_ideogram4(attention_backend=backend, ulysses_degree=2)
+
+
 @pytest.mark.parametrize("backend", ["aiter_fp8_sol", "aiter_f6f4_sol"])
-def test_ideogram4_refuses_a_sol_recipe_without_an_hd256_row(backend):
+def test_ideogram4_refuses_a_sol_recipe_without_an_hd256_row(monkeypatch, backend):
+    _aiter_build(monkeypatch, hd256=True)
     with pytest.raises(ValueError, match="runs head dimension 256 and that backend serves only 128"):
         _build_ideogram4(attention_backend=backend)
