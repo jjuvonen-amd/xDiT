@@ -167,7 +167,12 @@ def _dense_spec(fmt: MhaV4Format) -> Spec:
         impl=Impl("kernel:mha_v4_dense", {"fmt": fmt}),
         ring=DENSE_RING,
         low_precision=fmt.qk is not Fmt.BF16,
-        accepts=DENSE_CALLS & MIN_KEY_LENGTH(fmt.min_keys) if fmt.min_keys > 1 else DENSE_CALLS,
+        # Experiment: AITER has a dense hd256 BF16 row (fwd_hd256_bf16.co); let BF16 take it.
+        accepts=(
+            (NO_DROPOUT & NON_CAUSAL & PACKED_KEYS & HEAD_DIM(128, 256))
+            if fmt.name == "BF16"
+            else (DENSE_CALLS & MIN_KEY_LENGTH(fmt.min_keys) if fmt.min_keys > 1 else DENSE_CALLS)
+        ),
         # Every row here is head dim 128, which makes the family unselectable
         # for a model that mixes widths: LTX-2 runs 128-wide video blocks
         # beside 64-wide audio ones under one backend choice. The odd widths
